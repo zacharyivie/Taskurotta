@@ -2166,9 +2166,14 @@ function pathHandle(targetPath) {
 }
 
 async function registerBackendPathGrant(handle) {
-  if (!activeApiBaseUrl || !desktopGrantSecret) return;
-  if (!handle || typeof handle.path !== "string" || typeof handle.grantId !== "string") return;
+  const startedAt = Date.now();
+  let reason = "backend-unavailable";
+  let status = null;
   try {
+    if (!activeApiBaseUrl || !desktopGrantSecret) throw new Error("Backend unavailable");
+    reason = "invalid-handle";
+    if (!handle || typeof handle.path !== "string" || !handle.path
+      || typeof handle.grantId !== "string" || !handle.grantId) throw new Error("Invalid folder handle");
     const headers = {
       "Content-Type": "application/json",
       "X-Gofer-Desktop-Grant-Secret": desktopGrantSecret,
@@ -2176,17 +2181,31 @@ async function registerBackendPathGrant(handle) {
     if (activeUiApiToken) {
       headers.Authorization = `Bearer ${activeUiApiToken}`;
     }
+    reason = "network-error";
     const response = await fetch(`${activeApiBaseUrl}/api/desktop/path-grants`, {
       method: "POST",
       headers,
       body: JSON.stringify({ grantId: handle.grantId, path: handle.path }),
       signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) {
-      writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${response.status}\n`);
+    status = response.status;
+    reason = "http-error";
+    if (!response.ok) throw new Error("Registration rejected");
+    reason = "invalid-response";
+    const payload = await response.json();
+    if (payload?.grantId !== handle.grantId || typeof payload?.path !== "string" || !payload.path) {
+      throw new Error("Registration acknowledgment does not match");
     }
+    writeBackendLog(`PATH_GRANT_REGISTERED ${JSON.stringify({ path: handle.path, status, durationMs: Date.now() - startedAt })}\n`);
   } catch (error) {
-    writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${error?.message || error}\n`);
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") reason = "timeout";
+    // Do not log headers, grant IDs, response bodies, or raw network errors.
+    writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${JSON.stringify({ path: handle?.path, reason, status, durationMs: Date.now() - startedAt })}\n`);
+    const detail = reason === "timeout" ? "The backend timed out."
+      : reason === "http-error" ? `The backend rejected registration with HTTP ${status}.`
+        : reason === "backend-unavailable" ? "The backend is not ready."
+          : "The backend could not confirm folder access.";
+    throw new Error(`Could not renew Taskurotta folder access for ${JSON.stringify(handle?.path || "the selected folder")}. ${detail} Retry the action. If it keeps failing, restart Taskurotta.`, { cause: error });
   }
 }
 

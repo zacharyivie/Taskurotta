@@ -323,8 +323,16 @@ function subscribeToBrowserEvent(channel, callback) {
 
 async function trustProjectRoot(targetPath) {
   if (typeof targetPath !== "string" || !targetPath.trim()) return null;
-  const payload = await invokeDesktop("gofer:grant-path", { targetPath });
-  return payload?.path || targetPath;
+  const previousGrantId = grantForPath(targetPath);
+  try {
+    const payload = await invokeDesktop("gofer:grant-path", { targetPath });
+    return payload?.path || targetPath;
+  } catch (error) {
+    for (const [root, grantId] of pathGrants.entries()) {
+      if (grantId === previousGrantId) pathGrants.delete(root);
+    }
+    throw error;
+  }
 }
 
 function subscribeToTerminalEvent(channel, callback) {

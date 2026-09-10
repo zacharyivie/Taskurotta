@@ -1825,7 +1825,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         root = Path(str(config.get("root", ""))).expanduser()
         if not root.is_absolute() or not root.is_dir():
             raise ValueError("Choose an existing absolute Second Brain folder.")
-        self._assert_bundle_path_allowed(root, config.get("grantId"), must_exist=True)
+        try:
+            self._assert_bundle_path_allowed(root, config.get("grantId"), must_exist=True)
+        except WorkflowBundleError as exc:
+            log.warning("SECOND_BRAIN_PATH_DENIED root=%r", str(root))
+            raise WorkflowBundleError(
+                "Taskurotta could not confirm access to the Second Brain folder. "
+                "Retry your message to renew folder access. If it keeps failing, "
+                "reselect the folder in Settings > Rem or restart Taskurotta."
+            ) from exc
         if config.get("format", "md") not in {"md", "html"}:
             raise ValueError("Choose Markdown or HTML for Second Brain reports.")
 

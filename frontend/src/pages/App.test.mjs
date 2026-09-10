@@ -11513,3 +11513,97 @@ test("Rem permissions cannot change while a message is running", () => {
   }));
   assert.match(markup, /<select[^>]*aria-label="Rem permissions"[^>]*disabled=""/);
 });
+
+
+test("Electron folder registration reports failures without leaking credentials and recovers", async () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  const functionSource = source.slice(source.indexOf("async function registerBackendPathGrant(handle)"), source.indexOf("function getIpcSecurity()"));
+  const logs = [];
+  const handle = { path: "/outside/brain", grantId: "private-grant" };
+  let response;
+  const sandbox = {
+    activeApiBaseUrl: "http://127.0.0.1:1234",
+    desktopGrantSecret: "private-secret",
+    activeUiApiToken: "private-token",
+    AbortSignal,
+    writeBackendLog: (line) => logs.push(line),
+    fetch: async () => {
+      if (response instanceof Error) throw response;
+      return response;
+    },
+  };
+  const register = vm.runInNewContext(`${functionSource}\nregisterBackendPathGrant`, sandbox);
+  for (const [failure, reason, message] of [
+    [{ ok: false, status: 403 }, "http-error", /HTTP 403/],
+    [{ ok: false, status: 503 }, "http-error", /HTTP 503/],
+    [Object.assign(new Error("private-secret"), { name: "TimeoutError" }), "timeout", /timed out/],
+    [new Error("private-token"), "network-error", /could not confirm/],
+    [{ ok: true, status: 201, json: async () => ({ grantId: "wrong" }) }, "invalid-response", /could not confirm/],
+  ]) {
+    response = failure;
+    await assert.rejects(register(handle), message);
+    assert.match(logs.at(-1), new RegExp(reason));
+    assert.match(logs.at(-1), /outside\/brain/);
+    assert.match(logs.at(-1), /durationMs/);
+  }
+  sandbox.activeApiBaseUrl = "";
+  await assert.rejects(register(handle), /not ready/);
+  assert.match(logs.at(-1), /backend-unavailable/);
+  sandbox.activeApiBaseUrl = "http://127.0.0.1:1234";
+  response = { ok: true, status: 201, json: async () => handle };
+  await register(handle);
+  assert.match(logs.at(-1), /PATH_GRANT_REGISTERED/);
+  assert.doesNotMatch(logs.join(""), /private-secret|private-token|private-grant/);
+});
+
+test("Electron preload clears a failed renewal and permits a later retry", async () => {
+  let fail = false;
+  const exposed = runPreload({
+    argv: ["electron", "preload"],
+    invoke() {
+      if (fail) throw new Error("Could not renew Taskurotta folder access. Retry the action.");
+      return { grantId: "grant-brain", path: "/outside/brain" };
+    },
+  });
+  const workspace = exposed.goferDesktop.workspace;
+  await workspace.trustProjectRoot("/outside/brain");
+  assert.equal(workspace.pathGrantForApi("/outside/brain"), "grant-brain");
+  fail = true;
+  await assert.rejects(workspace.trustProjectRoot("/outside/brain"), /Could not renew/);
+  assert.equal(workspace.pathGrantForApi("/outside/brain"), "");
+  fail = false;
+  await workspace.trustProjectRoot("/outside/brain");
+  assert.equal(workspace.pathGrantForApi("/outside/brain"), "grant-brain");
+});
+
+test("Rem stops before sending chat when folder renewal fails and allows retry", async () => {
+  let fail = true;
+  const desktop = { workspace: {
+    trustProjectRoot: async () => {
+      if (fail) throw new Error("Could not renew Taskurotta folder access. Retry the action.");
+    },
+    pathGrantForApi: () => "renewed-grant",
+  } };
+  const chatStream = streamResponse(['{"type":"final","message":{"body":"Recovered reply"}}\n']);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", { providers: [] }),
+    url => url === "/api/chat/stream" ? chatStream(url) : null,
+  ]);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, {
+    workflows: [], width: 380,
+    memorySettings: { secondBrainEnabled: true, secondBrainRoot: "/outside/brain", secondBrainFormat: "html" },
+  }), fetchMock, { desktop });
+  await dom.flush();
+  await dom.change(dom.first("textarea"), "Search my notes");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  assert.match(dom.text(), /Could not renew Taskurotta folder access/);
+  assert.equal(fetchMock.calls.filter(call => call.url === "/api/chat/stream").length, 0);
+  fail = false;
+  await dom.change(dom.first("textarea"), "Try again");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  assert.equal(fetchMock.calls.filter(call => call.url === "/api/chat/stream").length, 1);
+  assert.match(dom.text(), /Recovered reply/);
+  await dom.unmount();
+});

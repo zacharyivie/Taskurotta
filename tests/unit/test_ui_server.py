@@ -2045,7 +2045,8 @@ def test_second_brain_requires_a_desktop_folder_grant(tmp_path: Path, endpoint: 
         },
     )
     assert result.status == 400
-    assert "outside the approved" in result.text()
+    assert "Second Brain folder" in result.text()
+    assert "Retry your message" in result.text()
 
 
 def test_commit_message_endpoint_uses_restricted_generator(
@@ -2072,3 +2073,32 @@ def test_commit_message_endpoint_uses_restricted_generator(
     failed = _request(tmp_path, "POST", "/api/chat/commit-message", body={"diff": ""})
     assert failed.status == 400
     assert failed.json() == {"error": "Stage changes first."}
+
+
+def test_second_brain_expired_grant_recovers_after_registration(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    brain = tmp_path / "brain"
+    brain.mkdir()
+    now = 1000.0
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: now)
+    server = _fake_server(data)
+    handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
+    handler.server = server
+    handler.headers = Message()
+    handler.headers["X-Gofer-Desktop-Grant-Secret"] = "test-secret"
+    registration = {"path": str(brain), "grantId": "private-grant"}
+    body = {
+        "workflow": {
+            "remSecondBrain": {"enabled": True, "root": str(brain), "grantId": "private-grant"}
+        }
+    }
+    handler._register_desktop_path_grant(registration)
+    handler._validate_second_brain(body)
+    now += 900
+    with pytest.raises(WorkflowBundleError, match="Retry your message"):
+        handler._validate_second_brain(body)
+    handler._register_desktop_path_grant(registration)
+    handler._validate_second_brain(body)

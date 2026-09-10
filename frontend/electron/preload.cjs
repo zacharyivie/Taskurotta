@@ -323,7 +323,6 @@ function subscribeToBrowserEvent(channel, callback) {
 
 async function trustProjectRoot(targetPath) {
   if (typeof targetPath !== "string" || !targetPath.trim()) return null;
-  if (grantForPath(targetPath)) return targetPath;
   const payload = await invokeDesktop("gofer:grant-path", { targetPath });
   return payload?.path || targetPath;
 }

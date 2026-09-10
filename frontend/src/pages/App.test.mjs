@@ -9082,6 +9082,38 @@ test("Electron preload keeps file grants private while attaching them to later c
   });
 });
 
+test("Electron preload refreshes an existing project grant with the backend", async () => {
+  const calls = [];
+  const exposed = runPreload({
+    argv: ["electron", "preload"],
+    invoke(channel, payload) {
+      calls.push({ channel, payload });
+      if (channel === "gofer:grant-path") {
+        return { grantId: "grant-project", path: payload.targetPath };
+      }
+      return { channel, payload };
+    },
+  });
+
+  await exposed.goferDesktop.workspace.trustProjectRoot("/workspace/project");
+  await exposed.goferDesktop.workspace.trustProjectRoot("/workspace/project");
+
+  assert.deepEqual(toPlainObject(calls), [
+    {
+      channel: "gofer:grant-path",
+      payload: { targetPath: "/workspace/project" },
+    },
+    {
+      channel: "gofer:grant-path",
+      payload: { targetPath: "/workspace/project" },
+    },
+  ]);
+  assert.equal(
+    exposed.goferDesktop.workspace.pathGrantForApi("/workspace/project"),
+    "grant-project",
+  );
+});
+
 test("Electron preload changes data directory through native directory grants", async () => {
   const calls = [];
   const exposed = runPreload({

@@ -416,7 +416,12 @@ async function exerciseDesignRegressions() {
     .find((button) => button.textContent.trim() === "Outline").click());
   await evaluate(() => document.querySelector("button[title='Map']").click());
 
-  await evaluate(() => document.querySelector("button[title='Show workflow settings and node inspector']").click());
+  await evaluate(() => document.querySelector("summary[title='More graph actions']").click());
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("details[open] summary[title='More graph actions']"),
+  )));
+  await evaluate(() => [...document.querySelectorAll("details[open] button")]
+    .find((button) => button.textContent.trim() === "Workflow settings").click());
   await waitFor(() => evaluate(() => document.querySelectorAll("[role='tab']").length === 4));
   assert.deepEqual(
     await evaluate(() => [...document.querySelectorAll("[role='tab']")].map((tab) => tab.textContent.trim())),

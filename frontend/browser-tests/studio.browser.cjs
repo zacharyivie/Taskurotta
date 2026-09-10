@@ -347,10 +347,20 @@ async function exerciseDesignRegressions() {
   await waitFor(() => evaluate(() => Boolean(document.querySelector("button[title='Back to recent threads']"))));
   await evaluate(() => document.querySelector("button[title='Back to recent threads']").click());
   await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-assistant-home]"))));
-  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Workflow assistant")), true);
-  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Ask about the selected workflow")), true);
-  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Recent threads")), true);
-  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("New thread")), true);
+  assert.equal(
+    await evaluate(() => document.querySelector("[data-assistant-home] h2")?.textContent.trim()),
+    "I'm Rem",
+    "Returning from a thread should show Rem's home screen",
+  );
+  assert.match(
+    await evaluate(() => document.querySelector("[data-assistant-home]").textContent),
+    /Your coding agent in Taskurotta\./,
+  );
+  assert.equal(
+    await evaluate(() => document.querySelector("[data-assistant-home] #assistant-home-recent")?.textContent.trim()),
+    "Recent threads",
+  );
+  assert.equal(await evaluate(() => Boolean(document.querySelector("button[title='New thread']"))), true);
   assert.equal(await evaluate(() => Boolean(document.querySelector("button[title='Back to recent threads']"))), false);
   await evaluate(() => document.querySelector("button[title='Recent threads']").click());
   await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("p")]

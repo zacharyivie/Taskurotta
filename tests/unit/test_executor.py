@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time
@@ -74,7 +75,7 @@ from gofer.utils.run_state import (
     request_workflow_stop,
     workflow_stop_path,
 )
-from tests.conftest import FakeSubscription
+from tests.conftest import FakeSubscription, envelope_request
 
 
 def _bash_node(node_id: str, command: str = "true") -> GraphNode:
@@ -149,9 +150,10 @@ async def test_agent_usage_fallback_records_estimated_tokens_and_cost(tmp_path: 
     assert usage["estimated"] is True
     assert usage["source"] == "fallback_chars_per_token"
     assert usage["provider"] == "claude_code"
-    assert usage["input_tokens"] == 3
+    input_tokens = math.ceil(len(str(sub.calls[0]["prompt"])) / 4)
+    assert usage["input_tokens"] == input_tokens
     assert usage["output_tokens"] == 2
-    assert usage["estimated_cost"] == pytest.approx(0.007)
+    assert usage["estimated_cost"] == pytest.approx(input_tokens / 1000 + 0.004)
 
 
 @pytest.mark.anyio
@@ -375,7 +377,9 @@ async def test_usage_summary_counts_each_fan_out_agent_run(tmp_path: Path) -> No
     assert len(nodes) == 3
     assert all(node["profile"] == "usage-profile" for node in nodes)
     assert all(node["model"] == "usage-model" for node in nodes)
-    assert all(node["prompt_length"] == len("Process item 0.") for node in nodes)
+    assert [node["prompt_length"] for node in nodes] == [
+        len(str(call["prompt"])) for call in sub.calls
+    ]
     assert all(node["output_length"] == len("done") for node in nodes)
     assert all(node["estimated"] is True for node in nodes)
     assert all(node["source"] == "fallback_chars_per_token" for node in nodes)
@@ -3007,7 +3011,7 @@ async def test_agent_node_uses_node_prompt_path_over_agent_default(tmp_path: Pat
     )
 
     assert result.success
-    assert sub.calls[0]["prompt"] == "Selected input"
+    assert envelope_request(sub.calls[0]["prompt"]) == "Selected input"
     assert sub.calls[0]["working_dir"] == node_working_dir
 
 
@@ -3290,7 +3294,7 @@ async def test_agent_node_memory_compaction_uses_fallback_summary(
 
     assert result.success
     assert len(sub.calls) == 2
-    final_prompt = str(sub.calls[1]["prompt"])
+    final_prompt = envelope_request(sub.calls[1]["prompt"])
     assert "Compacted prior agent node context" in final_prompt
     assert "User:\nvery long previous prompt" in final_prompt
     assert "Assistant:\nvery long previous response" in final_prompt
@@ -5971,7 +5975,7 @@ async def test_agent_loop_child_with_explicit_inputs_does_not_prepend_loop_json(
     ).run()
 
     assert result.success
-    agent_prompt = str(sub.calls[0]["prompt"])
+    agent_prompt = envelope_request(sub.calls[0]["prompt"])
     assert agent_prompt == "Implement the following ticket.\nticket body"
     assert agent_prompt.count("ticket body") == 1
     assert "file_path" not in agent_prompt
@@ -6042,7 +6046,7 @@ async def test_loop_runs_entire_child_chain_before_next_item(tmp_path: Path) -> 
     ).run()
 
     assert result.success
-    assert [str(call["prompt"]).splitlines()[0] for call in sub.calls] == [
+    assert [envelope_request(call["prompt"]).splitlines()[0] for call in sub.calls] == [
         "A0",
         "B0",
         "A1",
@@ -6194,7 +6198,7 @@ async def test_after_loop_edge_runs_once_after_loop_body_finishes(tmp_path: Path
     ).run()
 
     assert result.success
-    assert [str(call["prompt"]).splitlines()[0] for call in sub.calls] == [
+    assert [envelope_request(call["prompt"]).splitlines()[0] for call in sub.calls] == [
         "A0",
         "A1",
         "after",
@@ -6301,7 +6305,7 @@ async def test_after_loop_edge_runs_after_break(tmp_path: Path) -> None:
     assert result.success
     assert len(result.node_runs["break"]) == 1
     assert len(result.node_runs["after"]) == 1
-    assert str(sub.calls[0]["prompt"]).splitlines()[0] == "after"
+    assert envelope_request(sub.calls[0]["prompt"]).splitlines()[0] == "after"
 
 
 async def test_workflow_run_writes_success_log(tmp_path: Path) -> None:

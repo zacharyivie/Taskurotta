@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -108,3 +109,11 @@ class FakeSubscription(Subscription):
 @pytest.fixture
 def fake_subscription() -> FakeSubscription:
     return FakeSubscription()
+
+
+def envelope_request(prompt: object) -> str:
+    """Extract task text for test doubles that branch on workflow input values."""
+    text = str(prompt)
+    if text.startswith("Execute the agent node request."):
+        return str(json.loads(text.split("\n\n", 1)[1])["request"])
+    return text

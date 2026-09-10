@@ -25,7 +25,7 @@ from gofer.core.operations import (
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.core.resources import ResourceLimitError, ResourceLimits
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
-from tests.conftest import FakeSubscription
+from tests.conftest import FakeSubscription, envelope_request
 
 # ── _load_tabular ─────────────────────────────────────────────────────────────
 
@@ -596,7 +596,7 @@ async def test_fan_out_failures_aggregate_when_fail_fast_false(tmp_path: Path) -
             provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             self.calls.append({"prompt": prompt, "extra_paths": extra_paths or []})
-            failed = '"i": 1' in prompt
+            failed = '"i": 1' in envelope_request(prompt)
             return AgentResult(
                 agent_id="",
                 success=not failed,
@@ -726,7 +726,7 @@ async def test_fan_out_fail_fast_cancels_pending_iterations(tmp_path: Path) -> N
             provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             started.append(prompt)
-            if '"i": 0' in prompt:
+            if '"i": 0' in envelope_request(prompt):
                 return AgentResult(
                     agent_id="",
                     success=False,

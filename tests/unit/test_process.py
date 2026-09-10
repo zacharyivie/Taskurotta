@@ -8,7 +8,54 @@ import anyio
 import pytest
 
 import gofer.utils.process as process_module
-from gofer.utils.process import build_subprocess_env, run_subprocess, stream_subprocess
+from gofer.utils.process import (
+    build_subprocess_env,
+    env_with_executable_on_path,
+    run_subprocess,
+    stream_subprocess,
+)
+
+
+def test_env_with_executable_on_path_prepends_missing_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+
+    env = env_with_executable_on_path("/home/user/.nvm/versions/node/v20.20.0/bin/codex")
+
+    assert env["PATH"].split(os.pathsep) == [
+        "/home/user/.nvm/versions/node/v20.20.0/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+
+
+def test_env_with_executable_on_path_keeps_path_when_directory_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/local/bin", "/usr/bin"]))
+
+    env = env_with_executable_on_path("/usr/local/bin/claude")
+
+    assert "PATH" not in env
+
+
+def test_env_with_executable_on_path_ignores_bare_command_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    assert env_with_executable_on_path("codex", {"FOO": "bar"}) == {"FOO": "bar"}
+
+
+def test_env_with_executable_on_path_extends_overridden_path() -> None:
+    env = env_with_executable_on_path(
+        "/opt/node/bin/claude",
+        {"PATH": "/sandbox/bin", "FOO": "bar"},
+    )
+
+    assert env["PATH"].split(os.pathsep) == ["/opt/node/bin", "/sandbox/bin"]
+    assert env["FOO"] == "bar"
 
 
 def test_build_subprocess_env_restores_original_library_path(

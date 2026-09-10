@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Search,
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronDown,
   Copy,
@@ -11,14 +14,21 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
+  GitMerge,
   GitCommitHorizontal,
-  History,
   Loader2,
   PencilLine,
+  Plus,
+  Minus,
   RefreshCw,
   Trash2,
   X,
 } from "lucide-react";
+import GitIntegrationControls from "./GitIntegrationControls.jsx";
+import WorktreeContextMenu, { historyOperations } from "./WorktreeContextMenu.jsx";
+import ProjectSearch from "./ProjectSearch.jsx";
+import { Dialog } from "./Dialog.jsx";
+import { hasUnsavedCodeChanges } from "./CodeWorkspace.jsx";
 import { PathNameDialog } from "./DagCanvas.jsx";
 import { DEFAULT_APP_SETTINGS, matchesCommand } from "../lib/settings.js";
 
@@ -56,11 +66,53 @@ export default function CodeFileExplorer({
   const [grantRequired, setGrantRequired] = useState(false);
   const [recentMenuOpen, setRecentMenuOpen] = useState(false);
   const [sourceControl, setSourceControl] = useState({ active: false, entries: [] });
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [sourceControlRoot, setSourceControlRoot] = useState(null);
+  const [gitOperationBusy, setGitBusy] = useState(false);
+  const [gitStaging, setGitStaging] = useState(false);
+  const pendingStagingRef = useRef(null);
+  const gitOperationRef = useRef(false);
+  const currentRootRef = useRef(rootPath);
+  currentRootRef.current = rootPath;
+  const gitStatusPending = sourceControlRoot !== rootPath;
+  const gitBusy = gitOperationBusy || gitStaging || gitStatusPending;
+  const [branchRequest, setBranchRequest] = useState(null);
+  const [branchDraft, setBranchDraft] = useState("");
+  useEffect(() => { setHistoryMenu(null); setBranchRequest(null); setWorktreeStartPoint(""); setWorktreeFormOpen(false); setIntegrationRequest(null); setIntegrationSource(""); setWorktreeMenu(null); }, [rootPath]);
+  const [historyMenu, setHistoryMenu] = useState(null);
+  const [worktreeStartPoint, setWorktreeStartPoint] = useState("");
+  const [generatingMessage, setGeneratingMessage] = useState(false);
+  const generationRef = useRef(null);
+  useEffect(() => () => generationRef.current?.abort(), [rootPath]);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [gitNotice, setGitNotice] = useState("");
+  const [blockedBranch, setBlockedBranch] = useState("");
+  const [remote, setRemote] = useState("");
+  const [gitError, setGitError] = useState("");
+  useEffect(() => { setCommitMessage(""); setBlockedBranch(""); setGitError(""); setGitNotice(""); setRemote(""); }, [rootPath]);
+  const [sourceTab, setSourceTab] = useState("changes");
+  const stagedCount = sourceControl.entries.filter((entry) => entry.staged && entry.status !== "!").length;
+  const [sidebarView, setSidebarView] = useState("files");
+  const [searchFocusRequest, setSearchFocusRequest] = useState(0);
+  useEffect(() => {
+    function openSearch(event) {
+      if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey || event.key.toLowerCase() !== "f") return;
+      event.preventDefault();
+      setSidebarView("search");
+      setSearchFocusRequest((value) => value + 1);
+    }
+    window.addEventListener("keydown", openSearch);
+    return () => window.removeEventListener("keydown", openSearch);
+  }, []);
   const [gitHistory, setGitHistory] = useState({ active: false, commits: [], loading: false });
   const [expandedCommits, setExpandedCommits] = useState(() => new Set());
   const [copiedCommitHash, setCopiedCommitHash] = useState("");
   const [worktrees, setWorktrees] = useState({ active: false, items: [], loading: false });
+  const [integrationSource, setIntegrationSource] = useState("");
+  const [integrationRequest, setIntegrationRequest] = useState(null);
+  const [worktreeMenu, setWorktreeMenu] = useState(null);
+  const [worktreeRemoval, setWorktreeRemoval] = useState(null);
+  const [worktreeRemovalError, setWorktreeRemovalError] = useState("");
+  useEffect(() => { setWorktreeRemoval(null); setWorktreeRemovalError(""); }, [rootPath]);
   const [worktreeFormOpen, setWorktreeFormOpen] = useState(false);
   const [worktreeBranch, setWorktreeBranch] = useState("");
   const [worktreeFolder, setWorktreeFolder] = useState("");
@@ -99,30 +151,180 @@ export default function CodeFileExplorer({
   }, [rootPath]);
 
   const loadSourceControlStatus = useCallback(async () => {
-    if (!rootPath || gitStatusLoadingRef.current?.rootPath === rootPath) return;
+    if (!rootPath || pendingStagingRef.current?.rootPath === rootPath || gitStatusLoadingRef.current?.rootPath === rootPath) return;
     const request = { rootPath };
     gitStatusLoadingRef.current = request;
     try {
       const payload = await window.goferDesktop?.workspace?.gitStatus?.(rootPath);
-      if (gitStatusLoadingRef.current !== request) return;
+      if (gitStatusLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
       const next = payload?.active
-        ? { active: true, entries: payload.entries ?? [] }
+        ? { ...payload, active: true, entries: payload.entries ?? [] }
         : { active: false, entries: [] };
       setSourceControl((current) => sourceControlSnapshotsEqual(current, next) ? current : next);
+      setSourceControlRoot(rootPath);
     } catch {
-      if (gitStatusLoadingRef.current !== request) return;
+      if (gitStatusLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
       setSourceControl({ active: false, entries: [] });
+      setSourceControlRoot(rootPath);
     } finally {
       if (gitStatusLoadingRef.current === request) gitStatusLoadingRef.current = null;
     }
   }, [rootPath]);
 
+  function openHistoryMenu(event, commit) {
+    event.preventDefault();
+    if (gitBusy) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setHistoryMenu({ source: commit.shortHash, hash: commit.hash, x: event.clientX ?? rect.left, y: event.clientY ?? rect.bottom, trigger: event.currentTarget.querySelector("button") });
+  }
+
+  async function historyAction(kind) {
+    const { hash } = historyMenu;
+    setHistoryMenu(null);
+    if (kind === "worktree-commit") {
+      setWorktreeStartPoint(hash); setWorktreeCreateBranch(true); setWorktreeBranch(""); setWorktreeFolder(""); setWorktreeFormOpen(true); setSourceTab("worktrees"); return;
+    }
+    if (kind === "branch-commit") {
+      setBranchRequest({ hash }); setBranchDraft(""); return;
+    } else if (!window.confirm(kind === "reset-hard" ? `Hard reset to ${hash.slice(0, 8)}? This moves the current branch and permanently discards tracked staged and unstaged changes. Untracked files obstructing checkout can also be removed.` : kind === "reset-soft" ? `Soft reset to ${hash.slice(0, 8)}? Move the current branch while keeping the index and working files.` : `Detach HEAD at ${hash.slice(0, 8)}? New commits will need a branch to keep them.`)) return;
+    await changeSourceControl(kind, { hash });
+  }
+
+  async function generateCommitMessage() {
+    if (generatingMessage || gitBusy || !stagedCount) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => { if (currentRootRef.current === rootPath) setGitError("Rem timed out. Try generating again."); controller.abort(); }, 180000);
+    generationRef.current = controller;
+    const draft = commitMessage;
+    setGeneratingMessage(true); setGitError("");
+    try {
+      const snapshot = await window.goferDesktop.workspace.gitRepoAction(rootPath, "staged-diff");
+      if (snapshot?.error || !snapshot?.diff) throw new Error(snapshot?.error || "No staged diff available.");
+      if (controller.signal.aborted) return;
+      const message = await new Promise((resolve, reject) => {
+        const cancel = () => reject(new Error("Generation cancelled."));
+        controller.signal.addEventListener("abort", cancel, { once: true });
+        window.dispatchEvent(new CustomEvent("gofer:rem-commit-message", { detail: { projectRoot: rootPath, diff: snapshot.diff, signal: controller.signal, resolve, reject } }));
+      });
+      if (controller.signal.aborted || currentRootRef.current !== rootPath) return;
+      const current = await window.goferDesktop.workspace.gitRepoAction(rootPath, "staged-diff");
+      if (controller.signal.aborted || currentRootRef.current !== rootPath) return;
+      if (current?.error || current?.tree !== snapshot.tree) throw new Error("Staged changes changed. Generate a new message.");
+      setCommitMessage(value => value === draft ? message : value);
+      setGitNotice("Rem generated a message. Your edits to an existing draft are preserved.");
+    } catch (cause) { if (!controller.signal.aborted && currentRootRef.current === rootPath) setGitError(cause.message); }
+    finally { clearTimeout(timeout); if (generationRef.current === controller) { generationRef.current = null; setGeneratingMessage(false); } }
+  }
+
+  async function changeSourceControl(action, value) {
+    if (gitStatusPending || gitOperationRef.current || gitOperationBusy || (pendingStagingRef.current && action !== "commit") || (action === "commit" && (!commitMessage.trim() || !stagedCount || sourceControl.entries.some(entry => entry.status === "!")))) return;
+    const changesWorkingTree = (["switch", "stash-switch", "stash-apply", "pull", "reset-soft", "reset-hard", "detach-commit", "branch-commit"].includes(action) || /^(merge|rebase)-/.test(action)) || action.startsWith("revert");
+    if ((changesWorkingTree || action === "stage") && hasUnsavedCodeChanges(rootPath)) {
+      setGitError("Save your unsaved editor changes before changing the Git working tree.");
+      return;
+    }
+    const bulk = Array.isArray(value);
+    if (bulk && !value.length) return;
+    if (action === "stage" || action === "unstage") {
+      const paths = bulk ? value : [value];
+      const selected = new Set(paths);
+      gitStatusLoadingRef.current = null;
+      setGitStaging(true);
+      setGitError("");
+      setGitNotice("");
+      setSourceControl((current) => ({ ...current, entries: current.entries.map((entry) => selected.has(entry.path)
+        ? { ...entry, staged: action === "stage", unstaged: action === "unstage" }
+        : entry) }));
+      const pending = (async () => {
+        try {
+          let result;
+          for (const filePath of paths) {
+            result = await window.goferDesktop?.workspace?.gitFileAction?.(rootPath, filePath, action);
+            if (!result) throw new Error("Restart the desktop app to enable Git actions.");
+            if (result.error) throw new Error(result.error);
+          }
+          if (currentRootRef.current === rootPath) setSourceControl(result);
+          return true;
+        } catch (cause) {
+          if (currentRootRef.current === rootPath) {
+            setGitError(cause instanceof Error ? cause.message : String(cause));
+            // A bulk operation may have partially succeeded. Read the actual index.
+            try {
+              const actual = await window.goferDesktop?.workspace?.gitStatus?.(rootPath);
+              if (currentRootRef.current === rootPath) setSourceControl(actual ?? { active: false, entries: [] });
+            } catch {
+              if (currentRootRef.current === rootPath) setSourceControl({ active: false, entries: [] });
+            }
+          }
+          return false;
+        }
+      })();
+      pending.rootPath = rootPath;
+      pendingStagingRef.current = pending;
+      await pending;
+      if (pendingStagingRef.current === pending) pendingStagingRef.current = null;
+      setGitStaging(false);
+      return;
+    }
+    if (bulk && action === "revert-staged" && sourceControl.entries.some((entry) => value.includes(entry.path) && entry.unstaged)) {
+      setGitError("Some staged files also have unstaged edits. Unstage those files first, or discard their unstaged edits before discarding all staged changes.");
+      return;
+    }
+    const discardTarget = bulk ? `all ${value.length} ${action === "revert-staged" ? "staged" : "unstaged"} files` : value;
+    if (action.startsWith("revert") && !window.confirm(`Discard ${action === "revert-staged" ? "staged" : "unstaged"} changes to ${discardTarget}? New files will be moved to the trash.`)) return;
+    gitOperationRef.current = true;
+    setGitBusy(true);
+    if (changesWorkingTree) window.dispatchEvent(new CustomEvent("gofer:git-working-tree-busy", { detail: { rootPath, busy: true } }));
+    setGitError("");
+    setGitNotice("");
+    try {
+      if (pendingStagingRef.current && !await pendingStagingRef.current) return;
+      const bridge = window.goferDesktop?.workspace;
+      let result;
+      if (bulk) {
+        for (const filePath of value) {
+          result = await bridge?.gitFileAction?.(rootPath, filePath, action);
+          if (!result) throw new Error("Restart the desktop app to enable Git actions.");
+          if (result.error) throw new Error(result.error);
+        }
+      } else result = action === "switch"
+        ? await bridge?.gitSwitchBranch?.(rootPath, value)
+        : (["commit", "push", "pull", "publish", "stash-switch", "stash-apply", "reset-soft", "reset-hard", "detach-commit", "branch-commit"].includes(action) || /^(merge|rebase)-/.test(action))
+          ? await bridge?.gitRepoAction?.(rootPath, action, value)
+          : await bridge?.gitFileAction?.(rootPath, value, action);
+      if (!result) throw new Error("Restart the desktop app to enable Git actions.");
+      if (result.error) { if (result.active) setSourceControl(result); throw new Error(result.error); }
+      setBlockedBranch(result.switchBlocked ? result.requestedBranch : "");
+      setGitNotice(result.notice || (action === "commit" ? "Committed staged changes." : ""));
+      if (result.switchBlocked) return;
+      if (action === "commit") setCommitMessage("");
+      setSourceControl(result);
+      await refreshTree();
+      await loadGitPanels();
+      onFilesystemChange?.({ type: "git", rootPath });
+      return true;
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setGitError(message);
+      if (action === "switch" && /would be overwritten/i.test(message)) setBlockedBranch(value);
+      if (changesWorkingTree || bulk) { await refreshTree(); onFilesystemChange?.({ type: "git", rootPath }); }
+    } finally {
+      if (changesWorkingTree) window.dispatchEvent(new CustomEvent("gofer:git-working-tree-busy", { detail: { rootPath, busy: false } }));
+      setGitBusy(false);
+      gitOperationRef.current = false;
+    }
+  }
+
   const refreshTree = useCallback(async () => {
     directoriesRef.current = {};
     setDirectories({});
     setExpanded(new Set(rootPath ? [rootPath] : []));
-    setSourceControl({ active: false, entries: [] });
-    if (!rootPath) return;
+    // Keep the last Git snapshot visible while refreshing or switching worktrees.
+    if (!rootPath) {
+      setSourceControl({ active: false, entries: [] });
+      setSourceControlRoot(null);
+      return;
+    }
     try {
       await window.goferDesktop?.workspace?.trustProjectRoot?.(rootPath);
     } catch (trustError) {
@@ -130,6 +332,7 @@ export default function CodeFileExplorer({
       setGrantRequired(true);
       return;
     }
+    if (currentRootRef.current !== rootPath) return;
     await Promise.all([loadDirectory(rootPath), loadSourceControlStatus()]);
   }, [loadDirectory, loadSourceControlStatus, rootPath]);
 
@@ -144,22 +347,22 @@ export default function CodeFileExplorer({
         window.goferDesktop?.workspace?.gitHistory?.(rootPath),
         window.goferDesktop?.workspace?.gitWorktrees?.(rootPath),
       ]);
-      if (gitPanelsLoadingRef.current !== request) return;
+      if (gitPanelsLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
       setGitHistory({ active: Boolean(historyPayload?.active), commits: historyPayload?.commits ?? [], loading: false });
       setWorktrees({ active: Boolean(worktreePayload?.active), items: worktreePayload?.worktrees ?? [], loading: false });
     } catch (loadError) {
-      if (gitPanelsLoadingRef.current !== request) return;
+      if (gitPanelsLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
       setGitHistory((current) => ({ ...current, loading: false }));
       setWorktrees((current) => ({ ...current, loading: false }));
-      setError(loadError instanceof Error ? loadError.message : "Unable to load Git information");
+      setGitError(loadError instanceof Error ? loadError.message : "Unable to load Git information");
     } finally {
       if (gitPanelsLoadingRef.current === request) gitPanelsLoadingRef.current = null;
     }
   }, [rootPath]);
 
   useEffect(() => {
-    if (historyOpen) void loadGitPanels();
-  }, [historyOpen, loadGitPanels]);
+    if (sidebarView === "source-control") void loadGitPanels();
+  }, [sidebarView, loadGitPanels]);
 
   useEffect(() => {
     setSelectedPath(rootPath);
@@ -167,6 +370,9 @@ export default function CodeFileExplorer({
     setCopiedCommitHash("");
     setClipboardEntry(null);
     setContextMenu(null);
+    setWorktreeMenu(null);
+    setIntegrationSource("");
+    setIntegrationRequest(null);
     setGrantRequired(false);
     void refreshTree();
   }, [refreshTree, rootPath]);
@@ -313,6 +519,7 @@ export default function CodeFileExplorer({
   }
 
   async function createChild(kind, directory, name) {
+    if (gitBusy) return;
     setError("");
     try {
       const result = kind === "file"
@@ -335,6 +542,7 @@ export default function CodeFileExplorer({
   }
 
   async function renameEntry(entry, name) {
+    if (gitBusy) return;
     setError("");
     try {
       const result = await window.goferDesktop?.workspace?.renamePath?.({
@@ -367,6 +575,7 @@ export default function CodeFileExplorer({
   }
 
   async function pasteEntry(directory = selectedDirectory || rootPath) {
+    if (gitBusy) return;
     setContextMenu(null);
     if (!clipboardEntry || !directory) return;
     setError("");
@@ -394,6 +603,7 @@ export default function CodeFileExplorer({
   }
 
   async function deleteEntry(entry = selectedEntry) {
+    if (gitBusy) return;
     setContextMenu(null);
     if (!entry || entry.path === rootPath) return;
     const kind = entry.isDirectory ? "folder" : "file";
@@ -482,16 +692,19 @@ export default function CodeFileExplorer({
 
   async function createWorktree(event) {
     event.preventDefault();
+    if (gitBusy) return;
     setError("");
     try {
       const payload = await window.goferDesktop?.workspace?.addWorktree?.({
         branch: worktreeBranch,
         createBranch: worktreeCreateBranch,
+        startPoint: worktreeStartPoint || undefined,
         projectRoot: rootPath,
         targetPath: worktreeFolder,
       });
       setWorktrees({ active: true, items: payload?.worktrees ?? [], loading: false });
       setWorktreeFormOpen(false);
+      setWorktreeStartPoint("");
       setWorktreeBranch("");
       setWorktreeFolder("");
       onSelectProject?.(payload?.createdPath || worktreeFolder, {
@@ -503,13 +716,29 @@ export default function CodeFileExplorer({
   }
 
   async function removeWorktree(worktree) {
-    if (!window.confirm(`Remove the worktree at ${worktree.path}? Git will refuse if it has uncommitted changes.`)) return;
-    setError("");
+    if (gitBusy || gitOperationRef.current) return;
+    gitOperationRef.current = true;
+    setGitBusy(true);
+    setWorktreeRemovalError("");
     try {
-      const payload = await window.goferDesktop?.workspace?.removeWorktree?.({ projectRoot: rootPath, targetPath: worktree.path });
+      const remove = window.goferDesktop?.workspace?.removeWorktree;
+      if (!remove) throw new Error("Worktree removal is only available in the desktop app.");
+      const payload = await remove({ projectRoot: rootPath, targetPath: worktree.path, force: worktree.requiresForce === true });
+      if (currentRootRef.current !== rootPath) return;
+      if (payload?.requiresForce) {
+        setWorktreeRemoval({ ...worktree, requiresForce: true });
+        return;
+      }
       setWorktrees({ active: true, items: payload?.worktrees ?? [], loading: false });
+      setWorktreeRemoval(null);
+      onRemoveRecentProject?.(worktree.path);
     } catch (worktreeError) {
-      setError(worktreeError instanceof Error ? worktreeError.message : "Unable to remove worktree");
+      if (currentRootRef.current === rootPath) {
+        setWorktreeRemovalError(worktreeError instanceof Error ? worktreeError.message : "Unable to remove worktree");
+      }
+    } finally {
+      gitOperationRef.current = false;
+      setGitBusy(false);
     }
   }
 
@@ -556,10 +785,43 @@ export default function CodeFileExplorer({
   const rootLoading = loadingPaths.has(rootPath);
   return (
     <div
-      className="flex h-full min-h-0 flex-col"
-      aria-label="Project file explorer"
+      className="flex h-full min-h-0 min-w-0"
+      aria-label="Project sidebar"
       onKeyDownCapture={handleExplorerKeyDown}
     >
+      <div role="tablist" aria-label="Project sidebar views" aria-orientation="vertical" className="flex w-10 shrink-0 flex-col border-r border-line">
+        {[
+          { id: "files", label: "File explorer", icon: Folder },
+          { id: "search", label: "Search", icon: Search },
+          { id: "source-control", label: "Source control", icon: GitBranch },
+        ].map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            id={`sidebar-tab-${id}`}
+            role="tab"
+            type="button"
+            aria-label={label}
+            title={label}
+            aria-selected={sidebarView === id}
+            aria-controls={`sidebar-panel-${id}`}
+            tabIndex={sidebarView === id ? 0 : -1}
+            className={`grid h-10 w-full shrink-0 place-items-center border-l-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand ${sidebarView === id ? "border-brand text-ink" : "border-transparent text-muted hover:bg-slate-100 hover:text-ink"}`}
+            onClick={() => { setSidebarView(id); if (id === "search") setSearchFocusRequest((value) => value + 1); setContextMenu(null); setRecentMenuOpen(false); }}
+            onKeyDown={(event) => {
+              if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+              event.preventDefault();
+              const views = ["files", "search", "source-control"];
+              const next = event.key === "Home" ? views[0] : event.key === "End" ? views.at(-1) : views[(views.indexOf(id) + (event.key === "ArrowDown" ? 1 : views.length - 1)) % views.length];
+              setSidebarView(next);
+              setContextMenu(null);
+              setRecentMenuOpen(false);
+              event.currentTarget.parentElement.querySelector(`#sidebar-tab-${next}`)?.focus();
+            }}
+          ><Icon aria-hidden="true" size={19} strokeWidth={1.5} /></button>
+        ))}
+      </div>
+      <ProjectSearch key={rootPath} rootPath={rootPath} active={sidebarView === "search"} focusRequest={searchFocusRequest} onOpenFile={onOpenFile} disabled={gitBusy} onBusy={setGitBusy} onReplace={() => { void refreshTree(); onFilesystemChange?.({ type: "git", rootPath }); }} />
+      <div id="sidebar-panel-files" role="tabpanel" aria-labelledby="sidebar-tab-files" hidden={sidebarView !== "files"} className={`min-h-0 min-w-0 flex-1 flex-col ${sidebarView === "files" ? "flex" : "hidden"}`}>
       <div className="flex h-7 items-center justify-between px-1.5">
         <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted">Explorer</span>
         <div className="flex items-center">
@@ -735,28 +997,99 @@ export default function CodeFileExplorer({
         </div>
       </div>
 
-      <section className={`shrink-0 border-t border-line bg-white ${historyOpen ? "h-1/2 min-h-52" : "h-8"}`} aria-label="Git history and worktrees">
-        <button
-          aria-expanded={historyOpen}
-          className="flex h-8 w-full items-center gap-2 px-2 text-left text-[10px] font-semibold uppercase tracking-[0.12em] text-muted hover:bg-slate-50"
-          type="button"
-          onClick={() => setHistoryOpen((current) => !current)}
-        >
-          <ChevronDown className={`transition ${historyOpen ? "" : "-rotate-90"}`} size={12} />
-          <History size={12} />
-          <span className="flex-1">Source control</span>
-        </button>
-        {historyOpen ? (
-          <div className="h-[calc(100%-2rem)] overflow-y-auto px-1.5 pb-2">
+      {clipboardEntry ? (
+        <div className="mx-1.5 mt-2 flex items-center gap-1.5 rounded-md bg-slate-100 px-2 py-1.5 text-[10px] text-muted">
+          <Copy size={11} />
+          <span className="min-w-0 flex-1 truncate" title={clipboardEntry.path}>Copied {clipboardEntry.name}</span>
+          <button aria-label="Clear copied file" type="button" onClick={() => setClipboardEntry(null)}><X size={11} /></button>
+        </div>
+      ) : null}
+
+      </div>
+      <section id="sidebar-panel-source-control" role="tabpanel" aria-labelledby="sidebar-tab-source-control" hidden={sidebarView !== "source-control"} className={`scm-panel min-h-0 min-w-0 flex-1 flex-col bg-white text-ink ${sidebarView === "source-control" ? "flex" : "hidden"}`}>
+        <div className="flex h-8 shrink-0 items-center justify-between px-3">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted">Source control</span>
+          <div className="flex shrink-0 items-center gap-1">
+            {sourceControl.active && (sourceControl.ahead != null || sourceControl.remotes?.length) ? <>
+              <button aria-label="Pull" title="Pull" className="grid h-7 w-7 place-items-center rounded text-muted hover:bg-slate-100 focus-visible:outline disabled:opacity-40" disabled={gitBusy || sourceControl.ahead == null} type="button" onClick={() => void changeSourceControl("pull")}><ArrowDown aria-hidden="true" size={13} /></button>
+              {sourceControl.ahead != null ? <button aria-label="Push" title="Push" className="grid h-7 w-7 place-items-center rounded text-muted hover:bg-slate-100 focus-visible:outline disabled:opacity-40" disabled={gitBusy} type="button" onClick={() => void changeSourceControl("push")}><ArrowUp aria-hidden="true" size={13} /></button> : null}
+            </> : null}
+          <button aria-label="Refresh source control" className="grid h-7 w-7 place-items-center rounded text-muted hover:bg-slate-100" disabled={gitBusy || gitHistory.loading || worktrees.loading} type="button" onClick={() => { void loadSourceControlStatus(); void loadGitPanels(); }}><RefreshCw size={13} /></button>
+          </div>
+        </div>
+          {sourceControl.active ? <div className="shrink-0 space-y-2 border-b border-line px-3 pb-3">
+            <p className="truncate text-[11px] text-muted" title={rootPath}>{workspaceBasename(rootPath)}</p>
+                <label className="flex items-center gap-2 px-1 text-xs">
+                  <GitBranch aria-hidden="true" size={13} />
+                  <span className="sr-only">Current branch</span>
+                  <select aria-label="Switch branch" className="h-8 min-w-0 flex-1 rounded border border-line bg-white px-1 text-ink focus-visible:outline" disabled={gitBusy || worktrees.loading} value={sourceControl.branch || ""} onChange={(event) => void changeSourceControl("switch", event.target.value)}>
+                    {!sourceControl.branch ? <option value="">Detached HEAD</option> : null}
+                    {sourceControl.branch && !sourceControl.branches?.includes(sourceControl.branch) ? <option value={sourceControl.branch}>{sourceControl.branch}</option> : null}
+                    {(sourceControl.branches || []).filter(branch => branch === sourceControl.branch || !worktrees.items.some(worktree => worktree.branch === branch)).map((branch) => <option key={branch} value={branch}>{branch}</option>)}
+                  </select>
+                </label>
+                <p className="px-1 text-[11px] text-muted">{sourceControl.ahead == null ? "Local branch" : `${sourceControl.ahead} ahead · ${sourceControl.behind} behind`}</p>
+                {sourceControl.ahead == null && sourceControl.remotes?.length ? <div className="flex flex-wrap gap-1 px-1">
+                    <select aria-label="Publish remote" className="min-w-0 flex-1 rounded border border-line bg-white text-[11px]" value={remote || sourceControl.remotes?.[0] || ""} onChange={(event) => setRemote(event.target.value)}>
+                      {!sourceControl.remotes?.length ? <option value="">No remote configured</option> : sourceControl.remotes.map((name) => <option key={name}>{name}</option>)}
+                    </select>
+                    <button type="button" className="rounded border border-line px-2 py-1 text-[11px] disabled:opacity-40" disabled={gitBusy || !sourceControl.remotes?.length} onClick={() => void changeSourceControl("publish", remote || sourceControl.remotes[0])}>Publish</button>
+                </div> : null}
+
+          </div> : null}
+          <div role="tablist" aria-label="Source control views" className="flex shrink-0 gap-3 border-b border-line px-3">
+            {["changes", "history", "worktrees"].map((tab, index, tabs) => <button key={tab} id={`scm-tab-${tab}`} role="tab" aria-selected={sourceTab === tab} aria-controls="scm-content" tabIndex={sourceTab === tab ? 0 : -1} className={`min-w-0 border-b-2 py-2.5 text-[11px] ${sourceTab === tab ? "border-brand font-semibold text-ink" : "border-transparent text-muted hover:text-ink"}`} type="button" onClick={() => setSourceTab(tab)} onKeyDown={(event) => {
+              const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
+              if (next < 0) return;
+              event.preventDefault(); setSourceTab(tabs[next]); document.getElementById(`scm-tab-${tabs[next]}`)?.focus();
+            }}>{tab === "changes" ? "Changes" : tab === "history" ? "History" : "Worktrees"}</button>)}
+          </div>
+          <div id="scm-content" role="tabpanel" aria-labelledby={`scm-tab-${sourceTab}`} tabIndex={0} className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
+            {gitError || blockedBranch ? <div role="alert" className="scm-notice mb-3 rounded p-3 text-xs">
+              <div className="flex items-start gap-2"><strong className="min-w-0 flex-1">{blockedBranch ? "Changes would be overwritten" : sourceControlErrorSummary(gitError)}</strong><button aria-label="Dismiss Git error" type="button" onClick={() => { setGitError(""); setBlockedBranch(""); }}><X size={13} /></button></div>
+              {blockedBranch ? <><p className="my-2 break-words">Commit your changes or stash them before switching to {blockedBranch}.</p><div className="flex flex-wrap gap-2"><button className="rounded border border-current px-2 py-1" disabled={gitBusy} type="button" onClick={() => void changeSourceControl("stash-switch", blockedBranch)}>Stash &amp; switch</button><button type="button" disabled={gitBusy} onClick={() => { setBlockedBranch(""); setGitError(""); setGitNotice(""); }}>Stay on {sourceControl.branch || "this branch"}</button></div></> : null}
+              {gitError ? <details className="mt-2"><summary className="cursor-pointer">Technical details</summary><pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[11px]">{gitError}</pre></details> : null}
+            </div> : null}
+            {gitNotice && !blockedBranch ? <p role="status" className="mb-3 px-1 text-xs text-muted">{gitNotice}</p> : null}
+            {sourceControl.operation || sourceControl.entries.some(entry => entry.status === "!") ? <section aria-label="Merge conflicts" className="mb-4 space-y-2 rounded border border-line p-3 text-xs">
+              <strong>{sourceControl.operation ? `${sourceControl.operation === "rebase" ? "Rebase" : "Merge"} paused` : "Unresolved conflicts"}</strong>
+              <p>The ! entry in Staged is an unresolved index conflict. Review and save the working file in Unstaged, then stage it to resolve.</p>
+              <div className="flex flex-wrap gap-2"><button className="rounded border border-line px-2 py-1.5" type="button" onClick={() => window.dispatchEvent(new CustomEvent("gofer:rem-context", { detail: { mode: "conflicts", projectRoot: rootPath, text: sourceControl.entries.filter(entry => entry.status === "!").map(entry => entry.path).join("\n") } }))}>Resolve conflicts with Rem</button>
+              {sourceControl.operation ? <><button className="rounded border border-line px-2 py-1.5" type="button" disabled={gitBusy || sourceControl.entries.some(entry => entry.status === "!")} onClick={() => void changeSourceControl(`${sourceControl.operation}-continue`)}>Continue {sourceControl.operation}</button><button className="rounded border border-line px-2 py-1.5" type="button" disabled={gitBusy} onClick={() => { if (window.confirm(`Abort this ${sourceControl.operation}? Conflict resolution edits will be discarded.`)) void changeSourceControl(`${sourceControl.operation}-abort`); }}>Abort {sourceControl.operation}</button></> : null}</div>
+            </section> : null}
+            {!sourceControl.active ? <p className="px-2 py-6 text-xs text-muted">This project is not a Git repository.</p> : <>
+              {sourceTab === "changes" ? sourceControl.entries.length ? <>
+                {[["staged", "Staged"], ["unstaged", "Unstaged"]].map(([group, title]) => {
+                  const entries = sourceControl.entries.filter((entry) => entry[group] || (group === "staged" && entry.status === "!"));
+                  if (!entries.length) return null;
+                  return <details key={group} open aria-label={title} className="mb-5">
+                    <summary className="cursor-pointer px-1 py-1 text-[11px] font-semibold text-ink">
+                      <span className="inline-flex w-[calc(100%-1rem)] items-center gap-1 align-middle">
+                        <span className="min-w-0 flex-1">{title} · {entries.length}</span>
+                        <button aria-label={group === "staged" ? "Unstage all changes" : "Stage all changes"} title={group === "staged" ? "Unstage all changes" : "Stage all changes"} className="grid h-7 w-7 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink focus-visible:outline disabled:opacity-40" disabled={gitBusy || !entries.some(entry => group !== "staged" || entry.status !== "!")} type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); void changeSourceControl(group === "staged" ? "unstage" : "stage", entries.filter(entry => group !== "staged" || entry.status !== "!").map((entry) => entry.path)); }}>{group === "staged" ? <Minus size={12} /> : <Plus size={12} />}</button>
+                        <button aria-label={`Discard all ${group} changes`} title={`Discard all ${group} changes`} className="grid h-7 w-7 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 hover:text-red-700 focus-visible:outline disabled:opacity-40" disabled={gitBusy || !entries.length || entries.some(entry => entry.status === "!")} type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); void changeSourceControl(group === "staged" ? "revert-staged" : "revert", entries.filter(entry => group !== "staged" || entry.status !== "!").map((entry) => entry.path)); }}><Trash2 size={12} /></button>
+                      </span>
+                    </summary>
+                    {entries.map((entry) => <div key={entry.path} className={`scm-file flex min-h-12 items-center gap-1 rounded px-2 ${activeFilePath === joinWorkspacePath(rootPath, entry.path) ? "bg-indigo-50" : "hover:bg-slate-50"}`}>
+                      <span title={entry.status === "!" ? "Unresolved index conflict. Stage the working file to resolve." : undefined} className="w-3 shrink-0 text-[10px] text-muted">{entry.status}</span>
+                      <button className="min-w-0 flex-1 truncate text-left text-[11px] text-ink" title={entry.path} type="button" onClick={() => onOpenFile?.(joinWorkspacePath(rootPath, entry.path), { diff: true, gitGroup: entry.status === "!" ? "unstaged" : group })}><span className="block truncate text-xs font-medium">{workspaceBasename(entry.path)}</span><span className="block truncate text-[11px] text-muted">{entry.path.includes("/") ? entry.path.slice(0, entry.path.lastIndexOf("/")) : ""}</span></button>
+                      <button aria-label={`${group === "staged" ? "Unstage" : "Stage"} ${entry.path}`} title={group === "staged" ? "Unstage change" : "Stage change"} className="grid h-7 w-7 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 focus-visible:outline disabled:opacity-40" disabled={gitBusy || (group === "staged" && entry.status === "!")} type="button" onClick={() => void changeSourceControl(group === "staged" ? "unstage" : "stage", entry.path)}>{group === "staged" ? <Minus size={12} /> : <Plus size={12} />}</button>
+                      <button aria-label={`Discard ${group} changes to ${entry.path}`} title="Discard changes" className="grid h-7 w-7 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 hover:text-red-700 focus-visible:outline disabled:opacity-40" disabled={gitBusy || entry.status === "!"} type="button" onClick={() => void changeSourceControl(group === "staged" ? "revert-staged" : "revert", entry.path)}><Trash2 size={12} /></button>
+                    </div>)}
+                  </details>;
+                })}
+              </> : <div className="px-3 py-10 text-center"><Check className="mx-auto mb-3 text-muted" size={20} /><strong className="text-sm font-semibold">Working tree clean</strong><p className="mt-1 text-xs text-muted">No uncommitted changes.</p></div> : null}
+              {sourceTab === "worktrees" ? <>
             <div className="flex h-7 items-center justify-between">
               <span className="text-[10px] font-semibold text-ink">Worktrees</span>
-              <button aria-label="Add worktree" className="grid h-6 w-6 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink" type="button" onClick={() => setWorktreeFormOpen((current) => !current)}><FolderPlus size={12} /></button>
+              <button aria-label="Add worktree" className="grid h-6 w-6 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink" type="button" onClick={() => { setWorktreeStartPoint(""); setWorktreeFormOpen((current) => !current); }}><FolderPlus size={12} /></button>
             </div>
             {worktreeFormOpen ? (
               <form className="mb-2 space-y-1.5 rounded-md bg-slate-50 p-2" onSubmit={createWorktree}>
+                {worktreeStartPoint ? <p className="text-xs text-muted">Starting at {worktreeStartPoint.slice(0, 8)}</p> : null}
                 <input aria-label="Worktree branch" className="h-7 w-full rounded border border-line bg-white px-2 text-[11px] outline-none focus:border-indigo-500" placeholder="Branch name" required value={worktreeBranch} onChange={(event) => setWorktreeBranch(event.target.value)} />
                 <button className="flex h-7 w-full items-center gap-1.5 rounded border border-line bg-white px-2 text-left text-[11px] text-muted hover:text-ink" type="button" onClick={chooseWorktreeFolder}><FolderOpen size={12} /><span className="min-w-0 flex-1 truncate">{worktreeFolder || "Choose an empty folder"}</span></button>
-                <label className="flex items-center gap-1.5 text-[10px] text-muted"><input checked={worktreeCreateBranch} type="checkbox" onChange={(event) => setWorktreeCreateBranch(event.target.checked)} />Create a new branch</label>
+                <label className="flex items-center gap-1.5 text-[10px] text-muted"><input checked={worktreeCreateBranch} disabled={Boolean(worktreeStartPoint)} type="checkbox" onChange={(event) => setWorktreeCreateBranch(event.target.checked)} />Create a new branch</label>
                 <button className="h-7 w-full rounded bg-brand text-[11px] font-semibold text-white disabled:opacity-40" disabled={!worktreeBranch.trim() || !worktreeFolder} type="submit">Add worktree</button>
               </form>
             ) : null}
@@ -767,6 +1100,20 @@ export default function CodeFileExplorer({
                 <div
                   key={worktree.path}
                   className="group relative flex min-h-8 items-center gap-1 rounded px-1.5 hover:bg-slate-50"
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (gitBusy || !worktree.branch) return;
+                    setWorktreeMenu({ source: worktree.branch, x: event.clientX, y: event.clientY, trigger: event.currentTarget.querySelector("button") });
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (gitBusy || !worktree.branch) return;
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    setWorktreeMenu({ source: worktree.branch, x: rect.left, y: rect.bottom, trigger: event.target });
+                  }}
                 >
                   {activeWorktree ? <span aria-hidden="true" className="absolute inset-y-1 left-0 w-px bg-brand" /> : null}
                   <GitBranch className="shrink-0 text-muted" size={12} />
@@ -780,15 +1127,29 @@ export default function CodeFileExplorer({
                     })}
                   >
                     <span className="block truncate text-[11px] font-medium text-ink">{worktree.branch || "Detached HEAD"}</span>
-                    <span className="block truncate text-[9px] text-muted">
-                      {workspaceBasename(worktree.path)}
+                    <span className="block truncate text-[11px] text-muted">
+                      {worktree.path}
                     </span>
                   </button>
-                  {!activeWorktree ? <button aria-label={`Remove ${worktree.branch || "detached"} worktree`} className="grid h-6 w-6 place-items-center rounded text-muted opacity-0 hover:bg-red-50 hover:text-red-700 focus:opacity-100 group-hover:opacity-100" type="button" onClick={() => removeWorktree(worktree)}><Trash2 size={11} /></button> : null}
+                  {worktree.branch ? <button aria-label={`Integrate ${worktree.branch} worktree`} title="Merge or rebase worktree" className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand disabled:opacity-40" disabled={gitBusy} type="button" onClick={() => { setIntegrationRequest(null); setIntegrationSource(worktree.branch); }}><GitMerge aria-hidden="true" size={13} /></button> : null}
+                  {activeWorktree ? <span className="text-[10px] text-muted">Current</span> : null}
+                  {!activeWorktree ? <button aria-label={`Remove ${worktree.branch || "detached"} worktree`} className="grid h-6 w-6 place-items-center rounded text-muted opacity-0 hover:bg-red-50 hover:text-red-700 focus:opacity-100 group-hover:opacity-100" type="button" disabled={gitBusy} onClick={() => { setWorktreeRemovalError(""); setWorktreeRemoval(worktree); }}><Trash2 size={11} /></button> : null}
                 </div>
               );
             })}
-            <div className="mt-2 flex h-7 items-center gap-1.5 border-t border-line pt-1 text-[10px] font-semibold text-ink">
+
+                <GitIntegrationControls key={rootPath} rootPath={rootPath} sourceControl={sourceControl} worktrees={worktrees.items} source={integrationSource} request={integrationRequest} onSourceChange={setIntegrationSource} onBusy={(busy) => { gitOperationRef.current = busy; setGitBusy(busy); }} disabled={gitBusy} onSelectProject={onSelectProject} onChanged={async (result) => {
+                  if (currentRootRef.current !== rootPath) return;
+                  if (result.active) setSourceControl(result);
+                  setGitNotice(result.notice || "");
+                  await refreshTree(); await loadGitPanels();
+                  onFilesystemChange?.({ type: "git", rootPath });
+                  if (result.destinationRoot && result.destinationRoot !== rootPath) onFilesystemChange?.({ type: "git", rootPath: result.destinationRoot });
+                  if (result.conflicts?.length) setSourceTab("changes");
+                }} />
+              </> : null}
+              {sourceTab === "history" ? <>
+            <div className="flex h-7 items-center gap-1.5 pb-1 text-[10px] font-semibold text-ink">
               <GitCommitHorizontal size={12} />
               <span className="flex-1">Commit history</span>
               <button
@@ -804,11 +1165,12 @@ export default function CodeFileExplorer({
             </div>
             {gitHistory.loading && !gitHistory.commits.length ? <p className="py-2 text-[11px] text-muted">Loading history...</p> : null}
             {!gitHistory.loading && !gitHistory.active ? <p className="py-2 text-[11px] text-muted">This project is not a Git repository.</p> : null}
+            {!gitHistory.loading && gitHistory.active && !gitHistory.commits.length ? <p className="py-6 text-center text-xs text-muted">No commits yet.</p> : null}
             {gitHistory.commits.map((commit) => {
               const isExpanded = expandedCommits.has(commit.hash);
               const isCopied = copiedCommitHash === commit.hash;
               return (
-                <div key={commit.hash} className={`rounded-md transition-colors ${isExpanded ? "bg-slate-50" : "hover:bg-slate-50"}`}>
+                <div key={commit.hash} onContextMenu={event => openHistoryMenu(event, commit)} onKeyDown={event => { if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) openHistoryMenu(event, commit); }} className={`rounded-md transition-colors ${isExpanded ? "bg-slate-50" : "hover:bg-slate-50"}`}>
                   <div className="flex items-start rounded-md">
                     <button
                       aria-expanded={isExpanded}
@@ -850,18 +1212,45 @@ export default function CodeFileExplorer({
                 </div>
               );
             })}
+
+              </> : null}
+            </>}
           </div>
-        ) : null}
+          {sourceControl.active && sourceTab === "changes" && sourceControl.entries.length > 0 ? (
+                <form className="scm-composer shrink-0 space-y-2 border-t border-line bg-slate-50 p-3" onSubmit={(event) => { event.preventDefault(); void changeSourceControl("commit", commitMessage); }}>
+                  <label className="block text-xs font-semibold" htmlFor="scm-commit-message">Commit message</label>
+                  <div className="relative">
+                  <button type="button" aria-label="Generate commit message with Rem" title="Generate a Conventional Commit message from staged changes" className="absolute right-1 top-1 rounded border border-line bg-canvas px-2 py-1 text-[11px] text-ink disabled:opacity-40" disabled={gitBusy || generatingMessage || !stagedCount || sourceControl.entries.some(entry => entry.status === "!")} onClick={() => void generateCommitMessage()}>{generatingMessage ? "Generating…" : "Rem"}</button>
+                  <textarea id="scm-commit-message" aria-label="Commit message" placeholder="Describe your changes…" rows={2} className="scm-commit-message w-full pr-24 resize-none rounded border border-line bg-white px-2 py-1 text-xs focus-visible:outline" value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && commitMessage.trim() && !gitOperationBusy && stagedCount) { event.preventDefault(); void changeSourceControl("commit", commitMessage); } }} />
+                  </div>
+                  <button type="submit" className="h-8 w-full rounded bg-brand text-[11px] font-semibold text-white disabled:opacity-40" disabled={gitStatusPending || gitOperationBusy || !commitMessage.trim() || !stagedCount || sourceControl.entries.some(entry => entry.status === "!")}>{gitOperationBusy ? "Working…" : `Commit ${stagedCount} staged file${stagedCount === 1 ? "" : "s"}`}</button>
+                  <p className="text-[11px] text-muted">Only staged files will be committed. Unresolved conflicts block commits.</p>
+                </form>
+
+          ) : null}
       </section>
 
-      {clipboardEntry ? (
-        <div className="mx-1.5 mt-2 flex items-center gap-1.5 rounded-md bg-slate-100 px-2 py-1.5 text-[10px] text-muted">
-          <Copy size={11} />
-          <span className="min-w-0 flex-1 truncate" title={clipboardEntry.path}>Copied {clipboardEntry.name}</span>
-          <button aria-label="Clear copied file" type="button" onClick={() => setClipboardEntry(null)}><X size={11} /></button>
-        </div>
-      ) : null}
-
+      {worktreeMenu && sidebarView === "source-control" && sourceTab === "worktrees" ? <WorktreeContextMenu
+        {...worktreeMenu}
+        branches={sourceControl.branches || []}
+        disabled={gitBusy}
+        onClose={() => setWorktreeMenu(null)}
+        onSelect={(kind, target) => {
+          setIntegrationSource(worktreeMenu.source);
+          setIntegrationRequest({ kind, target });
+          setWorktreeMenu(null);
+        }}
+      /> : null}
+      {branchRequest ? <Dialog title="Checkout new branch" onClose={() => { if (!gitBusy) setBranchRequest(null); }} panelClassName="w-full max-w-sm rounded-lg border border-line bg-white p-4 shadow-panel">
+        <form className="space-y-3" onSubmit={async event => { event.preventDefault(); if (!branchDraft.trim() || gitBusy) return; if (await changeSourceControl("branch-commit", { hash: branchRequest.hash, branch: branchDraft.trim() })) setBranchRequest(null); }}>
+          <h3 className="text-sm font-semibold">Checkout new branch</h3>
+          <p className="text-xs text-muted">Start at {branchRequest.hash.slice(0, 8)}</p>
+          <label className="block text-xs">Branch name<input autoFocus aria-label="New branch name" className="mt-1 h-9 w-full rounded border border-line bg-canvas px-2 text-sm focus-visible:outline" value={branchDraft} onChange={event => setBranchDraft(event.target.value)} /></label>
+          {gitError ? <p role="alert" className="text-xs text-red-700">{gitError}</p> : null}
+          <div className="flex justify-end gap-2"><button type="button" disabled={gitBusy} onClick={() => setBranchRequest(null)} className="rounded border border-line px-3 py-2 text-xs">Cancel</button><button type="submit" disabled={gitBusy || !branchDraft.trim()} className="rounded bg-brand px-3 py-2 text-xs text-white disabled:opacity-40">Checkout branch</button></div>
+        </form>
+      </Dialog> : null}
+      {historyMenu && sidebarView === "source-control" && sourceTab === "history" ? <WorktreeContextMenu {...historyMenu} operations={historyOperations} disabled={gitBusy} onClose={() => setHistoryMenu(null)} onSelect={kind => void historyAction(kind)} /> : null}
       {contextMenu ? (
         <ExplorerContextMenu
           canPaste={Boolean(clipboardEntry)}
@@ -879,6 +1268,23 @@ export default function CodeFileExplorer({
           onRefresh={() => loadDirectory(contextMenu.directory || rootPath)}
           onRename={() => requestRename(contextMenu.entry)}
         />
+      ) : null}
+
+      {worktreeRemoval ? (
+        <Dialog
+          title={worktreeRemoval.requiresForce ? "Discard changes and remove worktree?" : "Remove worktree?"}
+          onClose={() => { if (!gitOperationRef.current) setWorktreeRemoval(null); }}
+          panelClassName="w-full max-w-md rounded-xl border border-line bg-white p-5 text-ink"
+        >
+          <h2 className="text-sm font-semibold">{worktreeRemoval.requiresForce ? "Discard changes and remove worktree?" : "Remove worktree?"}</h2>
+          <p className="mt-3 break-all text-xs text-muted">{worktreeRemoval.path}</p>
+          <p className="mt-3 text-xs">{worktreeRemoval.requiresForce ? "This worktree has uncommitted changes. Removing it will permanently discard all uncommitted changes and untracked files, and delete its folder. The branch will be kept." : "This removes the worktree and its folder. The branch will be kept."}</p>
+          {worktreeRemovalError ? <p role="alert" className="mt-3 break-words text-xs text-red-600">{worktreeRemovalError}</p> : null}
+          <div className="mt-5 flex justify-end gap-2">
+            <button type="button" className="rounded border border-line px-3 py-2 text-xs" disabled={gitOperationBusy} onClick={() => setWorktreeRemoval(null)}>Cancel</button>
+            <button aria-label={worktreeRemoval.requiresForce ? "Discard changes and remove" : "Confirm worktree removal"} type="button" className="rounded bg-red-600 px-3 py-2 text-xs text-white disabled:opacity-50" disabled={gitBusy} onClick={() => removeWorktree(worktreeRemoval)}>{gitOperationBusy ? "Removing…" : worktreeRemoval.requiresForce ? "Discard changes and remove" : "Remove worktree"}</button>
+          </div>
+        </Dialog>
       ) : null}
 
       {nameRequest ? (
@@ -951,6 +1357,7 @@ function SourceControlDecoration({ directory = false, path, projectRoot, statuse
     );
   }
   const presentation = {
+    "!": { className: "text-red-700 dark:text-red-300", label: "Merge conflict" },
     A: { className: "source-control-status--added", label: "Added" },
     M: { className: "source-control-status--modified", label: "Modified" },
     U: { className: "source-control-status--untracked", label: "Untracked" },
@@ -1092,10 +1499,7 @@ export function sourceControlStatusForPath(rootPath, targetPath, statuses = [], 
 }
 
 function sourceControlSnapshotsEqual(left, right) {
-  if (left.active !== right.active || left.entries.length !== right.entries.length) return false;
-  return left.entries.every((entry, index) => (
-    entry.path === right.entries[index]?.path && entry.status === right.entries[index]?.status
-  ));
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export function nextCopyName(name = "copy", existingNames = new Set()) {
@@ -1206,4 +1610,13 @@ function discardDirectoryBranch(setDirectories, branchPath) {
     Object.entries(current).filter(([directory]) =>
       directory !== branchPath && !normalizeWorkspacePath(directory).startsWith(`${normalizeWorkspacePath(branchPath)}/`)),
   ));
+}
+
+export function sourceControlErrorSummary(message) {
+  if (/unsaved editor/i.test(message)) return "Save your editor changes and try again.";
+  if (/conflict|unmerged/i.test(message)) return "Resolve the Git conflicts before continuing.";
+  if (/authentication|permission denied|could not read Username/i.test(message)) return "Git authentication failed. Check your remote access and try again.";
+  if (/restart the desktop/i.test(message)) return "Restart the desktop app to enable Git actions.";
+  if (/network|could not resolve|unable to access/i.test(message)) return "Could not reach the remote. Check your connection and try again.";
+  return "Git could not complete this action. Review the details and try again.";
 }

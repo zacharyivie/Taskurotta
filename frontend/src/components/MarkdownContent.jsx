@@ -27,7 +27,7 @@ export default function MarkdownContent({
       return;
     }
     event.preventDefault();
-    if ((!hasUrlScheme(href) || isFileUrl(href)) && onOpenRelativeLinkRef.current) {
+    if ((!hasUrlScheme(href) || isFileUrl(href) || isWindowsFilePath(href)) && onOpenRelativeLinkRef.current) {
       onOpenRelativeLinkRef.current(href);
       return;
     }
@@ -216,12 +216,16 @@ function hasUrlScheme(value) {
   return /^[a-z][a-z\d+.-]*:/i.test(value);
 }
 
+function isWindowsFilePath(value) {
+  return /^[a-z]:[\\/]/i.test(value) || String(value).startsWith("\\\\");
+}
+
 function isFileUrl(value) {
   return /^file:/i.test(value);
 }
 
 export function markdownUrlTransform(url, key) {
-  if (key === "href" && isFileUrl(url)) return url;
+  if (key === "href" && (isFileUrl(url) || isWindowsFilePath(url))) return url;
   return defaultUrlTransform(url);
 }
 

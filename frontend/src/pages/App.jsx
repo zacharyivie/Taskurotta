@@ -1,8 +1,10 @@
+import { generateConventionalCommit } from "../lib/commit-message.js";
+import RemResources, { DEFAULT_REM_RESOURCES, remResourceError } from "../components/RemResources.jsx";
+import RemAvatar from "../components/RemAvatar.jsx";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowLeft,
-  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -54,6 +56,7 @@ import { apiUrl } from "../lib/api.js";
 import {
   chatMessageForRequest,
   clipboardAttachmentFiles,
+  largePasteFile,
   readChatAttachments,
   transferContainsFiles,
   uploadChatAttachments,
@@ -231,6 +234,20 @@ export function workflowExportEndpoint(workflow) {
     : `/workflows/${encodeURIComponent(workflow.id)}/export`;
 }
 
+export async function withProjectOpenTimeout(operation, timeoutMs = 30000) {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Opening the project timed out. Try opening the folder again.")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function discoverProjectWorkflows(projectRoot) {
   const normalizedRoot = String(projectRoot ?? "").trim();
   if (!normalizedRoot) return [];
@@ -257,6 +274,27 @@ export default function App() {
   const [settings, setSettings] = useState(loadAppSettings);
   const [initialStudioSession] = useState(loadStudioSession);
   const [textZoom, setTextZoom] = useState(loadTextZoom);
+  useEffect(() => {
+    const bridge = window.goferDesktop?.rem;
+    if (!bridge) return;
+    void bridge.settings().then((memory) => {
+      setSettings((current) => ({ ...current, memory: { ...current.memory, ...memory } }));
+      if (memory.archiveFolder) void archiveAllConversations();
+    }).catch(reportArchiveError);
+  }, []);
+  useEffect(() => {
+    function archiveError(event) { setTopBarNotice({ type: "error", message: `Conversation archive: ${event.detail}. Rem still keeps its local history.` }); }
+    window.addEventListener("gofer:archive-error", archiveError);
+    return () => window.removeEventListener("gofer:archive-error", archiveError);
+  }, []);
+  useEffect(() => {
+    if (settings.memory.archiveFolder) void archiveAllConversations();
+  }, [settings.memory.archiveFolder]);
+  useEffect(() => {
+    if (settings.memory.secondBrainEnabled && settings.memory.secondBrainRoot) {
+      setRecentProjectRoots((current) => mergeRecentProjects([settings.memory.secondBrainRoot], current));
+    }
+  }, [settings.memory.secondBrainEnabled, settings.memory.secondBrainRoot]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false,
@@ -264,6 +302,7 @@ export default function App() {
   const [workflows, setWorkflows] = useState([]);
   const [promptAgentIds, setPromptAgentIds] = useState([]);
   const [activeWorkflowId, setActiveWorkflowId] = useState(initialStudioSession.workflowId || undefined);
+  const [openingProjectRoot, setOpeningProjectRoot] = useState("");
   const [activeProjectRoot, setActiveProjectRoot] = useState(initialStudioSession.projectRoot);
   const [studioView, setStudioView] = useState(initialStudioSession.view || settings.general.defaultView);
   const [codeEditorOpened, setCodeEditorOpened] = useState(
@@ -280,10 +319,14 @@ export default function App() {
   const [lastWorktreeByProject, setLastWorktreeByProject] = useState(loadLastWorktreeByProject);
   const [radishEditorState, setRadishEditorState] = useState(null);
   const [activeCodeDocumentState, setActiveCodeDocumentState] = useState(null);
-  const [query, setQuery] = useState("");
   const [projectPaneVisible, setProjectPaneVisible] = useState(true);
   const [assistantPaneVisible, setAssistantPaneVisible] = useState(true);
   const [assistantFocusRequest, setAssistantFocusRequest] = useState(0);
+  useEffect(() => {
+    const openRem = () => { setAssistantPaneVisible(true); setAssistantFocusRequest(current => current + 1); };
+    window.addEventListener("gofer:rem-context", openRem);
+    return () => window.removeEventListener("gofer:rem-context", openRem);
+  }, []);
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
   const [doctorState, setDoctorState] = useState({
@@ -731,7 +774,6 @@ export default function App() {
   }, [activeWorkflow?.id, activeWorkflow?.sourceFormat]);
 
   function changeStudioView(nextView) {
-    setQuery("");
     setStudioView(nextView);
     if (nextView === "code") setCodeEditorOpened(true);
   }
@@ -749,16 +791,19 @@ export default function App() {
     previewCodePathRef.current = next.previewPath;
     setPreviewCodePath(next.previewPath);
     setActiveCodePath(path);
-    if (Number.isInteger(options.lineNumber) && options.lineNumber > 0) {
+    if (options.diff || (Number.isInteger(options.lineNumber) && options.lineNumber > 0)) {
       codeNavigationSequenceRef.current += 1;
       setCodeNavigationRequest({
         column: Number.isInteger(options.column) && options.column > 0 ? options.column : 1,
-        lineNumber: options.lineNumber,
+        diff: options.diff === true,
+        gitGroup: options.gitGroup,
+        lineNumber: options.lineNumber || 1,
         path,
         requestId: codeNavigationSequenceRef.current,
       });
     } else {
-      setCodeNavigationRequest(null);
+      codeNavigationSequenceRef.current += 1;
+      setCodeNavigationRequest({ path, requestId: codeNavigationSequenceRef.current, diff: false });
     }
     setCodeEditorOpened(true);
     setStudioView("code");
@@ -819,10 +864,17 @@ export default function App() {
 
   async function openLinkedCodeFile(path, options = {}) {
     if (!path) return;
-    await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
-    const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
-    if (info && !info.isFile) throw new Error(`The link does not point to a file: ${path}`);
-    openCodeFile(info?.path || path, options);
+    try {
+      await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
+      const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
+      if (info && !info.isFile) throw new Error(`The link does not point to a file: ${path}`);
+      openCodeFile(info?.path || path, options);
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Could not open the linked file",
+      });
+    }
   }
 
   openLinkedCodeFileRef.current = openLinkedCodeFile;
@@ -917,7 +969,6 @@ export default function App() {
     setActiveWorkflowId(workflow.id);
     setCodeEditorOpened(true);
     setStudioView("code");
-    setQuery("");
   }
 
   async function reloadActiveRadishDocument() {
@@ -1000,59 +1051,65 @@ export default function App() {
   async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
     const requestId = projectOpenRequestRef.current + 1;
     projectOpenRequestRef.current = requestId;
-    const discoveredPayloads = await discoverProjectWorkflows(projectRoot);
-    let mainProjectRoot = projectRoot;
+    setOpeningProjectRoot(projectRoot);
     try {
-      const worktreePayload = await window.goferDesktop.workspace.gitWorktrees?.(projectRoot);
-      mainProjectRoot = mainWorktreeRoot(worktreePayload, projectRoot);
-    } catch {
-      // Non-Git projects use their selected folder as the recent-project identity.
-    }
-    if (projectOpenRequestRef.current !== requestId) return null;
-    const discovered = discoveredPayloads.map((workflow) =>
-      summarizeWorkflow(workflow, dataDir));
-    if (rememberProject) {
-      setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
-      setLastWorktreeByProject((current) => ({ ...current, [mainProjectRoot]: projectRoot }));
-    }
-    setActiveProjectRoot(projectRoot);
-    if (!discovered.length) {
-      setActiveWorkflowId(undefined);
+      const discoveredPayloads = await withProjectOpenTimeout(discoverProjectWorkflows(projectRoot));
+      let mainProjectRoot = projectRoot;
+      try {
+        const worktreePayload = await withProjectOpenTimeout(Promise.resolve(window.goferDesktop?.workspace?.gitWorktrees?.(projectRoot)), 3000);
+        mainProjectRoot = mainWorktreeRoot(worktreePayload, projectRoot);
+      } catch {
+        // Non-Git projects use their selected folder as the recent-project identity.
+      }
+      if (projectOpenRequestRef.current !== requestId) return null;
+      const discovered = discoveredPayloads.map((workflow) =>
+        summarizeWorkflow(workflow, dataDir));
+      if (rememberProject) {
+        setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
+        setLastWorktreeByProject((current) => ({ ...current, [mainProjectRoot]: projectRoot }));
+      }
+      setActiveProjectRoot(projectRoot);
+      if (!discovered.length) {
+        setActiveWorkflowId(undefined);
+        if (focusPath) {
+          setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [focusPath]));
+          setActiveCodePath(focusPath);
+        }
+        setCodeEditorOpened(true);
+        setStudioView("code");
+        return { discovered, projectRoot };
+      }
+      for (const workflow of discovered) deletedWorkflowIdsRef.current.delete(workflow.id);
+      setWorkflows((current) => {
+        const discoveredIds = new Set(discovered.map((workflow) => workflow.id));
+        return [
+          ...current.filter((workflow) => !discoveredIds.has(workflow.id)),
+          ...discovered,
+        ];
+      });
+      const selectedWorkflow = discovered.find((workflow) => workflow.sourcePath === focusPath)
+        ?? discovered[0];
       if (focusPath) {
         setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [focusPath]));
         setActiveCodePath(focusPath);
+        pinCodeFile(focusPath);
+      }
+      if (activeWorkflow?.id !== selectedWorkflow.id) {
+        pendingProjectFileRef.current = focusPath ? {
+          path: focusPath,
+          workflowId: selectedWorkflow.id,
+        } : null;
+        setActiveWorkflowId(selectedWorkflow.id);
       }
       setCodeEditorOpened(true);
       setStudioView("code");
-      setQuery("");
       return { discovered, projectRoot };
+    } catch (error) {
+      if (projectOpenRequestRef.current !== requestId) return null;
+      throw error;
+    } finally {
+      if (projectOpenRequestRef.current === requestId) setOpeningProjectRoot("");
     }
-    for (const workflow of discovered) deletedWorkflowIdsRef.current.delete(workflow.id);
-    setWorkflows((current) => {
-      const discoveredIds = new Set(discovered.map((workflow) => workflow.id));
-      return [
-        ...current.filter((workflow) => !discoveredIds.has(workflow.id)),
-        ...discovered,
-      ];
-    });
-    const selectedWorkflow = discovered.find((workflow) => workflow.sourcePath === focusPath)
-      ?? discovered[0];
-    if (focusPath) {
-      setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [focusPath]));
-      setActiveCodePath(focusPath);
-      pinCodeFile(focusPath);
-    }
-    if (activeWorkflow?.id !== selectedWorkflow.id) {
-      pendingProjectFileRef.current = {
-        path: focusPath || selectedWorkflow.sourcePath,
-        workflowId: selectedWorkflow.id,
-      };
-      setActiveWorkflowId(selectedWorkflow.id);
-    }
-    setCodeEditorOpened(true);
-    setStudioView("code");
-    setQuery("");
-    return { discovered, projectRoot };
   }
 
   async function openFile() {
@@ -1068,7 +1125,6 @@ export default function App() {
       if (!selectedPath) return;
       if (activeWorkflow?.sourceFormat === "radish") {
         openCodeFile(selectedPath);
-        setQuery("");
         return;
       }
       if (!window.goferDesktop.workspace.resolveProjectFile) {
@@ -1860,12 +1916,6 @@ export default function App() {
     };
   }, []);
 
-  const filteredWorkflows = useMemo(() => {
-    return workflows.filter((workflow) => {
-      const text = `${workflow.name} ${workflow.description} ${workflow.tags.join(" ")} ${workflow.projectName ?? ""} ${workflow.projectRoot ?? ""}`;
-      return text.toLowerCase().includes(query.toLowerCase());
-    });
-  }, [query, workflows]);
   const usedAgentIds = useMemo(() => {
     return [
       ...new Set(
@@ -2447,7 +2497,6 @@ export default function App() {
       deletedWorkflowIdsRef.current.delete(nextWorkflow.id);
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
-      setQuery("");
       setCreateDialogOpen(false);
       setCreateState({ saving: false, error: "" });
     } catch (error) {
@@ -3076,15 +3125,14 @@ export default function App() {
         activeWorkflow={activeWorkflow}
         activeWorkflowId={activeWorkflow?.id}
         loading={loadState.loading}
-        query={query}
+        openingProjectRoot={openingProjectRoot}
         runState={runState}
         settings={settings}
-        workflows={filteredWorkflows}
+        workflows={workflows}
         view={studioView}
         width={workflowPaneWidth}
         newFileRequest={newCodeFileRequest}
         recentProjectRoots={recentProjectRoots}
-        onQueryChange={setQuery}
         onCreate={() => {
           setCreateState({ saving: false, error: "" });
           setCreateDialogOpen(true);
@@ -3315,13 +3363,19 @@ export default function App() {
           onChange={changeSetting}
           onChooseDataDirectory={chooseApplicationDataDirectory}
           onClose={() => setSettingsOpen(false)}
-          onResetAll={() => setSettings(defaultSettingsSnapshot())}
+          onResetAll={async () => {
+            try { await window.goferDesktop?.rem?.configure?.("reset", true); setSettings(defaultSettingsSnapshot()); }
+            catch (error) { reportArchiveError(error); }
+          }}
         />
       ) : null}
 
       <div className={assistantPaneVisible ? "contents" : "hidden"} aria-hidden={!assistantPaneVisible}>
         <ChatPane
+          visible={assistantPaneVisible}
+          reducedMotion={settings.appearance.reducedMotion}
           composerFocusRequest={assistantFocusRequest}
+          memorySettings={settings.memory}
           assistantDefaults={settings.assistant}
           audioInputDeviceId={settings.devices.audioInputId}
           recentProjectRoots={recentProjectRoots}
@@ -3943,11 +3997,11 @@ function pathMatchesChange(path, changedPath, isDirectory) {
 }
 
 export function WorkflowSidebar({
+  openingProjectRoot = "",
   activeCodePath,
   activeWorkflow,
   activeWorkflowId,
   loading,
-  query,
   runState,
   settings,
   workflows,
@@ -3961,7 +4015,6 @@ export function WorkflowSidebar({
   onDeleteWorkflow,
   onDuplicateWorkflow,
   onEditWorkflowFile,
-  onQueryChange,
   onRefresh,
   onRenameWorkflow,
   onSelectProject,
@@ -4087,7 +4140,7 @@ export function WorkflowSidebar({
       <div className="px-3.5 pb-2 pt-3.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <TaskurottaMark className="h-8 w-8" />
+            <TaskurottaMark className="h-10 w-10" />
             <div>
               <h1 className="text-[13px] font-semibold leading-tight">Taskurotta</h1>
               <p className="text-[11px] leading-tight text-muted">
@@ -4144,17 +4197,6 @@ export function WorkflowSidebar({
             Code
           </button>
         </div>
-
-        <div className="mt-2.5 flex h-8 items-center gap-2 rounded-lg border border-transparent bg-slate-100 px-2.5 transition focus-within:border-indigo-500 focus-within:bg-white">
-          <Search size={14} className="text-muted" />
-          <input
-            aria-label={view === "code" ? "Search files" : "Search workflows"}
-            className="studio-search-input min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
-            placeholder={view === "code" ? "Search files" : "Search workflows"}
-            value={query}
-            onChange={(event) => onQueryChange(event.target.value)}
-          />
-        </div>
       </div>
 
       {view === "graph" ? <div className="px-3.5 pb-2">
@@ -4169,12 +4211,17 @@ export function WorkflowSidebar({
         </button>
       </div> : null}
 
-      <div className={`workflow-scrollbar relative flex-1 px-2.5 pb-3 pt-1 ${view === "code" ? "min-h-0 overflow-hidden" : "overflow-y-auto"}`}>
+      {openingProjectRoot ? (
+        <div role="status" className="flex items-center gap-2 px-3.5 py-2 text-xs text-muted">
+          <Loader2 aria-hidden="true" className="shrink-0 animate-spin motion-reduce:animate-none" size={14} />
+          <span className="truncate" title={openingProjectRoot}>Opening {projectNameFromPath(openingProjectRoot)}...</span>
+        </div>
+      ) : null}
+      <div aria-busy={Boolean(openingProjectRoot)} className={`workflow-scrollbar relative flex-1 px-2.5 pb-3 pt-1 ${view === "code" ? "min-h-0 overflow-hidden" : "overflow-y-auto"}`}>
         {view === "code" && activeWorkflow?.projectRoot ? (
           <CodeFileExplorer
             activeFilePath={activeCodePath}
             newFileRequest={newFileRequest}
-            query={query}
             recentProjects={recentProjects}
             settings={settings}
             workflow={activeWorkflow}
@@ -4993,7 +5040,7 @@ const APPLICATION_MENUS = [
     ["view.code", "Code Editor", "", "code-check"],
     null,
     ["view.projectPane", "Project Files", "Ctrl+B", "project-check"],
-    ["view.assistantPane", "Assistant", "", "assistant-check"],
+    ["view.assistantPane", "Rem", "", "assistant-check"],
     ["view.panel", "Bottom Panel", "panel.toggle"],
     null,
     ["view.zoomIn", "Zoom In", "Ctrl++"],
@@ -5404,8 +5451,11 @@ function formatRevisionDate(value) {
 }
 
 export function ChatPane({
+  visible = true,
+  reducedMotion = "system",
   activeWorkflowId,
   assistantDefaults = {},
+  memorySettings = DEFAULT_APP_SETTINGS.memory,
   audioInputDeviceId = "default",
   composerFocusRequest = 0,
   onOpenMarkdownLink,
@@ -5428,6 +5478,9 @@ export function ChatPane({
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState([]);
   const [attachmentError, setAttachmentError] = useState("");
+  const [contextSendThread, setContextSendThread] = useState(null);
+  const [pendingRemContext, setPendingRemContext] = useState(null);
+  const [contextFocusRequest, setContextFocusRequest] = useState(0);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [providerId, setProviderId] = useState(assistantDefaults.provider || "codex");
   const [model, setModel] = useState(assistantDefaults.model || "");
@@ -5448,6 +5501,7 @@ export function ChatPane({
   const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const [scopeMenuOpen, setScopeMenuOpen] = useState(false);
+  const [resourcesOpen, setResourcesOpen] = useState(false);
   const [homeProjectRoot, setHomeProjectRoot] = useState(prospectiveProjectRoot);
   const chatAbortControllersRef = useRef({});
   const deletedChatThreadIdsRef = useRef(new Set());
@@ -5514,7 +5568,10 @@ export function ChatPane({
       textKey: conversationTextKey,
     };
 
-    if (!activeThreadId) return;
+    if (!activeThreadId) {
+      if (threadChanged && chatScrollRef.current) chatScrollRef.current.scrollTop = 0;
+      return;
+    }
     if (threadChanged) chatPinnedToBottomRef.current = true;
     if (threadChanged || (textChanged && chatPinnedToBottomRef.current)) {
       scrollConversationToBottom(chatScrollRef.current);
@@ -5608,9 +5665,11 @@ export function ChatPane({
 
   function handleClipboardPaste(event) {
     const files = clipboardAttachmentFiles(event.clipboardData);
-    if (!files.length) return;
+    const pastedText = event.clipboardData?.getData?.("text/plain") || "";
+    const textFile = largePasteFile(pastedText);
+    if (!files.length && !textFile) return;
     event.preventDefault();
-    addAttachments(files);
+    addAttachments(textFile ? [...files, textFile] : files);
   }
 
   function openScopedMarkdownLink(href) {
@@ -5664,6 +5723,8 @@ export function ChatPane({
       originalMessage?.attachments?.length || selectedAttachments.length,
     );
     if ((!text && !hasMessageAttachments) || chatState.sending) return;
+    const resourceError = remResourceError(activeThread?.resources || assistantDefaults.resources || DEFAULT_REM_RESOURCES);
+    if (resourceError) { setAttachmentError(resourceError); return; }
     const clientTurnStartedAt = Date.now();
     const turnSummaryId = uniqueClientId();
     const targetThread = activeThread ?? createThread();
@@ -5762,6 +5823,7 @@ export function ChatPane({
     const abortController = new AbortController();
     chatAbortControllersRef.current[targetThreadId] = abortController;
     try {
+      if (memorySettings.secondBrainEnabled) await window.goferDesktop?.workspace?.trustProjectRoot?.(memorySettings.secondBrainRoot);
       const response = await fetch(apiUrl("/chat/stream"), {
         method: "POST",
         headers: {
@@ -5777,6 +5839,8 @@ export function ChatPane({
             .map(chatMessageForRequest),
           workflow: {
             ...workflowContext,
+            remSecondBrain: { enabled: memorySettings.secondBrainEnabled, root: memorySettings.secondBrainRoot, format: memorySettings.secondBrainFormat, theme: memorySettings.secondBrainTheme, grantId: window.goferDesktop?.workspace?.pathGrantForApi?.(memorySettings.secondBrainRoot) },
+            remResources: targetThread.resources || assistantDefaults.resources || DEFAULT_REM_RESOURCES,
             id: `workflow-assistant:${targetThreadId}`,
             chatThreadId: targetThreadId,
           },
@@ -5820,7 +5884,7 @@ export function ChatPane({
                 updateThreadMessages(targetThreadId, compactedMessages);
               } else {
                 appendAssistantMessage(
-                  event.message || "Compacting workflow assistant context",
+                  event.message || "Compacting Rem context",
                   "system",
                   { role: "system" },
                 );
@@ -5849,7 +5913,7 @@ export function ChatPane({
             } else if (event.type === "error") {
               appendTurnSummary(event);
               setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
-              throw new Error(event.error || "Workflow assistant failed");
+              throw new Error(event.error || "Rem failed");
             }
           }
         }
@@ -5866,7 +5930,7 @@ export function ChatPane({
         } else if (event?.type === "error") {
           appendTurnSummary(event);
           setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
-          throw new Error(event.error || "Workflow assistant failed");
+          throw new Error(event.error || "Rem failed");
         } else if (event?.type === "changes") {
           setLiveTurnByThread((current) => ({
             ...current,
@@ -5884,7 +5948,7 @@ export function ChatPane({
       }
 
       if (!finalReceived) {
-        throw new Error("Workflow assistant stream ended without a final response");
+        throw new Error("Rem stream ended without a final response");
       }
       if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
       setChatStateByThread((current) => ({
@@ -5896,17 +5960,17 @@ export function ChatPane({
         },
       }));
       if (activeThreadIdRef.current !== targetThreadId) {
-        setBackgroundChatAnnouncement(`Assistant response complete in ${targetThreadTitle}.`);
+        setBackgroundChatAnnouncement(`Rem response complete in ${targetThreadTitle}.`);
       }
       setChatAnnouncementByThread((current) => ({
         ...current,
-        [targetThreadId]: "Workflow assistant response complete.",
+        [targetThreadId]: "Rem response complete.",
       }));
       void onResponseComplete?.(workflowContext.projectRoot);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
-        appendAssistantMessage("Workflow assistant stopped.", "final");
+        appendAssistantMessage("Rem stopped.", "final");
         if (!turnSummaryReceived) {
           appendTurnSummary({
             completedAt: new Date().toISOString(),
@@ -5920,7 +5984,7 @@ export function ChatPane({
         setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
         setChatAnnouncementByThread((current) => ({
           ...current,
-          [targetThreadId]: "Workflow assistant stopped.",
+          [targetThreadId]: "Rem stopped.",
         }));
         return;
       }
@@ -5976,8 +6040,8 @@ export function ChatPane({
       setChatAnnouncementByThread((current) => ({
         ...current,
         [threadId]: redo
-          ? "Workflow assistant changes reapplied."
-          : "Workflow assistant changes undone.",
+          ? "Rem changes reapplied."
+          : "Rem changes undone.",
       }));
     } catch (error) {
       updateChangeState({
@@ -5991,12 +6055,18 @@ export function ChatPane({
 
   function updateThreadMessages(threadId, nextValue) {
     if (deletedChatThreadIdsRef.current.has(threadId)) return;
+    setThreads((current) => {
+      const next = bumpChatThread(current, threadId);
+      persistChatThreads(next);
+      return next;
+    });
     setMessagesByThread((current) => {
       const currentMessages =
         current[threadId] ?? loadChatMessages(chatStorageKeyFor(threadId));
       const nextMessages =
         typeof nextValue === "function" ? nextValue(currentMessages) : nextValue;
       window.localStorage.setItem(chatStorageKeyFor(threadId), JSON.stringify(nextMessages));
+      archiveThreadFromStorage(threadId, nextMessages);
       return { ...current, [threadId]: nextMessages };
     });
   }
@@ -6013,6 +6083,8 @@ export function ChatPane({
       {
         id: uniqueClientId(),
         title: "New thread",
+        provider: providerId, model, effort,
+        resources: structuredClone(assistantDefaults.resources || DEFAULT_REM_RESOURCES),
         createdAt: now,
         updatedAt: now,
       },
@@ -6031,6 +6103,59 @@ export function ChatPane({
     return thread;
   }
 
+  useEffect(() => {
+    let active = true;
+    const receive = async (event) => {
+      const context = event.detail || {};
+      let root = context.projectRoot;
+      if (!root && context.path) {
+        const candidates = [...recentProjectRoots, ...workflows.map(item => item.projectRoot)].filter(item => typeof item === "string" && context.path.startsWith(`${item.replace(/\/$/, "")}/`));
+        root = candidates.sort((a, b) => b.length - a.length)[0];
+        if (!root) {
+          try { root = (await window.goferDesktop?.workspace?.gitStatus?.(context.path.replace(/[/\\][^/\\]+$/, "")))?.root; } catch { /* Non-Git files still carry their exact path. */ }
+        }
+      }
+      if (!active) return;
+      const thread = createThread(root || "");
+      const body = context.mode === "conflicts"
+        ? `Resolve the Git conflicts in this project. Inspect the current and incoming changes, preserve the intended behavior, and edit the conflicted files. Leave the results for me to review before staging or continuing the merge or rebase.\n\nConflicted files:\n${context.text}`
+        : `File: ${context.path || "workflow.rad"}\nProject: ${root || "No project"}\nLines: ${context.startLine || 1}-${context.endLine || context.startLine || 1}\n${context.version || "Editor selection"}\n\n${context.text || ""}`;
+      const file = new File([body], context.mode === "conflicts" ? "merge-conflicts.txt" : "editor-selection.txt", { type: "text/plain" });
+      const result = readChatAttachments([file], []);
+      setPendingRemContext({ threadId: thread.id, attachments: result.attachments, error: result.error,
+        draft: context.mode === "ask" ? "" : context.mode === "conflicts" ? body : "Explain the highlighted text in the attached file selection, using its file and project context.",
+        send: context.mode !== "ask" });
+    };
+    window.addEventListener("gofer:rem-context", receive);
+    return () => { active = false; window.removeEventListener("gofer:rem-context", receive); };
+  }, [threads, providerId, model, effort, workflows, recentProjectRoots, activeWorkflowId]);
+
+  useEffect(() => {
+    const receive = event => {
+      const request = event.detail;
+      if (!request || request.signal?.aborted) return;
+      generateConventionalCommit({ provider: providerId, model, effort, diff: request.diff, signal: request.signal }).then(request.resolve, request.reject);
+    };
+    window.addEventListener("gofer:rem-commit-message", receive);
+    return () => window.removeEventListener("gofer:rem-commit-message", receive);
+  }, [providerId, model, effort]);
+
+  // Apply context after the thread activation effect clears the previous draft.
+  useEffect(() => {
+    if (!pendingRemContext || activeThreadId !== pendingRemContext.threadId) return;
+    setAttachments(pendingRemContext.attachments); setAttachmentError(pendingRemContext.error);
+    setDraft(pendingRemContext.draft);
+    setContextSendThread(pendingRemContext.send ? pendingRemContext.threadId : null);
+    setContextFocusRequest(current => current + 1);
+    setPendingRemContext(null);
+  }, [pendingRemContext, activeThreadId]);
+
+  useEffect(() => {
+    if (!contextSendThread || activeThreadId !== contextSendThread || !draft || !attachments.length) return;
+    setContextSendThread(null);
+    void sendMessage();
+  }, [contextSendThread, activeThreadId, draft, attachments]);
+
   function openThread(threadId) {
     const thread = threads.find((candidate) => candidate.id === threadId);
     if (thread && !thread.projectRoot) {
@@ -6047,6 +6172,11 @@ export function ChatPane({
       );
       persistChatThreads(nextThreads);
       setThreads(nextThreads);
+    }
+    if (thread) {
+      setProviderId(thread.provider || assistantDefaults.provider || "codex");
+      setModel(thread.model || assistantDefaults.model || "");
+      setEffort(thread.effort || assistantDefaults.effort || "");
     }
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
@@ -6090,6 +6220,21 @@ export function ChatPane({
     setScopeMenuOpen(false);
   }
 
+  function loadOlderThreads(count) {
+    setThreads((current) => [...new Map(
+      [...loadChatThreads(count), ...current].map((thread) => [thread.id, thread]),
+    ).values()]);
+  }
+
+  function updateThreadConfig(patch) {
+    if (!activeThreadId) return;
+    setThreads((current) => {
+      const next = current.map((thread) => thread.id === activeThreadId ? { ...thread, ...patch } : thread);
+      persistChatThreads(next);
+      return next;
+    });
+  }
+
   function showThreadList() {
     activeThreadIdRef.current = null;
     setActiveThreadId(null);
@@ -6118,6 +6263,13 @@ export function ChatPane({
     chatAbortControllersRef.current[threadId]?.abort();
     delete chatAbortControllersRef.current[threadId];
     const nextThreads = threads.filter((thread) => thread.id !== threadId);
+    const archived = await archiveThreadFromStorage(threadId, loadChatMessages(chatStorageKeyFor(threadId)), true);
+    if (!archived) {
+      deletedChatThreadIdsRef.current.delete(threadId);
+      setChatStateByThread((current) => ({ ...current, [threadId]: { sending: false, error: "The archive could not be saved. Reconnect the archive folder, or stop archiving in Settings > Memory before deleting this thread." } }));
+      return;
+    }
+    deleteStoredChatThread(threadId);
     persistChatThreads(nextThreads);
     setThreads(nextThreads);
     window.localStorage.removeItem(chatStorageKeyFor(threadId));
@@ -6231,7 +6383,7 @@ export function ChatPane({
               aria-label={`Scoped to ${scopedProjectName}. Change project scope`}
               className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-lg px-2 text-xs font-semibold text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
               disabled={chatState.sending || !scopeProjects.length}
-              title={chatState.sending ? "Project scope cannot change while the assistant is running" : scopedProjectRoot}
+              title={chatState.sending ? "Project scope cannot change while Rem is running" : scopedProjectRoot}
               type="button"
               onClick={() => {
                 setConversationMenuOpen(false);
@@ -6248,7 +6400,7 @@ export function ChatPane({
             </button>
             {scopeMenuOpen ? (
               <div
-                aria-label="Assistant project scope"
+                aria-label="Rem project scope"
                 className="absolute left-0 top-9 z-50 max-h-72 w-72 overflow-y-auto rounded-[14px] border border-line bg-white p-1.5 shadow-panel"
                 role="menu"
               >
@@ -6306,6 +6458,8 @@ export function ChatPane({
               <ThreadList
                 activityByThread={chatStateByThread}
                 threads={threads}
+                totalCount={chatThreadIndex().length}
+                onLoadOlder={loadOlderThreads}
                 activeThreadId={activeThreadId}
                 onDelete={deleteThread}
                 onOpen={openThread}
@@ -6325,12 +6479,14 @@ export function ChatPane({
       >
         {!activeThread ? (
           <div className="min-h-full" data-assistant-home>
-            <div className="px-6 pb-8 pt-10 text-center">
-              <span className="mx-auto grid h-9 w-9 place-items-center rounded-[10px] bg-indigo-50 text-indigo-600">
-                <Bot size={18} />
-              </span>
-              <h2 className="mt-3 text-sm font-semibold text-ink">Workflow assistant</h2>
-              <p className="mt-1 text-xs leading-5 text-muted">Ask about the selected workflow or describe a change.</p>
+            <div className="mx-auto max-w-[340px] px-2 pb-4 pt-1 text-center">
+              {assistantDefaults.avatarEnabled !== false ? (
+                <RemAvatar visible={visible} animated={assistantDefaults.avatarAnimated !== false} reducedMotion={reducedMotion} />
+              ) : null}
+              <h2 className="mt-2 text-lg font-semibold tracking-[-0.02em] text-ink">I&apos;m Rem</h2>
+              <p className="mt-1 text-xs leading-5 text-muted">Your coding agent in Taskurotta.</p>
+              <p className="mt-2 text-xs leading-5 text-muted">I can build workflows, change code, and help you understand your project.</p>
+              <p className="mt-2 text-xs font-medium leading-5 text-ink">What would you like to work on?</p>
             </div>
             <section aria-labelledby="assistant-home-recent" className="border-t border-line pt-3">
               <h3 id="assistant-home-recent" className="px-2 pb-2 text-xs font-semibold text-muted">
@@ -6339,6 +6495,8 @@ export function ChatPane({
               <ThreadList
                 activityByThread={chatStateByThread}
                 threads={threads}
+                totalCount={chatThreadIndex().length}
+                onLoadOlder={loadOlderThreads}
                 activeThreadId={activeThreadId}
                 onDelete={deleteThread}
                 onOpen={openThread}
@@ -6347,6 +6505,7 @@ export function ChatPane({
           </div>
         ) : (
           <>
+            {!messages.length ? <p className="text-sm leading-6 text-muted">I&apos;m Rem, your coding agent in Taskurotta. I can build workflows, change code, and help you understand your project. What would you like to work on?</p> : null}
             {conversationItems.map((item) =>
               item.type === "thought-group" ? (
                 <ThoughtGroup
@@ -6388,6 +6547,10 @@ export function ChatPane({
       </div>
 
       <div className="relative shrink-0 border-t border-line p-3">
+          {activeThread ? <div className="mb-2">
+            <button aria-expanded={resourcesOpen} className="rounded px-1 py-1 text-xs text-muted hover:bg-slate-50" type="button" onClick={() => setResourcesOpen((open) => !open)}>Thread tools, skills & MCP</button>
+            {resourcesOpen ? <div className="max-h-64 overflow-y-auto border-t border-line py-2"><RemResources key={activeThreadId} value={activeThread.resources || assistantDefaults.resources || DEFAULT_REM_RESOURCES} onChange={(resources) => updateThreadConfig({ resources })} /></div> : null}
+          </div> : null}
           <ProviderModelEffortFields
             capabilities={providers}
             className="mb-2"
@@ -6396,6 +6559,7 @@ export function ChatPane({
             model={model}
             provider={providerId}
             onChange={(patch) => {
+              updateThreadConfig(patch);
               if (patch.provider !== undefined) setProviderId(patch.provider);
               if (patch.model !== undefined) setModel(patch.model);
               if (patch.effort !== undefined) setEffort(patch.effort);
@@ -6411,7 +6575,7 @@ export function ChatPane({
             audioInputDeviceId={audioInputDeviceId}
             contextKey={activeThreadId ?? "new-thread"}
             draft={draft}
-            focusRequest={composerFocusRequest}
+            focusRequest={composerFocusRequest + contextFocusRequest}
             sending={chatState.sending}
             onAddAttachments={addAttachments}
             onAttachmentErrorChange={setAttachmentError}
@@ -6425,14 +6589,16 @@ export function ChatPane({
   );
 }
 
-function ThreadList({ activeThreadId, activityByThread = {}, onDelete, onOpen, threads }) {
+export function ThreadList({ activeThreadId, activityByThread = {}, onDelete, onOpen, threads, totalCount = threads.length, onLoadOlder }) {
+  const [visibleCount, setVisibleCount] = useState(15);
+  const sortedThreads = [...threads].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
   if (threads.length) {
     return (
       <div className="space-y-1">
-          {threads.map((thread) => (
+          {sortedThreads.slice(0, visibleCount).map((thread) => (
             <div
               key={thread.id}
-              className={`group flex items-center gap-1 rounded-lg p-1 transition ${
+              className={`group flex items-center gap-1 rounded-lg px-1 transition ${
                 thread.id === activeThreadId ? "bg-indigo-50" : "hover:bg-slate-50"
               }`}
             >
@@ -6459,6 +6625,12 @@ function ThreadList({ activeThreadId, activityByThread = {}, onDelete, onOpen, t
               </button>
             </div>
           ))}
+          {totalCount > visibleCount ? (
+            <button className="w-full rounded-md px-2 py-2 text-left text-xs text-muted hover:bg-slate-50 focus-visible:outline" type="button" onClick={() => { const nextCount = visibleCount + 15; onLoadOlder?.(nextCount); setVisibleCount(nextCount); }}>
+              Show older threads ({totalCount - visibleCount})
+            </button>
+          ) : null}
+          {visibleCount > 15 ? <button className="px-2 py-2 text-xs text-muted" type="button" onClick={() => setVisibleCount(15)}>Collapse older threads</button> : null}
       </div>
     );
   }
@@ -6473,7 +6645,7 @@ function ThreadActivityIndicator({ state }) {
     return (
       <span
         className="grid h-4 w-4 shrink-0 place-items-center text-brand"
-        title="Assistant response running"
+        title="Rem response running"
       >
         <Loader2 aria-hidden="true" className="animate-spin" size={13} />
         <span className="sr-only">Running</span>
@@ -6485,7 +6657,7 @@ function ThreadActivityIndicator({ state }) {
     return (
       <span
         className="grid h-4 w-4 shrink-0 place-items-center"
-        title="Assistant response complete"
+        title="Rem response complete"
       >
         <span aria-hidden="true" className="h-2 w-2 rounded-full bg-blue-500" />
         <span className="sr-only">Completed</span>
@@ -6664,7 +6836,7 @@ function TurnSummaryCard({ message, onUndo }) {
   if (!changes) {
     return (
       <div
-        aria-label="Assistant running"
+        aria-label="Rem running"
         className="flex items-center gap-1.5 px-1 text-[10px] text-muted"
         data-message-id={message.id}
       >
@@ -6677,7 +6849,7 @@ function TurnSummaryCard({ message, onUndo }) {
   return (
     <div className="space-y-1.5" data-message-id={message.id}>
       <section
-        aria-label="Assistant file changes"
+        aria-label="Rem file changes"
         className="overflow-hidden rounded-lg border border-line bg-white dark:bg-[#181818]"
       >
         <div className="flex min-h-12 items-center gap-2.5 px-3 py-2">
@@ -7132,23 +7304,64 @@ function TracePayload({ divided = false, label, value }) {
 
 const chatThreadsStorageKey = "gofer-flow-chat-threads";
 
-export function loadChatThreads() {
+export function bumpChatThread(threads, threadId, now = new Date().toISOString()) {
+  const thread = threads.find((item) => item.id === threadId);
+  return thread ? [{ ...thread, updatedAt: now }, ...threads.filter((item) => item.id !== threadId)] : threads;
+}
+
+function chatThreadMetadataKey(id) { return `gofer-flow-chat-thread-meta:${id}`; }
+
+export function chatThreadIndex() {
   try {
-    const storedThreads = JSON.parse(window.localStorage.getItem(chatThreadsStorageKey) || "[]");
-    if (
-      Array.isArray(storedThreads) &&
-      storedThreads.every((thread) => thread?.id && typeof thread.title === "string")
-    ) {
-      return storedThreads;
+    const index = JSON.parse(window.localStorage.getItem(chatThreadsStorageKey) || "[]");
+    if (!Array.isArray(index)) return [];
+    // One-time migration. Subsequent starts read metadata for only the first page.
+    const valid = index.filter((entry) => typeof entry?.id === "string");
+    if (valid.some((entry) => typeof entry.title === "string")) {
+      for (const entry of valid) {
+        if (typeof entry.title === "string") window.localStorage.setItem(chatThreadMetadataKey(entry.id), JSON.stringify(entry));
+      }
+      const migrated = valid.map(({ id, updatedAt }) => ({ id, updatedAt }));
+      migrated.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+      window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(migrated));
+      return migrated;
     }
-  } catch {
-    return [];
-  }
-  return [];
+    return valid;
+  } catch { return []; }
+}
+
+export function loadChatThreads(limit = 15) {
+  return chatThreadIndex().slice(0, limit).flatMap(({ id }) => {
+    try {
+      const thread = JSON.parse(window.localStorage.getItem(chatThreadMetadataKey(id)) || "null");
+      return thread?.id === id && typeof thread.title === "string" ? [thread] : [];
+    } catch { return []; }
+  });
 }
 
 export function persistChatThreads(threads) {
-  window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(threads));
+  const loadedIds = new Set(threads.map((thread) => thread.id));
+  const index = new Map([
+    ...threads.map(({ id, updatedAt }) => [id, { id, updatedAt }]),
+    ...chatThreadIndex().filter((entry) => !loadedIds.has(entry.id)).map((entry) => [entry.id, entry]),
+  ]);
+  for (const thread of threads) {
+    const key = chatThreadMetadataKey(thread.id);
+    const encoded = JSON.stringify(thread);
+    if (window.localStorage.getItem(key) !== encoded) {
+      window.localStorage.setItem(key, encoded);
+      archiveThreadFromStorage(thread.id, loadChatMessages(chatStorageKeyFor(thread.id)));
+    }
+    index.set(thread.id, { id: thread.id, updatedAt: thread.updatedAt });
+  }
+  const sorted = [...index.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(sorted));
+}
+
+function deleteStoredChatThread(id) {
+  const index = chatThreadIndex().filter((entry) => entry.id !== id);
+  window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(index));
+  window.localStorage.removeItem(chatThreadMetadataKey(id));
 }
 
 export function threadTitleFromMessage(message) {
@@ -7169,6 +7382,24 @@ function formatThreadDate(value) {
 
 function defaultChatMessages() {
   return [];
+}
+
+function reportArchiveError(error) {
+  window.dispatchEvent?.(new CustomEvent("gofer:archive-error", { detail: error?.message || String(error) }));
+}
+function archiveThreadFromStorage(threadId, messages, deleted = false) {
+  const bridge = window.goferDesktop?.rem;
+  if (!bridge?.archive) return Promise.resolve(true);
+  try {
+    const thread = JSON.parse(window.localStorage.getItem(chatThreadMetadataKey(threadId)) || "null") || { id: threadId };
+    return bridge.archive(thread, messages, deleted).then((result) => {
+      if (result?.warnings?.length) reportArchiveError(new Error(result.warnings.join("; ")));
+      return true;
+    }).catch((error) => { reportArchiveError(error); return false; });
+  } catch (error) { reportArchiveError(error); return Promise.resolve(false); }
+}
+async function archiveAllConversations() {
+  for (const thread of chatThreadIndex()) await archiveThreadFromStorage(thread.id, loadChatMessages(chatStorageKeyFor(thread.id)));
 }
 
 export function chatStorageKeyFor(threadId) {
@@ -8409,10 +8640,10 @@ function EmptyWorkspace({
         <div className="mt-6 grid gap-5 border-t border-line pt-5 md:grid-cols-3 md:gap-0 md:divide-x md:divide-line">
           <div className="flex items-start gap-3 md:pr-5">
             <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-indigo-50 text-indigo-600">
-              <Bot aria-hidden="true" size={16} />
+              <TaskurottaMark className="h-8 w-8" />
             </span>
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-ink">Workflow assistant</p>
+              <p className="text-sm font-semibold text-ink">Rem</p>
               <p className="mt-1 text-xs leading-5 text-muted">
                 Describe the automation you need. Installed Codex or Claude Code can use your existing subscription to build it.
               </p>
@@ -8421,7 +8652,7 @@ function EmptyWorkspace({
                 type="button"
                 onClick={onOpenAssistant}
               >
-                Open workflow assistant
+                Open Rem
                 <ChevronRight aria-hidden="true" size={14} />
               </button>
             </div>

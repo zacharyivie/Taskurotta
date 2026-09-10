@@ -129,6 +129,7 @@ export class AppCrashBoundary extends React.Component {
   }
 
   componentDidCatch(_error, errorInfo) {
+    void window.goferDesktop?.developer?.log?.(`${_error?.stack || _error}\n${errorInfo?.componentStack || ""}`).catch(() => {});
     if (!errorInfo?.componentStack) return;
     this.setState(({ crash }) => ({
       crash: crash ? { ...crash, componentStack: errorInfo.componentStack.trim() } : crash,

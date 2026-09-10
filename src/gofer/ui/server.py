@@ -1050,7 +1050,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception("Workflow assistant transcription failed")
+                log.exception("Rem transcription failed")
                 self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
                 return
             self._send_json(payload)
@@ -1065,7 +1065,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception("Workflow assistant transcription session failed to start")
+                log.exception("Rem transcription session failed to start")
                 self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
                 return
             self._send_json(payload, status=201)
@@ -1079,7 +1079,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception("Workflow assistant transcription chunk failed")
+                log.exception("Rem transcription chunk failed")
                 self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
                 return
             self._send_json(payload)
@@ -1092,7 +1092,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception("Workflow assistant transcription finalization failed")
+                log.exception("Rem transcription finalization failed")
                 self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
                 return
             self._send_json(payload)
@@ -1137,11 +1137,30 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if parsed.path == "/api/chat/commit-message":
+            from gofer.ui.commit_message import generate_commit_message
+
+            try:
+                body = self._read_json(limit=128 * 1024 * 1024)
+                result = asyncio.run(
+                    generate_commit_message(
+                        provider=str(body.get("provider", "codex")),
+                        model=str(body.get("model", "cli-default")),
+                        effort=_optional_body_str(body, "effort"),
+                        diff=body.get("diff", ""),
+                    )
+                )
+                self._send_json(result)
+            except (ValueError, ChatProviderError, OSError, TimeoutError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/chat/stream":
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
-            except json.JSONDecodeError as exc:
+                self._validate_second_brain(body)
+            except (json.JSONDecodeError, WorkflowBundleError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
@@ -1158,6 +1177,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
+                self._validate_second_brain(body)
                 response = asyncio.run(
                     run_workflow_chat(
                         provider=str(body.get("provider", "codex")),
@@ -1169,12 +1189,17 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                         resource_limits=self._resource_limits(),
                     )
                 )
-            except (ChatProviderError, json.JSONDecodeError) as exc:
+            except (
+                ChatProviderError,
+                json.JSONDecodeError,
+                WorkflowBundleError,
+                ValueError,
+            ) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception("Unhandled workflow assistant error")
-                self._send_json({"error": f"Workflow assistant failed: {exc}"}, status=500)
+                log.exception("Unhandled Rem error")
+                self._send_json({"error": f"Rem failed: {exc}"}, status=500)
                 return
 
             self._send_json(response)
@@ -1766,11 +1791,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._write_stream_event({"type": "error", "error": str(exc)})
         except Exception as exc:  # noqa: BLE001
             cancel_event.set()
-            log.exception("Unhandled workflow assistant stream error")
+            log.exception("Unhandled Rem stream error")
             self._write_stream_event(
                 {
                     "type": "error",
-                    "error": f"Workflow assistant failed: {exc}",
+                    "error": f"Rem failed: {exc}",
                 }
             )
         finally:
@@ -1790,6 +1815,17 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def _request_data_dir(self, _query: dict[str, list[str]]) -> Path:
         return self._default_data_dir()
+
+    def _validate_second_brain(self, body: dict[str, Any]) -> None:
+        config = (body.get("workflow") or {}).get("remSecondBrain") or {}
+        if config.get("enabled") is not True:
+            return
+        root = Path(str(config.get("root", ""))).expanduser()
+        if not root.is_absolute() or not root.is_dir():
+            raise ValueError("Choose an existing absolute Second Brain folder.")
+        self._assert_bundle_path_allowed(root, config.get("grantId"), must_exist=True)
+        if config.get("format", "md") not in {"md", "html"}:
+            raise ValueError("Choose Markdown or HTML for Second Brain reports.")
 
     def _assert_bundle_path_allowed(
         self,

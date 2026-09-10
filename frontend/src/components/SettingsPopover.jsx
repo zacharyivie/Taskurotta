@@ -21,6 +21,8 @@ import {
   X,
 } from "lucide-react";
 
+import DeveloperSettings, { RemMemorySettings } from "./DeveloperSettings.jsx";
+import RemResources from "./RemResources.jsx";
 import { useProviderCapabilities } from "./ProviderModelEffortFields.jsx";
 import { audioInputConstraints, listAudioInputDevices } from "../lib/audioDevices.js";
 import {
@@ -38,7 +40,9 @@ const CATEGORIES = [
   { id: "editor", label: "Editor", icon: Code2 },
   { id: "browser", label: "Browser", icon: Globe2 },
   { id: "terminal", label: "Terminal", icon: Terminal },
-  { id: "assistant", label: "Assistant", icon: Bot },
+  { id: "assistant", label: "Rem", icon: Bot },
+  { id: "memory", label: "Memory", icon: Bot },
+  { id: "developer", label: "Developer", icon: Code2 },
   { id: "layout", label: "Layout", icon: LayoutPanelLeft },
   { id: "keybindings", label: "Keybindings", icon: Command },
 ];
@@ -96,7 +100,7 @@ export default function SettingsPopover({
           <p className="text-sm font-semibold">Settings</p>
           <p className="mt-0.5 text-[10px] text-muted">Saved on this device</p>
         </div>
-        <nav aria-label="Settings categories" className="space-y-0.5">
+        <nav aria-label="Settings categories" className="min-h-0 overflow-y-auto space-y-0.5">
           {CATEGORIES.map((item) => {
             const Icon = item.icon;
             const active = item.id === category;
@@ -206,6 +210,8 @@ function categoryRows(category, settings, onChange, providerState, appControls) 
     element: <SettingRow key={key} label={label} description={description}>{element}</SettingRow>,
     searchText: `${label} ${description}`,
   });
+  if (category === "developer") return [{ searchText: "Developer diagnostics logs logging app data storage version backend restart tools", element: <DeveloperSettings key="developer" /> }];
+  if (category === "memory") return [{ searchText: "Rem memory conversation archive folder Second Brain knowledge notes reports HTML Markdown", element: <RemMemorySettings key="memory" value={settings.memory} onChange={onChange} /> }];
   if (category === "general") return [
     row("dataDir", "Application data directory", "Stores global Taskurotta state, run artifacts, and registries.", (
       <PathControl value={appControls.dataDir} onChoose={appControls.onChooseDataDirectory} />
@@ -262,7 +268,7 @@ function categoryRows(category, settings, onChange, providerState, appControls) 
   if (category === "assistant") return assistantRows(settings, onChange, row, providerState);
   if (category === "layout") return [
     row("workflowPane", "Project pane width", "Default and current width of the left project pane.", <NumberControl value={settings.layout.workflowPaneWidth} min={240} max={420} suffix="px" onCommit={(value) => onChange("layout.workflowPaneWidth", value)} />),
-    row("assistantPane", "Assistant pane width", "Default and current width of the workflow assistant.", <NumberControl value={settings.layout.assistantPaneWidth} min={300} max={520} suffix="px" onCommit={(value) => onChange("layout.assistantPaneWidth", value)} />),
+    row("assistantPane", "Rem pane width", "Default and current width of Rem's chat pane.", <NumberControl value={settings.layout.assistantPaneWidth} min={300} max={520} suffix="px" onCommit={(value) => onChange("layout.assistantPaneWidth", value)} />),
     row("bottomPanel", "Bottom panel height", "Height used for Problems, Run Timeline, and Terminal.", <NumberControl value={settings.layout.bottomPanelHeight} min={140} max={480} suffix="px" onCommit={(value) => onChange("layout.bottomPanelHeight", value)} />),
     row("inspector", "Graph inspector width", "Width of the node and workflow inspector.", <NumberControl value={settings.layout.graphInspectorWidth} min={280} max={520} suffix="px" onCommit={(value) => onChange("layout.graphInspectorWidth", value)} />),
   ];
@@ -280,13 +286,16 @@ function assistantRows(settings, onChange, row, providerState) {
     ?? models.find((item) => item.id === provider?.defaultModel)
     ?? models[0];
   return [
-    row("provider", "Default provider", "Provider selected for new workflow-assistant conversations.", (
+    row("avatar", "Show Rem avatar", "Show Rem on the chat welcome screen.", <SwitchControl checked={settings.assistant.avatarEnabled} onChange={(value) => onChange("assistant.avatarEnabled", value)} />),
+    row("avatarAnimation", "Animate Rem", "Greet you when the pane opens, then blink while seated. Respects reduced motion.", <SwitchControl checked={settings.assistant.avatarAnimated} onChange={(value) => onChange("assistant.avatarAnimated", value)} />),
+    row("resources", "Rem resources", "Defaults copied into new threads. Each thread can change its own selection.", <RemResources value={settings.assistant.resources} onChange={(value) => onChange("assistant.resources", value)} />),
+    row("provider", "Default provider", "Provider selected for new Rem conversations.", (
       <SelectControl disabled={loading || !availableProviders.length} value={provider?.id ?? settings.assistant.provider} onChange={(value) => onChange("assistant.provider", value)} options={availableProviders.map((item) => [item.id, item.displayName ?? item.id])} />
     )),
-    row("model", "Default model", "Model selected when a new assistant conversation starts.", (
+    row("model", "Default model", "Model selected when a new Rem conversation starts.", (
       <SelectControl disabled={!models.length} value={model?.id ?? settings.assistant.model} onChange={(value) => onChange("assistant.model", value)} options={models.map((item) => [item.id, item.displayName ?? item.id])} />
     )),
-    row("effort", "Default reasoning effort", "Reasoning level selected for new assistant conversations.", (
+    row("effort", "Default reasoning effort", "Reasoning level selected for new Rem conversations.", (
       <SelectControl disabled={!model?.efforts?.length} value={settings.assistant.effort || model?.defaultEffort || ""} onChange={(value) => onChange("assistant.effort", value)} options={(model?.efforts ?? []).map((item) => [item.id, item.displayName ?? item.id])} />
     )),
   ];
@@ -723,7 +732,9 @@ function categoryKeywords(category) {
     editor: "font line tab wrap minimap autosave markdown html preview code",
     browser: "homepage new tab search engine url web",
     terminal: "font line cursor blink scrollback shell",
-    assistant: "provider model effort codex claude conversation",
+    assistant: "rem provider model effort codex claude conversation skills tools mcp servers resources",
+    memory: "rem memory conversation archive folder second brain knowledge notes reports html markdown",
+    developer: "developer diagnostics logs logging app data storage version backend restart tools",
     layout: "width pane sidebar panel inspector",
   }[category] ?? "";
 }

@@ -1901,7 +1901,7 @@ def test_ui_server_chat_unhandled_error_returns_json(monkeypatch, tmp_path) -> N
     )
 
     assert response.status == 500
-    assert response.json() == {"error": "Workflow assistant failed: boom"}
+    assert response.json() == {"error": "Rem failed: boom"}
 
 
 def test_ui_server_rejects_large_body_before_json_parse() -> None:
@@ -2018,3 +2018,48 @@ def test_ui_server_delete_thread_chat_prompt(tmp_path) -> None:
     assert response.status == 200
     assert response.json() == {"workflowId": "workflow-assistant:thread-1", "deleted": True}
     assert not chat_path.exists()
+
+
+@pytest.mark.parametrize("endpoint", ["/api/chat", "/api/chat/stream"])
+def test_second_brain_requires_a_desktop_folder_grant(tmp_path: Path, endpoint: str) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    brain = tmp_path / "knowledge"
+    brain.mkdir()
+    result = _request(
+        data,
+        "POST",
+        endpoint,
+        body={
+            "workflow": {"remSecondBrain": {"enabled": True, "root": str(brain), "format": "md"}},
+            "messages": [{"role": "user", "body": "Search notes"}],
+        },
+    )
+    assert result.status == 400
+    assert "outside the approved" in result.text()
+
+
+def test_commit_message_endpoint_uses_restricted_generator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from gofer.ui import commit_message
+
+    generate = AsyncMock(return_value={"message": "fix: expose resolved edits"})
+    monkeypatch.setattr(commit_message, "generate_commit_message", generate)
+    response = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/commit-message",
+        body={"provider": "codex", "model": "cli-default", "diff": "+staged"},
+    )
+    assert response.status == 200
+    assert response.json() == {"message": "fix: expose resolved edits"}
+    generate.assert_awaited_once_with(
+        provider="codex", model="cli-default", effort=None, diff="+staged"
+    )
+    generate.side_effect = ValueError("Stage changes first.")
+    failed = _request(tmp_path, "POST", "/api/chat/commit-message", body={"diff": ""})
+    assert failed.status == 400
+    assert failed.json() == {"error": "Stage changes first."}

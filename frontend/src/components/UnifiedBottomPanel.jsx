@@ -605,7 +605,7 @@ function TerminalWorkspace({ active, projectRoot, settings, theme }) {
   }
 
   return (
-    <div className="flex h-full min-h-0 bg-white" onKeyDownCapture={handleWorkspaceKeyDown}>
+    <div data-terminal-workspace="true" className="flex h-full min-h-0 bg-white" onKeyDownCapture={handleWorkspaceKeyDown}>
       <div className="relative min-h-0 min-w-0 flex-1">
         {tabs.map((tab) => (
           <TerminalSession
@@ -1050,26 +1050,27 @@ function terminalTheme(theme) {
     };
   }
   return {
-    background: "#fbfbfc",
-    black: "#27272a",
-    blue: "#4f46e5",
-    brightBlack: "#71717a",
-    brightBlue: "#4338ca",
-    brightCyan: "#0e7490",
-    brightGreen: "#15803d",
-    brightMagenta: "#7c3aed",
-    brightRed: "#b91c1c",
-    brightWhite: "#18181b",
-    brightYellow: "#a16207",
-    cursor: "#4f46e5",
-    cyan: "#0891b2",
-    foreground: "#27272a",
-    green: "#16a34a",
-    magenta: "#9333ea",
-    red: "#dc2626",
-    selectionBackground: "#c7d2fe",
-    white: "#d4d4d8",
-    yellow: "#ca8a04",
+    background: "#eee9df",
+    foreground: "#30343b",
+    cursor: "#4f46a5",
+    cursorAccent: "#eee9df",
+    selectionBackground: "#c4ccf4",
+    black: "#30343b",
+    red: "#a33343",
+    green: "#356344",
+    yellow: "#805b1a",
+    blue: "#4545a0",
+    magenta: "#80508d",
+    cyan: "#276770",
+    white: "#eee9df",
+    brightBlack: "#62635f",
+    brightRed: "#ae3547",
+    brightGreen: "#3b6b49",
+    brightYellow: "#876022",
+    brightBlue: "#514bb2",
+    brightMagenta: "#885295",
+    brightCyan: "#2b6b78",
+    brightWhite: "#f4f0e7",
   };
 }
 

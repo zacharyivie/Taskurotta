@@ -23,7 +23,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
-from gofer.utils.process import run_subprocess
+from gofer.utils.process import env_with_executable_on_path, run_subprocess
 
 ProviderId = Literal["codex", "claude_code"]
 DISCOVERY_TIMEOUT_SECONDS = 10
@@ -541,14 +541,13 @@ def resolve_provider_executable(provider_id: ProviderId) -> str | None:
 
     Desktop applications do not source shell startup files, so an npm global
     install managed by nvm is often absent from their PATH.  Check nvm's
-    selected/default Node installation as a narrow fallback for Claude Code.
+    selected/default Node installation as a narrow fallback for providers
+    installed as npm-global packages (Claude Code, Codex).
     """
 
     binary_name = "codex" if provider_id == "codex" else "claude"
     if executable := shutil.which(binary_name):
         return executable
-    if provider_id != "claude_code":
-        return None
 
     nvm_dir = Path(os.environ.get("NVM_DIR", Path.home() / ".nvm"))
     versions_dir = nvm_dir / "versions" / "node"
@@ -589,6 +588,7 @@ async def _run_probe(
     try:
         return await run_subprocess(
             command,
+            env=env_with_executable_on_path(command[0]),
             timeout=DISCOVERY_TIMEOUT_SECONDS,
             stdin=stdin,
             max_output_bytes=DISCOVERY_MAX_OUTPUT_BYTES,

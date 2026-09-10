@@ -13,7 +13,7 @@ from gofer.core.agent import AgentResult
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS
 from gofer.core.thoughts import summarize_thought
-from gofer.utils.process import stream_subprocess
+from gofer.utils.process import env_with_executable_on_path, stream_subprocess
 
 
 class Subscription(ABC):
@@ -51,7 +51,7 @@ class Subscription(ABC):
                 cmd,
                 cancel_event=cancel_event,
                 cwd=working_dir,
-                env=env,
+                env=env_with_executable_on_path(cmd[0], env),
                 timeout=timeout,
                 max_output_bytes=(
                     max_output_bytes

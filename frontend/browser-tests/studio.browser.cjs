@@ -39,7 +39,7 @@ async function run() {
   });
 
   await windowRef.loadURL(baseUrl);
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Search workflows']"))));
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Studio view']"))));
   if (process.env.GOFER_TERMINAL_ONLY === "1") {
     await exerciseBottomPanelTerminal();
     clearTimeout(timeout);
@@ -55,15 +55,48 @@ async function run() {
     await cleanup(0);
     return;
   }
+  if (process.env.GOFER_REM_ONLY === "1") {
+    await exerciseRemAvatar();
+    clearTimeout(timeout);
+    console.log("Browser Rem avatar regression test passed.");
+    await cleanup(0);
+    return;
+  }
   await exerciseCreateDialog();
   await exerciseDesignRegressions();
   await exerciseKeyboardGraphAndResizers();
   await exerciseMonacoEditor();
   await exercisePackagedMonacoWorker(baseUrl);
+  await exerciseSourceControl();
 
   clearTimeout(timeout);
   console.log("Browser studio accessibility smoke test passed.");
   await cleanup(0);
+}
+
+async function exerciseRemAvatar() {
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.pose === "waving"));
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.pose === "seated"));
+  await wait(700);
+  const metrics = await evaluate(() => {
+    const avatar = document.querySelector(".rem-avatar");
+    return { width: avatar.offsetWidth, imagesLoaded: [...avatar.querySelectorAll("img")].every((img) => img.complete && img.naturalWidth > 0), waveOpacity: getComputedStyle(avatar.querySelector(".rem-avatar-wave")).opacity };
+  });
+  assert.deepEqual(metrics, { width: 112, imagesLoaded: true, waveOpacity: "0" });
+  fs.writeFileSync("/tmp/taskurotta-rem-seated.png", (await windowRef.webContents.capturePage()).toPNG());
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.blinking === "true"));
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.blinking === "false"));
+  const toggle = () => evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "l", code: "KeyL", ctrlKey: true, bubbles: true })));
+  await toggle();
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.animated === "false"));
+  await toggle();
+  await waitFor(() => evaluate(() => document.querySelector(".rem-avatar")?.dataset.pose === "waving"));
+  assert.deepEqual(await evaluate(() => {
+    const wave = document.querySelector(".rem-avatar-wave");
+    const style = getComputedStyle(wave);
+    return { opacity: style.opacity, transitionDuration: style.transitionDuration };
+  }), { opacity: "1", transitionDuration: "0s" });
+  fs.writeFileSync("/tmp/taskurotta-rem-wave.png", (await windowRef.webContents.capturePage()).toPNG());
 }
 
 async function exerciseBottomPanelTerminal() {
@@ -111,7 +144,7 @@ async function exerciseMonacoEditor() {
   await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
     .find((button) => button.textContent.trim() === "Code").click());
   await waitFor(() => evaluate(() => Boolean(document.querySelector(".monaco-editor"))));
-  assert.equal(await evaluate(() => document.querySelector("[aria-label='Search files']")?.placeholder), "Search files");
+  assert.equal(await evaluate(() => Boolean(document.querySelector("[aria-label='Search files']"))), false);
   await waitFor(() => evaluate(() => [...document.querySelectorAll(".view-line")]
     .some((line) => line.textContent.includes("Radish"))));
   await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
@@ -139,7 +172,7 @@ async function exercisePackagedMonacoWorker(baseUrl) {
   await packagedWindow.loadFile(path.join(distRoot, "index.html"));
   windowRef = packagedWindow;
   if (httpWindow && !httpWindow.isDestroyed()) httpWindow.destroy();
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Search workflows']"))));
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Studio view']"))));
   await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
     .some((button) => button.textContent.includes("Radish editor"))));
   await evaluate(() => [...document.querySelectorAll("[role='button']")]
@@ -922,4 +955,77 @@ async function fail(error) {
   clearTimeout(timeout);
   console.error(error);
   await cleanup(1);
+}
+
+async function exerciseSourceControl() {
+  await evaluate(() => {
+    window.goferDesktop.workspace.gitStatus = async () => ({ active: true, branch: "main", branches: ["main", "feature"], remotes: [], entries: Array.from({ length: 24 }, (_, i) => ({ path: `frontend/src/components/Example${i}.jsx`, status: "M", staged: i === 0, unstaged: i !== 0 })) });
+    window.goferDesktop.workspace.gitHistory = async () => ({ active: true, commits: [] });
+    window.goferDesktop.workspace.gitWorktrees = async () => ({ active: true, worktrees: [{ path: "/repo", branch: "main" }] });
+    document.querySelector("[aria-label='Refresh source control']").click();
+    document.querySelector("#sidebar-tab-source-control").click();
+  });
+  await waitFor(() => evaluate(() => Boolean(document.querySelector(".scm-composer"))));
+  for (const dark of [false, true]) {
+    await windowRef.webContents.executeJavaScript(`document.documentElement.classList.toggle("dark", ${dark})`);
+    const bounds = await evaluate(() => {
+      const panel = document.querySelector(".scm-panel");
+      const content = document.querySelector("#scm-content");
+      const composer = document.querySelector(".scm-composer");
+      const before = composer.getBoundingClientRect().top;
+      content.scrollTop = content.scrollHeight;
+      return { width: panel.clientWidth, overflow: panel.scrollWidth > panel.clientWidth, scrolls: content.scrollHeight > content.clientHeight, fixed: composer.getBoundingClientRect().top === before, bottom: composer.getBoundingClientRect().bottom <= panel.getBoundingClientRect().bottom + 1 };
+    });
+    assert.equal(bounds.overflow, false, JSON.stringify(bounds));
+    assert.equal(bounds.scrolls, true);
+    assert.equal(bounds.fixed, true);
+    assert.equal(bounds.bottom, true);
+    await evaluate(() => { document.querySelector("#scm-content").scrollTop = 0; });
+    const beforeHover = await evaluate(() => {
+      const row = document.querySelector(".scm-file");
+      const buttons = [...row.querySelectorAll("button")].slice(1);
+      const bounds = buttons.map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, display: getComputedStyle(button).display };
+      });
+      return bounds;
+    });
+    assert.equal(beforeHover.length, 2);
+    assert.ok(beforeHover.every((button) => button.width > 0 && button.display !== "none"));
+    windowRef.webContents.sendInputEvent({ type: "mouseMove", x: Math.round(beforeHover[0].x + 14), y: Math.round(beforeHover[0].y + 14) });
+    await wait(50);
+    const afterHover = await evaluate(() => [...document.querySelector(".scm-file").querySelectorAll("button")].slice(1).map((button) => button.getBoundingClientRect().x));
+    assert.deepEqual(afterHover, beforeHover.map((button) => button.x), "Git action buttons must stay in place on hover");
+    const screenshot = await windowRef.webContents.capturePage();
+    fs.writeFileSync(`/tmp/taskurotta-source-control-${dark ? "dark" : "light"}.png`, screenshot.toPNG());
+  }
+  await evaluate(() => document.querySelector("#scm-tab-worktrees").click());
+  for (const dark of [false, true]) {
+    await windowRef.webContents.executeJavaScript(`document.documentElement.classList.toggle("dark", ${dark})`);
+    await evaluate(() => document.querySelector('[aria-label="Integrate main worktree"]').dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 240 })));
+    await waitFor(() => evaluate(() => Boolean(document.querySelector('[data-operation="merge"]'))));
+    const merge = await evaluate(() => {
+      const item = document.querySelector('[data-operation="merge"]');
+      const style = getComputedStyle(item);
+      return { background: style.backgroundColor, color: style.color, outline: style.outlineStyle };
+    });
+    assert.equal(merge.background, dark ? "rgb(45, 43, 65)" : "rgb(224, 227, 248)");
+    assert.equal(merge.outline, "none", "Opening a context menu with the pointer should not paint a keyboard outline");
+    const rebaseBounds = await evaluate(() => {
+      const rect = document.querySelector('[data-operation="rebase"]').getBoundingClientRect();
+      return { x: Math.round(rect.x + 30), y: Math.round(rect.y + 15) };
+    });
+    windowRef.webContents.sendInputEvent({ type: "mouseMove", ...rebaseBounds });
+    await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "rebase"));
+    assert.equal(await evaluate(() => document.querySelector('[data-operation="merge"]').getAttribute("aria-expanded")), "false");
+    windowRef.webContents.sendInputEvent({ type: "keyDown", keyCode: "Up" });
+    await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "merge"));
+    assert.equal(await evaluate(() => getComputedStyle(document.activeElement).outlineStyle), "solid");
+    fs.writeFileSync(`/tmp/taskurotta-worktree-menu-${dark ? "dark" : "light"}.png`, (await windowRef.webContents.capturePage()).toPNG());
+    windowRef.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+    await waitFor(() => evaluate(() => !document.querySelector('[data-operation="merge"]')));
+  }
+  await evaluate(() => document.querySelector("#scm-tab-history").click());
+  assert.equal(await evaluate(() => Boolean(document.querySelector(".scm-composer"))), false);
+  assert.equal(await evaluate(() => document.querySelector("#scm-content").textContent.includes("No commits yet.")), true);
 }

@@ -198,7 +198,7 @@ test("settings dropdown exposes useful app categories and searchable commands", 
   assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("autosave"), ["general", "editor"]);
   assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("open browser"), ["keybindings"]);
   assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("toggle project pane"), ["keybindings"]);
-  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("toggle workflow assistant"), ["keybindings"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("toggle Rem"), ["keybindings"]);
   assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("data directory"), ["general"]);
   assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("microphone"), ["devices"]);
 });
@@ -437,7 +437,7 @@ test("settings search only takes focus on open and compact switches keep their c
   await dom.unmount();
 });
 
-test("workflow assistant attachments preserve text, images, and binary files for upload", async () => {
+test("Rem attachments preserve text, images, and binary files for upload", async () => {
   const textFile = {
     name: "review<notes>.md",
     size: 42,
@@ -487,7 +487,7 @@ test("workflow assistant attachments preserve text, images, and binary files for
   assert.equal(requestMessage.attachments[1].storageName, "1-screen.png");
 });
 
-test("workflow assistant attaches dropped files and pasted screenshots", async () => {
+test("Rem attaches dropped files and pasted screenshots", async () => {
   const screenshot = {
     name: "pasted-screenshot.png",
     size: 2048,
@@ -539,7 +539,7 @@ test("workflow assistant attaches dropped files and pasted screenshots", async (
   await dom.unmount();
 });
 
-test("workflow assistant edit paths preserve the filename and open in the scoped code editor", async () => {
+test("Rem edit paths preserve the filename and open in the scoped code editor", async () => {
   const opened = [];
   const chatStream = streamResponse([
     '{"type":"thought","text":"Edit","trace":{"id":"edit-1","kind":"tool","title":"Edit","detail":".taskurotta/testing/workflow.rad","input":"{\\"path\\":\\".taskurotta/testing/workflow.rad\\",\\"kind\\":\\"update\\"}","status":"complete"}}\n',
@@ -582,7 +582,7 @@ test("workflow assistant edit paths preserve the filename and open in the scoped
   await dom.unmount();
 });
 
-test("workflow assistant follows new text only while the conversation is at the bottom", async () => {
+test("Rem follows new text only while the conversation is at the bottom", async () => {
   const controlledStream = controlledStreamResponse([
     '{"type":"thought","text":"Checking the workflow"}\n',
     '{"type":"final","message":{"body":"The workflow is ready."}}\n',
@@ -614,7 +614,7 @@ test("workflow assistant follows new text only while the conversation is at the 
   await dom.flush(2000);
   assert.equal(
     allElements(dom.container).some(
-      (element) => element.getAttribute?.("aria-label") === "Workflow assistant is typing",
+      (element) => element.getAttribute?.("aria-label") === "Rem is typing",
     ),
     false,
   );
@@ -636,7 +636,7 @@ test("workflow assistant follows new text only while the conversation is at the 
   await dom.unmount();
 });
 
-test("opening an assistant thread starts its conversation at the bottom", async () => {
+test("assistant threads open at the bottom and returning home resets the pane to the top", async () => {
   const chatStream = streamResponse([
     '{"type":"final","message":{"body":"Finished"}}\n',
   ]);
@@ -678,10 +678,26 @@ test("opening an assistant thread starts its conversation at the bottom", async 
   await dom.click(firstThread);
   assert.equal(scrollPane.scrollTop, 900);
 
+  await dom.click(dom.byTitle("Back to recent threads"));
+  assert.equal(scrollPane.scrollTop, 0);
+  scrollPane.scrollTop = 150;
+  await dom.change(dom.first("textarea"), "Draft from home");
+  assert.equal(scrollPane.scrollTop, 150);
+
+  const reopenedThread = allElements(dom.container).find(
+    (element) => element.tagName === "BUTTON" && textOf(element).includes("First thread history"),
+  );
+  await dom.click(reopenedThread);
+  assert.equal(scrollPane.scrollTop, 900);
+  scrollPane.scrollTop = 250;
+  await dom.pointer(scrollPane, "onScroll");
+  await dom.click(dom.byTitle("Back to recent threads"));
+  assert.equal(scrollPane.scrollTop, 0);
+
   await dom.unmount();
 });
 
-test("workflow assistant composer grows with its draft up to its height limit", async () => {
+test("Rem composer grows with its draft up to its height limit", async () => {
   function ComposerHarness() {
     const [draft, setDraft] = React.useState("");
     return React.createElement(chatComposerModule.default, {
@@ -713,7 +729,7 @@ test("workflow assistant composer grows with its draft up to its height limit", 
   await dom.unmount();
 });
 
-test("workflow assistant transcription streams partial text into the composer", async () => {
+test("Rem transcription streams partial text into the composer", async () => {
   let processor;
   class FakeAudioContext {
     constructor() {
@@ -1686,7 +1702,7 @@ test("workflow sidebar swaps project workflows for Radish files", async () => {
   );
 
   await dom.flush();
-  assert.equal(dom.byLabel("Search files").getAttribute("placeholder"), "Search files");
+  assert.throws(() => dom.byLabel("Search files"), /Unable to find/);
   assert.ok(dom.byText("Project files"));
   assert.ok(dom.byText("README.md"));
   await dom.click(dom.ancestor(dom.byText(".taskurotta"), "BUTTON"));
@@ -1818,7 +1834,7 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
     ["trust", "/workspace/gofer-flow"],
     ["list", "/workspace/gofer-flow"],
   ]);
-  const explorer = dom.byLabel("Project file explorer");
+  const explorer = dom.byLabel("Project sidebar");
   const closeEvent = testEvent(explorer);
   closeEvent.ctrlKey = true;
   closeEvent.key = "w";
@@ -1965,8 +1981,8 @@ test("Code file explorer renders live Git file states and omits deleted files", 
       return {
         active: true,
         entries: [
-          { path: "src/app.js", status: "M" },
-          { path: "added.txt", status: "A" },
+          { path: "src/app.js", status: "M", indexStatus: " ", worktreeStatus: "M", staged: false, unstaged: true },
+          { path: "added.txt", status: "A", indexStatus: "A", worktreeStatus: " ", staged: true, unstaged: false },
           { path: "new.txt", status: "U" },
           { path: "gone.txt", status: "D" },
         ],
@@ -2106,6 +2122,7 @@ test("code workspace marks tracked lines only when full diff mode is off", () =>
 test("code diff mode detects and displays whitespace-only changes", () => {
   assert.deepEqual(codeWorkspaceModule.codeDiffEditorOptions({ fontSize: 14 }), {
     diffAlgorithm: "advanced",
+    diffCodeLens: true,
     enableSplitViewResizing: true,
     fontSize: 14,
     ignoreTrimWhitespace: false,
@@ -2214,7 +2231,7 @@ test("HTML documents default to browser mode and browser tabs use page titles", 
   assert.equal(codeWorkspaceModule.browserTabLabel({ url: "taskurotta://home" }), "Taskurotta");
   assert.match(
     codeWorkspaceModule.browserTabFavicon({ url: "taskurotta://home" }),
-    /taskurotta-icon\.svg$/,
+    /roundel\.png$/,
   );
   assert.equal(codeWorkspaceModule.browserTabFavicon({
     favicon: "https://www.youtube.com/s/desktop/favicon.ico",
@@ -2345,6 +2362,7 @@ test("cycling browser tabs transfers native focus to the selected guest", async 
         error: "",
         id,
         loading: false,
+        ready: true,
         src: url,
         url,
       };
@@ -2426,6 +2444,7 @@ test("cycling tabs inside an unfocused split browser pane stays in that pane", a
       error: "",
       id: `session-${clientId}`,
       loading: false,
+      ready: true,
       src: url,
       url,
     }),
@@ -2730,7 +2749,7 @@ test("browser shortcut opens one reusable editor tab", async () => {
   await dom.unmount();
 });
 
-test("hiding the workflow assistant keeps its mounted thread state alive", async () => {
+test("hiding the Rem keeps its mounted thread state alive", async () => {
   const workflow = workflowFixture();
   const dom = await mountReact(
     React.createElement(appModule.default),
@@ -3142,6 +3161,7 @@ test("active browser tabs drag from the left edge and keep their guest while cha
         favicon: "",
         id: `session-${clientId}`,
         loading: false,
+        ready: true,
         src: url,
         title: browserTabs[clientId].title,
         url,
@@ -3487,7 +3507,7 @@ test("empty Graph view offers creation, .taskurotta import, and project opening"
   assert.match(dom.text(), /Installed Codex or Claude Code/);
   assert.ok(dom.byText("A full IDE, built in"));
   assert.ok(dom.byText("Integrated browser"));
-  assert.ok(dom.byText("Open workflow assistant"));
+  assert.ok(dom.byText("Open Rem"));
   assert.ok(dom.byText("Import workflow"));
   assert.ok(dom.byText("Open project"));
   assert.ok(dom.byLabel("Open settings"));
@@ -3531,7 +3551,7 @@ test("empty Graph view offers creation, .taskurotta import, and project opening"
     ).getAttribute("class"),
     "hidden",
   );
-  await dom.click(dom.ancestor(dom.byText("Open workflow assistant"), "BUTTON"));
+  await dom.click(dom.ancestor(dom.byText("Open Rem"), "BUTTON"));
   await dom.flush();
   assert.equal(
     dom.ancestor(
@@ -4901,7 +4921,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   const dom = await mountReact(React.createElement(appModule.default), fetchMock);
 
   await dom.flush();
-  assert.match(dom.byLabel("Search workflows").getAttribute("class"), /studio-search-input/);
+  assert.throws(() => dom.byLabel("Search workflows"), /Unable to find/);
   const stopButton = dom.byTitle("Stop all runs");
   assert.equal(stopButton.disabled, false);
   await dom.click(stopButton);
@@ -5045,7 +5065,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     ),
     true,
   );
-  assert.match(dom.text(), /Workflow assistant response complete/);
+  assert.match(dom.text(), /Rem response complete/);
   const projectDiscoveryRequest = fetchMock.calls.find(
     (call) => call.url === "/api/projects/open" && call.options.method === "POST",
   );
@@ -5060,7 +5080,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     matchingLiveRegions(dom.container, {
       politeness: "polite",
       role: "status",
-      text: "Workflow assistant response complete",
+      text: "Rem response complete",
     }).length,
     1,
   );
@@ -5076,7 +5096,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     matchingLiveRegions(dom.container, {
       politeness: "polite",
       role: "status",
-      text: "Workflow assistant changes undone",
+      text: "Rem changes undone",
     }).length,
     1,
   );
@@ -5089,7 +5109,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     matchingLiveRegions(dom.container, {
       politeness: "polite",
       role: "status",
-      text: "Workflow assistant changes reapplied",
+      text: "Rem changes reapplied",
     }).length,
     1,
   );
@@ -5127,21 +5147,21 @@ test("assistant threads keep streaming after navigation and report running and c
   await dom.flush();
   await dom.click(dom.byTitle("Back to recent threads"));
 
-  assert.equal(dom.byTitle("Assistant response running").tagName, "SPAN");
+  assert.equal(dom.byTitle("Rem response running").tagName, "SPAN");
   assert.match(dom.text(), /Keep tracking this response/);
 
   controlledStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.byTitle("Assistant response running").tagName, "SPAN");
+  assert.equal(dom.byTitle("Rem response running").tagName, "SPAN");
 
   controlledStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.byTitle("Assistant response complete").tagName, "SPAN");
+  assert.equal(dom.byTitle("Rem response complete").tagName, "SPAN");
   assert.equal(
     matchingLiveRegions(dom.container, {
       politeness: "polite",
       role: "status",
-      text: "Assistant response complete in Keep tracking this response",
+      text: "Rem response complete in Keep tracking this response",
     }).length,
     1,
   );
@@ -5158,7 +5178,7 @@ test("assistant threads keep streaming after navigation and report running and c
   await dom.click(dom.byTitle("Recent threads"));
   assert.equal(
     allElements(dom.container).some(
-      (element) => element.getAttribute?.("title") === "Assistant response complete",
+      (element) => element.getAttribute?.("title") === "Rem response complete",
     ),
     false,
   );
@@ -5190,7 +5210,7 @@ test("assistant file changes and elapsed time update before the turn completes",
   await dom.flush();
   assert.match(dom.text(), /Editing 1 file/);
   assert.match(dom.text(), /\+1/);
-  const liveChangeCard = dom.byLabel("Assistant file changes");
+  const liveChangeCard = dom.byLabel("Rem file changes");
   const liveUndo = allElements(liveChangeCard).find(
     (element) => element.tagName === "BUTTON" && textOf(element).trim() === "Undo",
   );
@@ -5236,21 +5256,21 @@ test("assistant keeps an open live edit preview stable while new messages arrive
   await dom.click(dom.byTitle("Send message"));
   controlledStream.releaseNext();
   await dom.flush();
-  const liveChangeCard = dom.byLabel("Assistant file changes");
+  const liveChangeCard = dom.byLabel("Rem file changes");
   await dom.click(dom.ancestor(dom.byText("Review"), "BUTTON"));
   assert.match(textOf(liveChangeCard), /working/);
 
   scrollPane.scrollHeight = 700;
   controlledStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.byLabel("Assistant file changes"), liveChangeCard);
+  assert.equal(dom.byLabel("Rem file changes"), liveChangeCard);
   assert.match(textOf(liveChangeCard), /Close/);
   assert.equal(scrollPane.scrollTop, 700);
 
   scrollPane.scrollHeight = 760;
   controlledStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.byLabel("Assistant file changes"), liveChangeCard);
+  assert.equal(dom.byLabel("Rem file changes"), liveChangeCard);
   assert.match(textOf(liveChangeCard), /Close/);
   assert.equal(scrollPane.scrollTop, 760);
 
@@ -5398,7 +5418,7 @@ test("assistant threads keep their project scope until the user changes it", asy
   assert.ok(dom.byLabel("Scoped to alpha. Change project scope"));
 
   await dom.click(dom.byLabel("Scoped to alpha. Change project scope"));
-  const scopeMenu = dom.byLabel("Assistant project scope");
+  const scopeMenu = dom.byLabel("Rem project scope");
   const betaScopeButton = allElements(scopeMenu).find(
     (element) => element.tagName === "BUTTON" && textOf(element).trim() === "beta",
   );
@@ -5455,7 +5475,7 @@ test("changing project scope from assistant home keeps the thread list visible",
   assert.match(dom.text(), /Recent threads/);
 
   await dom.click(dom.byLabel("Scoped to alpha. Change project scope"));
-  const scopeMenu = dom.byLabel("Assistant project scope");
+  const scopeMenu = dom.byLabel("Rem project scope");
   const betaScopeButton = allElements(scopeMenu).find(
     (element) => element.tagName === "BUTTON" && textOf(element).trim() === "beta",
   );
@@ -5500,8 +5520,8 @@ test("deleting a background assistant thread disposes its pending stream state",
 
   assert.doesNotMatch(dom.text(), /Delete this running thread/);
   assert.equal(window.localStorage.getItem(appModule.chatStorageKeyFor(threadId)), null);
-  assert.equal(dom.allByTitle("Assistant response running").length, 0);
-  assert.equal(dom.allByTitle("Assistant response complete").length, 0);
+  assert.equal(dom.allByTitle("Rem response running").length, 0);
+  assert.equal(dom.allByTitle("Rem response complete").length, 0);
 
   await dom.unmount();
 });
@@ -5538,17 +5558,17 @@ test("assistant activity remains independent across concurrent threads", async (
   await dom.click(dom.byTitle("Send message"));
   await dom.flush();
   await dom.click(dom.byTitle("Back to recent threads"));
-  assert.equal(dom.allByTitle("Assistant response running").length, 2);
+  assert.equal(dom.allByTitle("Rem response running").length, 2);
 
   secondStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.allByTitle("Assistant response running").length, 1);
-  assert.equal(dom.allByTitle("Assistant response complete").length, 1);
+  assert.equal(dom.allByTitle("Rem response running").length, 1);
+  assert.equal(dom.allByTitle("Rem response complete").length, 1);
 
   firstStream.releaseNext();
   await dom.flush();
-  assert.equal(dom.allByTitle("Assistant response running").length, 0);
-  assert.equal(dom.allByTitle("Assistant response complete").length, 2);
+  assert.equal(dom.allByTitle("Rem response running").length, 0);
+  assert.equal(dom.allByTitle("Rem response complete").length, 2);
 
   await dom.unmount();
 });
@@ -5611,7 +5631,7 @@ test("assistant errors use one assertive live region and clear on the next reque
     matchingLiveRegions(dom.container, {
       politeness: "polite",
       role: "status",
-      text: "Workflow assistant response complete",
+      text: "Rem response complete",
     }).length,
     1,
   );
@@ -7328,24 +7348,30 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     "!! ignored.log",
     "",
   ].join("\0")), [
-    { path: "src/app.js", status: "M" },
-    { path: "notes.txt", status: "U" },
-    { path: "added.txt", status: "A" },
-    { path: "removed.txt", status: "D" },
-    { path: "renamed.txt", status: "A" },
+    { path: "src/app.js", status: "M", indexStatus: " ", worktreeStatus: "M", staged: false, unstaged: true },
+    { path: "notes.txt", status: "U", indexStatus: "?", worktreeStatus: "?", staged: false, unstaged: true },
+    { path: "added.txt", status: "A", indexStatus: "A", worktreeStatus: " ", staged: true, unstaged: false },
+    { path: "removed.txt", status: "D", indexStatus: " ", worktreeStatus: "D", staged: false, unstaged: true },
+    { path: "renamed.txt", status: "A", indexStatus: "R", worktreeStatus: " ", staged: true, unstaged: false, originalPath: "old-name.txt" },
   ]);
 
   const calls = [];
   const result = await readGitStatus("/workspace/project", {
     async runGit(args) {
       calls.push(args);
-      return calls.length === 1 ? "/workspace/project\n" : " M workflow.rad\0";
+      if (args.includes("--show-toplevel")) return "/workspace/project\n";
+      if (args.includes("status")) return " M workflow.rad\0";
+      if (args.includes("branch")) return "main\n";
+      if (args.includes("for-each-ref")) return "main\nfeature\n";
+      if (args.includes("remote") || args.includes("stash")) return "";
+      return "2\t3\n";
     },
   });
   assert.deepEqual(result, {
     active: true,
-    entries: [{ path: "workflow.rad", status: "M" }],
+    entries: [{ path: "workflow.rad", status: "M", indexStatus: " ", worktreeStatus: "M", staged: false, unstaged: true }],
     root: "/workspace/project",
+    branch: "main", branches: ["main", "feature"], ahead: 2, behind: 3, remotes: [], stashCount: 0,
   });
   assert.deepEqual(calls[1], [
     "-C",
@@ -7409,6 +7435,7 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
   }), {
     changed: true,
     content: "const answer = 41;\n",
+    modifiedContent: "", deleted: true,
     hunks: [{ startLine: 1, endLine: 1 }],
     tracked: true,
   });
@@ -7430,6 +7457,152 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     "-C", "/workspace/project", "worktree", "prune", "--expire", "now",
   ]);
   assert.deepEqual(removed.worktrees, []);
+});
+
+test("worktree removal deletes the folder and registration while preserving the branch", async () => {
+  const { execFileSync } = require("node:child_process");
+  const { removeGitWorktree } = require("../../electron/git-status.cjs");
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-remove-worktree-"));
+  const projectRoot = path.join(temporaryRoot, "main");
+  const targetPath = path.join(temporaryRoot, "feature");
+  const git = (...args) => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    git("init", "-b", "main", projectRoot);
+    git("-C", projectRoot, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "Initial");
+    git("-C", projectRoot, "worktree", "add", "-b", "feature", targetPath);
+    fs.writeFileSync(path.join(targetPath, "unsaved.txt"), "Keep this until removal is safe");
+    assert.deepEqual(await removeGitWorktree(projectRoot, targetPath), { requiresForce: true });
+    assert.equal(fs.existsSync(targetPath), true);
+    git("-C", targetPath, "add", "unsaved.txt");
+    fs.writeFileSync(path.join(targetPath, "unsaved.txt"), "Unstaged changes too");
+    fs.writeFileSync(path.join(targetPath, "untracked.txt"), "Untracked file");
+    const result = await removeGitWorktree(projectRoot, targetPath, { force: true });
+    assert.equal(fs.existsSync(targetPath), false);
+    assert.deepEqual(result.worktrees.map((worktree) => worktree.path), [projectRoot]);
+    assert.equal(git("-C", projectRoot, "branch", "--list", "feature").trim(), "feature");
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("source control requires explicit confirmation to discard worktree changes and supports cancel", async () => {
+  const items = [{ path: "/workspace/project", branch: "main" }, { path: "/workspace/feature", branch: "feature" }];
+  const calls = [];
+  const removedProjects = [];
+  let finishRemoval;
+  let fail = true;
+  const dom = await mountReact(
+    React.createElement(codeFileExplorerModule.default, {
+      workflow: { projectRoot: items[0].path },
+      onRemoveRecentProject: (root) => removedProjects.push(root),
+    }),
+    createFetchMock([]),
+    { desktop: { workspace: {
+      async trustProjectRoot() {},
+      async listDirectory() { return { entries: [] }; },
+      async gitStatus() { return { active: true, entries: [], branch: "main", branches: ["main", "feature"] }; },
+      async gitHistory() { return { active: true, commits: [] }; },
+      async gitWorktrees() { return { active: true, worktrees: items }; },
+      async removeWorktree(options) {
+        calls.push(options);
+        if (fail === "permission") throw new Error("Permission denied");
+        if (fail) return { requiresForce: true };
+        await new Promise((resolve) => { finishRemoval = resolve; });
+        return { active: true, worktrees: [items[0]] };
+      },
+    } } },
+  );
+  await dom.click(dom.byLabel("Source control"));
+  await dom.click(dom.byText("Worktrees"));
+  await dom.click(dom.byLabel("Remove feature worktree"));
+  assert.match(dom.text(), /The branch will be kept/);
+  assert.deepEqual(calls, []);
+  await dom.click(dom.byText("Cancel"));
+  assert.deepEqual(calls, []);
+  await dom.click(dom.byLabel("Remove feature worktree"));
+  await dom.click(dom.byLabel("Confirm worktree removal"));
+  assert.match(dom.text(), /This worktree has uncommitted changes/);
+  assert.match(dom.text(), /permanently discard all uncommitted changes and untracked files/);
+  assert.equal(calls[0].force, false);
+  await dom.click(dom.byText("Cancel"));
+  assert.equal(calls.length, 1);
+  await dom.click(dom.byLabel("Remove feature worktree"));
+  await dom.click(dom.byLabel("Confirm worktree removal"));
+  assert.equal(removedProjects.length, 0);
+  fail = "permission";
+  await dom.click(dom.byLabel("Discard changes and remove"));
+  assert.match(dom.text(), /Permission denied/);
+  assert.equal(removedProjects.length, 0);
+  fail = false;
+  await dom.click(dom.byLabel("Discard changes and remove"));
+  assert.equal(reactProps(dom.byText("Removing…")).disabled, true);
+  finishRemoval();
+  await dom.flush();
+  assert.throws(() => dom.byLabel("Remove feature worktree"));
+  assert.doesNotMatch(dom.text(), /Remove worktree\?/);
+  assert.deepEqual(calls, [false, false, true, true].map((force) => ({ projectRoot: items[0].path, targetPath: items[1].path, force })));
+  assert.deepEqual(removedProjects, [items[1].path]);
+  await dom.unmount();
+});
+
+test("source control keeps the Worktrees tab selected when switching worktrees", async () => {
+  const roots = ["/workspace/project", "/workspace/feature"];
+  const selections = [];
+  const statusRoots = [];
+  let resolveStatus;
+  let delayStatus = false;
+  function WorktreeSwitcher() {
+    const [projectRoot, setProjectRoot] = React.useState(roots[0]);
+    return React.createElement(codeFileExplorerModule.default, {
+      workflow: { projectRoot },
+      onSelectProject: (path) => {
+        selections.push(path);
+        setProjectRoot(path);
+      },
+    });
+  }
+  const dom = await mountReact(
+    React.createElement(WorktreeSwitcher),
+    createFetchMock([]),
+    { desktop: { workspace: {
+      async trustProjectRoot() {},
+      async listDirectory() { return { entries: [] }; },
+      async gitStatus(root) {
+        statusRoots.push(root);
+        if (delayStatus) await new Promise((resolve) => { resolveStatus = resolve; });
+        return { active: true, entries: [], branch: root === roots[0] ? "main" : "feature", branches: ["main", "feature"] };
+      },
+      async gitHistory() { return { active: true, commits: [] }; },
+      async gitWorktrees() {
+        return { active: true, worktrees: roots.map((path, index) => ({
+          path, branch: index === 0 ? "main" : "feature",
+        })) };
+      },
+    } } },
+  );
+  await dom.click(dom.byLabel("Source control"));
+  await dom.click(dom.byText("Worktrees"));
+  const worktreeButton = (root) => dom.allByTitle(root).find((node) => node.tagName === "BUTTON");
+  delayStatus = true;
+  for (const root of [roots[1], roots[0]]) {
+    const branchSelector = dom.byLabel("Switch branch");
+    const row = worktreeButton(root);
+    await dom.click(worktreeButton(root));
+    await dom.flush();
+    assert.doesNotMatch(dom.text(), /This project is not a Git repository/);
+    assert.equal(dom.byLabel("Switch branch"), branchSelector);
+    assert.equal(reactProps(branchSelector).disabled, true);
+    assert.equal(worktreeButton(root), row);
+    resolveStatus();
+    await dom.flush();
+    assert.equal(reactProps(branchSelector).disabled, false);
+    assert.equal(reactProps(branchSelector).value, root === roots[0] ? "main" : "feature");
+    assert.equal(worktreeButton(root).getAttribute("aria-current"), "page");
+    assert.equal(statusRoots.at(-1), root);
+    assert.doesNotMatch(dom.text(), /Commit message/);
+  }
+  assert.deepEqual(selections, [roots[1], roots[0]]);
+  await dom.unmount();
 });
 
 test("commit history refreshes in the background and rows expand on click", async () => {
@@ -7481,16 +7654,18 @@ test("commit history refreshes in the background and rows expand on click", asyn
   assert.equal(codeFileExplorerModule.commitMessageBody({ ...commit, message: commit.subject }), "");
   assert.equal(codeFileExplorerModule.commitMessageBody({ ...commit, message: "A different first line\n\nMore context." }), "A different first line\n\nMore context.");
 
-  const sourceControlButton = dom.ancestor(dom.byText("Source control"), "BUTTON");
+  const sourceControlButton = dom.byLabel("Source control");
   await dom.click(sourceControlButton);
   await dom.flush();
   assert.equal(historyCalls, 1);
   assert.doesNotMatch(dom.text(), /\b1 commits\b/);
 
+  await dom.click(dom.byText("Worktrees"));
   const activeWorktree = dom.ancestor(dom.byText("main"), "BUTTON");
   assert.equal(activeWorktree.getAttribute("aria-current"), "page");
   assert.doesNotMatch(dom.text(), /old-feature|missing · Missing/);
 
+  await dom.click(dom.byText("History"));
   const copiedValues = [];
   navigator.clipboard.writeText = async (value) => copiedValues.push(value);
   const commitButton = dom.ancestor(dom.byText("abc123d"), "BUTTON");
@@ -7531,7 +7706,7 @@ test("commit history refreshes in the background and rows expand on click", asyn
   assert.match(dom.text(), /Ship it/);
   assert.doesNotMatch(dom.text(), /Full commit details\./);
 
-  await dom.click(sourceControlButton);
+  await dom.click(dom.byLabel("File explorer"));
   await dom.click(sourceControlButton);
   await dom.flush();
   assert.equal(historyCalls, 3);
@@ -8687,9 +8862,11 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   assert.deepEqual(Object.keys(exposed.goferDesktop).sort(), [
     "appearance",
     "dataDirectory",
+    "developer",
     "getDataDir",
     "getDroppedFilePath",
     "grantDroppedPath",
+    "rem",
     "textFiles",
     "workspace",
   ]);
@@ -8702,17 +8879,22 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "createFolder",
     "deletePath",
     "getPathInfo",
+    "gitFileAction",
     "gitFileBaseline",
     "gitHistory",
+    "gitRepoAction",
     "gitStatus",
+    "gitSwitchBranch",
     "gitWorktrees",
     "listDirectory",
     "openPath",
     "pathGrantForApi",
     "removeWorktree",
     "renamePath",
+    "replaceProject",
     "resolveProjectFile",
     "revealPath",
+    "searchProject",
     "selectPath",
     "trustProjectRoot",
   ]);
@@ -8826,6 +9008,20 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   );
 });
 
+test("Electron worktree removal bridge forwards force only when explicitly true", async () => {
+  const exposed = runPreload({
+    argv: ["electron", "preload"],
+    invoke(channel, payload) { return { channel, payload }; },
+  });
+  for (const force of [undefined, false, "true", true]) {
+    const result = await exposed.goferDesktop.workspace.removeWorktree({
+      projectRoot: "/workspace/main", targetPath: "/workspace/feature", force,
+    });
+    assert.equal(result.channel, "gofer:git-worktree-remove");
+    assert.equal(result.payload.force, force === true);
+  }
+});
+
 test("Electron preload keeps file grants private while attaching them to later calls", async () => {
   const calls = [];
   const exposed = runPreload({
@@ -8868,6 +9064,14 @@ test("Electron preload keeps file grants private while attaching them to later c
     },
   });
   assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/shared"), "grant-1");
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.searchProject("/outside/shared", { query: "hello", grantId: "spoofed" })), {
+    channel: "gofer:search-project",
+    payload: { projectRoot: "/outside/shared", query: "hello", grantId: "grant-1" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.replaceProject("/outside/shared", { query: "hello", replacement: "hi", files: [], grantId: "spoofed" })), {
+    channel: "gofer:replace-project",
+    payload: { projectRoot: "/outside/shared", query: "hello", replacement: "hi", files: [], grantId: "grant-1" },
+  });
   assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/shared" })), {
     channel: "gofer:list-directory",
     payload: {
@@ -9837,3 +10041,1405 @@ function directText(node) {
 function textOf(node) {
   return node.textContent ?? "";
 }
+
+test("Rem pages older threads and bumps active history without loading messages", async () => {
+  const threads = Array.from({ length: 31 }, (_, index) => ({ id: `t${index}`, title: `Thread ${index}`, updatedAt: new Date(2026, 0, 31 - index).toISOString() }));
+  const bumped = appModule.bumpChatThread(threads, "t30", "2026-09-08T12:00:00Z");
+  assert.equal(bumped[0].id, "t30");
+  assert.deepEqual(bumped.slice(1).map((thread) => thread.id), threads.slice(0, 30).map((thread) => thread.id));
+  const dom = await mountReact(React.createElement(appModule.ThreadList, { threads: bumped, onOpen() {}, onDelete() {} }), createFetchMock([]));
+  assert.equal(dom.allByTitle("Delete thread").length, 15);
+  await dom.click(dom.byText("Show older threads"));
+  assert.equal(dom.allByTitle("Delete thread").length, 30);
+  await dom.click(dom.byText("Collapse older threads"));
+  assert.equal(dom.allByTitle("Delete thread").length, 15);
+  await dom.unmount();
+});
+
+test("Rem large pastes become text attachments without entering the draft", async () => {
+  const text = "Large reference data\n".repeat(2000);
+  const file = chatAttachmentsModule.largePasteFile(text);
+  assert.equal(await file.text(), text);
+  assert.equal(file.type, "text/plain");
+  assert.equal(chatAttachmentsModule.largePasteFile("small edit"), null);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, { workflows: [], width: 380 }), createFetchMock([jsonResponse("/api/provider/capabilities", { providers: [] })]));
+  const pane = allElements(dom.container).find((node) => node.getAttribute?.("data-chat-pane") === "true");
+  await dom.pointer(pane, "onPaste", { clipboardData: { items: [], getData: () => text } });
+  assert.equal(dom.first("textarea").value, "");
+  assert.match(dom.text(), /pasted-text-.*\.txt/);
+  await dom.unmount();
+});
+
+test("Rem resource drafts allow clear, type, blur and survive row removal", async () => {
+  const { default: RemResources } = await viteServer.ssrLoadModule("/src/components/RemResources.jsx");
+  let saved;
+  function Editor() {
+    const [value, setValue] = React.useState({ shell: true, web: false, skills: [{ path: "/one" }, { path: "/two" }], mcpServers: [] });
+    return React.createElement(RemResources, { value, onChange: (next) => { saved = next; setValue(next); } });
+  }
+  const dom = await mountReact(React.createElement(Editor), createFetchMock([]));
+  let field = dom.byLabel("Skill 1 path");
+  await dom.pointer(field, "onFocus");
+  await dom.change(field, "");
+  assert.equal(field.value, "");
+  await dom.change(field, "/replacement");
+  await dom.pointer(field, "onBlur");
+  assert.equal(saved.skills[0].path, "/replacement");
+  await dom.click(dom.byLabel("Remove skill 1"));
+  field = dom.byLabel("Skill 1 path");
+  assert.equal(field.value, "/two");
+  await dom.pointer(field, "onBlur");
+  assert.equal(saved.skills[0].path, "/two");
+  await dom.unmount();
+});
+
+test("source control displays an unborn branch and keeps one option after the first commit", async () => {
+  const { runGit, readGitStatus } = require("../../electron/git-status.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rem-unborn-"));
+  const git = (...args) => runGit(["-C", root, ...args]);
+  let dom;
+  try {
+    await git("init");
+    await git("branch", "-M", "main");
+    let snapshot = await readGitStatus(root);
+    assert.equal(snapshot.branch, "main");
+    assert.deepEqual(snapshot.branches, []);
+    dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: root } }), createFetchMock([]), { desktop: { workspace: {
+      async trustProjectRoot() {},
+      async listDirectory() { return { entries: [] }; },
+      async gitStatus() { return snapshot; },
+      async gitHistory() { return { active: true, commits: [] }; },
+      async gitWorktrees() { return { active: true, worktrees: [] }; },
+    } } });
+    await dom.click(dom.byLabel("Source control"));
+    const assertMainOption = () => {
+      const selector = dom.byLabel("Switch branch");
+      assert.equal(reactProps(selector).value, "main");
+      const options = selector.childNodes.filter(node => node.tagName === "OPTION");
+      assert.equal(options.length, 1);
+      assert.equal(options[0].textContent, "main");
+      assert.equal(reactProps(options[0]).value, "main");
+    };
+    assertMainOption();
+    await git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial commit");
+    snapshot = await readGitStatus(root);
+    await dom.click(dom.byLabel("Refresh source control"));
+    await dom.flush();
+    assert.deepEqual(snapshot.branches, ["main"]);
+    assertMainOption();
+  } finally {
+    if (dom) await dom.unmount();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Git file actions preserve staged edits, handle literal paths, and switch branches", async () => {
+  const { runGit, readGitStatus, changeGitFile, switchGitBranch } = require("../../electron/git-status.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rem-git-"));
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main");
+    await git("config", "user.name", "Test");
+    await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "file.txt"), "base\n");
+    await git("add", "file.txt");
+    await git("commit", "-m", "base");
+    fs.writeFileSync(path.join(root, "file.txt"), "staged\n");
+    await changeGitFile(root, "file.txt", "stage");
+    fs.writeFileSync(path.join(root, "file.txt"), "unstaged\n");
+    let snapshot = await readGitStatus(root);
+    assert.equal(snapshot.entries[0].staged, true);
+    assert.equal(snapshot.entries[0].unstaged, true);
+    await assert.rejects(changeGitFile(root, "file.txt", "revert-staged"), /also has unstaged/);
+    await changeGitFile(root, "file.txt", "revert");
+    assert.equal(fs.readFileSync(path.join(root, "file.txt"), "utf8"), "staged\n");
+    assert.equal(await git("show", ":file.txt"), "staged\n");
+    await changeGitFile(root, "file.txt", "revert-staged");
+    fs.writeFileSync(path.join(root, "[literal].txt"), "new\n");
+    await changeGitFile(root, "[literal].txt", "stage");
+    await changeGitFile(root, "[literal].txt", "unstage");
+    snapshot = await readGitStatus(root);
+    assert.equal(snapshot.entries.find((entry) => entry.path === "[literal].txt").staged, false);
+    await assert.rejects(changeGitFile(root, "../outside", "stage"), /no longer present/);
+    await git("branch", "feature");
+    snapshot = await switchGitBranch(root, "feature");
+    assert.equal(snapshot.branch, "feature");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Rem migrates history once and loads only requested metadata pages", () => {
+  const legacy = Array.from({ length: 35 }, (_, index) => ({ id: `thread-${index}`, title: `Thread ${index}`, updatedAt: new Date(2026, 0, 35 - index).toISOString(), resources: { shell: false, web: true, skills: [], mcpServers: [] } }));
+  const stored = new Map([["gofer-flow-chat-threads", JSON.stringify(legacy)]]);
+  const reads = [];
+  window.localStorage = { getItem: (key) => { reads.push(key); return stored.get(key) || null; }, setItem: (key, value) => stored.set(key, value), removeItem: (key) => stored.delete(key) };
+  assert.equal(appModule.loadChatThreads().length, 15);
+  reads.length = 0;
+  const recent = appModule.loadChatThreads();
+  assert.equal(reads.filter((key) => key.startsWith("gofer-flow-chat-thread-meta:")).length, 15);
+  assert.equal(appModule.loadChatThreads(30).length, 30);
+  appModule.persistChatThreads(appModule.bumpChatThread(recent, "thread-5", "2026-09-08T12:00:00Z"));
+  assert.equal(appModule.chatThreadIndex().length, 35);
+  assert.equal(appModule.loadChatThreads()[0].id, "thread-5");
+  assert.deepEqual(appModule.loadChatThreads()[0].resources, legacy[5].resources);
+});
+
+test("browser Ctrl+T yields to a focused terminal and handled key events", () => {
+  const event = { ctrlKey: true, key: "t", target: { closest: () => ({}) } };
+  assert.equal(integratedBrowserModule.browserChromeShortcutAction(event, "linux"), null);
+  assert.equal(integratedBrowserModule.browserChromeShortcutAction({ ...event, target: null }, "linux"), "new-tab");
+  assert.equal(integratedBrowserModule.browserChromeShortcutAction({ ...event, target: null, defaultPrevented: true }, "linux"), null);
+});
+
+test("Developer and Memory settings can be found by task words", () => {
+  assert.ok(settingsPopoverModule.settingsCategoriesForQuery("logs").includes("developer"));
+  assert.ok(settingsPopoverModule.settingsCategoriesForQuery("second brain").includes("memory"));
+  assert.ok(settingsPopoverModule.settingsCategoriesForQuery("archive").includes("memory"));
+});
+
+test("Git commit, protected switch, stash, publish, pull and staged comparisons use real repositories", async () => {
+  const { runGit, gitRepositoryAction, switchGitBranch, readGitFileBaseline } = require("../../electron/git-status.cjs");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-scm-"));
+  const root = path.join(base, "repo");
+  const remote = path.join(base, "remote.git");
+  fs.mkdirSync(root);
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main");
+    await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "note.md"), "base\n");
+    await git("add", ".");
+    await gitRepositoryAction(root, "commit", "Initial commit");
+    await git("switch", "-c", "feature");
+    fs.writeFileSync(path.join(root, "note.md"), "feature\n"); await git("add", ".");
+    await gitRepositoryAction(root, "commit", "Feature"); await git("switch", "main");
+    fs.writeFileSync(path.join(root, "note.md"), "local\n");
+    const blocked = await switchGitBranch(root, "feature");
+    assert.equal(blocked.switchBlocked, true);
+    assert.equal(blocked.branch, "main");
+    assert.equal(fs.readFileSync(path.join(root, "note.md"), "utf8"), "local\n");
+    const switched = await gitRepositoryAction(root, "stash-switch", "feature");
+    assert.equal(switched.branch, "feature"); assert.equal(switched.stashCount, 1);
+    await switchGitBranch(root, "main"); await gitRepositoryAction(root, "stash-apply");
+    assert.equal(fs.readFileSync(path.join(root, "note.md"), "utf8"), "local\n");
+    await git("add", "note.md"); fs.writeFileSync(path.join(root, "note.md"), "unstaged\n");
+    const staged = await readGitFileBaseline(path.join(root, "note.md"), { group: "staged" });
+    assert.equal(staged.content, "base\n"); assert.equal(staged.modifiedContent, "local\n");
+    const unstaged = await readGitFileBaseline(path.join(root, "note.md"), { group: "unstaged" });
+    assert.equal(unstaged.content, "local\n"); assert.equal(unstaged.modifiedContent, "unstaged\n");
+    await gitRepositoryAction(root, "commit", "Only staged");
+    assert.equal(await git("show", "HEAD:note.md"), "local\n");
+    await assert.rejects(gitRepositoryAction(root, "commit", "No staged files"), /Stage changes/);
+    fs.unlinkSync(path.join(root, "note.md"));
+    const deleted = await readGitFileBaseline(path.join(root, "note.md"), { group: "unstaged" });
+    assert.equal(deleted.deleted, true); assert.equal(deleted.content, "local\n");
+    fs.writeFileSync(path.join(root, "new.md"), "new\n");
+    const added = await readGitFileBaseline(path.join(root, "new.md"), { group: "unstaged" });
+    assert.equal(added.content, ""); assert.equal(added.changed, true);
+    await git("restore", "note.md");
+    await runGit(["init", "--bare", remote]); await git("remote", "add", "origin", remote);
+    const published = await gitRepositoryAction(root, "publish", "origin");
+    assert.equal(published.ahead, 0);
+    await gitRepositoryAction(root, "push"); await gitRepositoryAction(root, "pull");
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("conversation archive retains structured revisions, attachments, and deterministic search metadata", () => {
+  const { archiveConversation } = require("../../electron/conversation-archive.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-archive-"));
+  const archive = path.join(root, "archive"); fs.mkdirSync(archive);
+  const storageName = "a".repeat(32) + "-note.txt";
+  const attachments = path.join(root, "chat-attachments", "thread-1"); fs.mkdirSync(attachments, { recursive: true });
+  fs.writeFileSync(path.join(attachments, storageName), "Attachment content");
+  const thread = { id: "thread-1", title: "Database decision", projectRoot: "/project", provider: "codex" };
+  const messages = [{ id: "m1", role: "user", body: "Use SQLite", attachments: [{ storageName, name: "note.txt" }] }, { id: "m2", role: "assistant", kind: "thought", body: "Inspecting files", tool: { name: "read" } }];
+  try {
+    const { id } = archiveConversation(archive, thread, messages, { dataDir: root });
+    const journal = path.join(archive, "threads", `${id}.jsonl`);
+    const snapshot = path.join(archive, "threads", `${id}.json`);
+    const original = fs.readFileSync(journal, "utf8");
+    archiveConversation(archive, thread, messages, { dataDir: root });
+    assert.equal(fs.readFileSync(journal, "utf8"), original);
+    const saved = JSON.parse(fs.readFileSync(snapshot, "utf8"));
+    assert.deepEqual(saved.messages[1].tool, { name: "read" });
+    assert.equal(fs.readFileSync(path.join(archive, saved.messages[0].attachments[0].archivePath), "utf8"), "Attachment content");
+    archiveConversation(archive, thread, [{ ...messages[0], body: "Use Postgres" }], { dataDir: root, deleted: true });
+    assert.ok(fs.readFileSync(journal, "utf8").startsWith(original));
+    const index = JSON.parse(fs.readFileSync(path.join(archive, "index.json"), "utf8"));
+    assert.equal(index.threads[id].deleted, true); assert.ok(index.threads[id].terms.includes("postgres"));
+    // Missing snapshots are recovered from the journal without replacing history.
+    fs.unlinkSync(snapshot);
+    archiveConversation(archive, thread, [{ ...messages[0], body: "Use Postgres" }], { dataDir: root, deleted: true });
+    assert.equal(JSON.parse(fs.readFileSync(snapshot, "utf8")).messages.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("app logging rotates files, redacts common credentials and preserves structured entries", () => {
+  const { createAppLog } = require("../../electron/app-log.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-log-"));
+  try {
+    const log = createAppLog(root, { maxBytes: 240, backups: 2 });
+    log.write("error", "renderer", "apiToken=super-secret password=hunter2 Authorization: Bearer abc123");
+    const entry = JSON.parse(fs.readFileSync(log.file, "utf8"));
+    assert.equal(entry.source, "renderer");
+    assert.ok(!entry.message.includes("super-secret")); assert.ok(!entry.message.includes("hunter2")); assert.ok(!entry.message.includes("abc123"));
+    for (let i = 0; i < 10; i++) log.write("info", "backend", "x".repeat(120));
+    assert.deepEqual(fs.readdirSync(root).sort(), ["app.jsonl", "app.jsonl.1", "app.jsonl.2"]);
+    for (const file of fs.readdirSync(root)) for (const line of fs.readFileSync(path.join(root, file), "utf8").trim().split("\n")) assert.ok(JSON.parse(line).time);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("archive continues when old attachments are missing and rejects symlink destinations", () => {
+  const { archiveConversation } = require("../../electron/conversation-archive.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-archive-missing-"));
+  try {
+    const messages = [{ id: "m", role: "user", body: "Historic text", attachments: [{ storageName: "a".repeat(32) + "-gone.txt", name: "gone.txt" }] }];
+    const result = archiveConversation(root, { id: "t" }, messages, { dataDir: root });
+    assert.match(result.warnings[0], /no longer available/);
+    const snapshot = JSON.parse(fs.readFileSync(path.join(root, "threads", `${result.id}.json`), "utf8"));
+    assert.equal(snapshot.messages[0].body, "Historic text");
+    assert.match(snapshot.messages[0].attachments[0].archiveError, /gone.txt/);
+    fs.symlinkSync(path.join(root, "must-not-create"), path.join(root, "index.json.tmp"));
+    assert.throws(() => archiveConversation(root, { id: "t" }, []), /symbolic links/);
+    assert.equal(fs.existsSync(path.join(root, "must-not-create")), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Git comparisons cover empty additions, renamed files, and binary versions", async () => {
+  const { runGit, readGitFileBaseline } = require("../../electron/git-status.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-diff-"));
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "empty.txt"), "");
+    assert.equal((await readGitFileBaseline(path.join(root, "empty.txt"), { group: "unstaged" })).changed, true);
+    fs.writeFileSync(path.join(root, "old.txt"), "retained content\n".repeat(20));
+    fs.writeFileSync(path.join(root, "image.png"), Buffer.from([137, 80, 78, 71, 0, 1]));
+    await git("add", "."); await git("commit", "-m", "Initial");
+    await git("mv", "old.txt", "renamed.txt");
+    const renamed = await readGitFileBaseline(path.join(root, "renamed.txt"), { group: "staged" });
+    assert.equal(renamed.content, "retained content\n".repeat(20));
+    fs.writeFileSync(path.join(root, "image.png"), Buffer.from([137, 80, 78, 71, 0, 2]));
+    const binary = await readGitFileBaseline(path.join(root, "image.png"), { group: "unstaged" });
+    assert.equal(binary.binary, true); assert.equal(binary.originalBytes, 6);
+    assert.deepEqual(Buffer.from(binary.originalData, "base64"), Buffer.from([137, 80, 78, 71, 0, 1]));
+    assert.notEqual(binary.originalData, binary.modifiedData);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("browser close is idempotent after guest destruction and checks live ownership", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  const actionSource = source.slice(source.indexOf("function browserAction("), source.indexOf("function configureBrowserSession("));
+  const ownerSource = source.slice(source.indexOf("function ownedBrowserSession("), source.indexOf("function closeBrowserSession("));
+  const browserSessions = new Map();
+  const action = vm.runInNewContext(`${ownerSource}\n${actionSource}\nbrowserAction`, {
+    browserSessions, browserSessionContents: () => null, browserSessionState: () => ({ ready: false }),
+  });
+  assert.equal(action({ sender: { id: 1 } }, { id: "gone", action: "close" }).closed, true);
+  browserSessions.set("pending", { ownerId: 1 });
+  assert.equal(action({ sender: { id: 1 } }, { id: "pending", action: "focus" }).ready, false);
+  assert.throws(() => action({ sender: { id: 2 } }, { id: "pending", action: "close" }), /not found/);
+});
+
+test("browser waits for adoption before focusing and ignores late state after cleanup", async () => {
+  let update;
+  const focused = [];
+  const closed = [];
+  const browser = {
+    create: async () => ({ id: "pending-view", clientId: "report", ready: false, src: "about:blank" }),
+    close: async (id) => { closed.push(id); },
+    focus: async (id) => { focused.push(id); },
+    onState: (callback) => { update = callback; return () => {}; },
+    onCommand: () => () => {},
+  };
+  const dom = await mountReact(React.createElement(integratedBrowserModule.default, {
+    active: true, clientId: "report",
+  }), createFetchMock([]), { browser });
+  await dom.flush();
+  assert.deepEqual(focused, []);
+  await React.act(async () => update({ id: "pending-view", clientId: "report", ready: true }));
+  await dom.flush();
+  assert.deepEqual(focused, ["pending-view"]);
+  await dom.unmount();
+  update({ id: "pending-view", clientId: "report", ready: true });
+  assert.deepEqual(closed, ["pending-view"]);
+  assert.deepEqual(focused, ["pending-view"]);
+});
+
+test("report themes survive settings persistence and appear in the picker", async () => {
+  const { RemMemorySettings } = await viteServer.ssrLoadModule("/src/components/DeveloperSettings.jsx");
+  const markup = renderToStaticMarkup(React.createElement(RemMemorySettings, { value: {}, onChange() {} }));
+  for (const { id, label } of settingsModule.REPORT_THEMES) {
+    const stored = new Map();
+    const storage = { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value) };
+    const settings = settingsModule.updateSetting(settingsModule.DEFAULT_APP_SETTINGS, "memory.secondBrainTheme", id);
+    settingsModule.saveAppSettings(settings, storage);
+    assert.equal(settingsModule.loadAppSettings(storage).memory.secondBrainTheme, id);
+    assert.ok(markup.includes(`value="${id}"`), label);
+  }
+  assert.equal(settingsModule.normalizeAppSettings({ memory: { secondBrainTheme: "unknown" } }).memory.secondBrainTheme, "auto");
+});
+
+test("source control tabs keep drafts and expose staging, commits, and branch recovery", async () => {
+  let snapshot = { active: true, branch: "main", branches: ["main", "feature"], remotes: [], entries: [{ path: "src/example.js", status: "M", staged: false, unstaged: true }] };
+  const actions = [];
+  const workspace = {
+    trustProjectRoot: async () => {},
+    listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => snapshot,
+    gitHistory: async () => ({ active: true, commits: [] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [] }),
+    gitFileAction: async (root, path, action) => {
+      actions.push([action, path]);
+      snapshot = { ...snapshot, entries: [{ ...snapshot.entries[0], staged: true, unstaged: false }] };
+      return snapshot;
+    },
+    gitSwitchBranch: async () => { throw new Error("error: Your local changes would be overwritten by checkout: src/example.js"); },
+    gitRepoAction: async (root, action, value) => {
+      actions.push([action, value]);
+      snapshot = { ...snapshot, entries: [] };
+      return snapshot;
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" } }), createFetchMock([]), { desktop: { workspace } });
+  await dom.click(dom.byLabel("Source control"));
+  await dom.flush();
+  assert.throws(() => dom.byText("Publish"));
+  assert.throws(() => dom.byLabel("Add worktree"));
+  await dom.change(dom.byLabel("Commit message"), "Update example");
+  await dom.click(dom.byLabel("File explorer"));
+  assert.equal(dom.byLabel("File explorer").getAttribute("aria-selected"), "true");
+  assert.equal(dom.byLabel("Source control").getAttribute("aria-selected"), "false");
+  assert.equal(dom.ancestor(dom.byLabel("Commit message"), "SECTION").getAttribute("hidden"), "");
+  await dom.click(dom.byLabel("Source control"));
+  assert.equal(dom.byLabel("Source control").getAttribute("aria-selected"), "true");
+  assert.equal(dom.ancestor(dom.byLabel("Commit message"), "SECTION").getAttribute("hidden"), null);
+  assert.equal(reactProps(dom.byLabel("Commit message")).value, "Update example");
+  await dom.click(dom.byText("History"));
+  assert.throws(() => dom.byLabel("Commit message"));
+  assert.ok(dom.byText("No commits yet."));
+  await dom.click(dom.byText("Changes"));
+  assert.equal(reactProps(dom.byLabel("Commit message")).value, "Update example");
+  await dom.click(dom.byLabel("Stage src/example.js"));
+  await dom.flush();
+  assert.deepEqual(actions[0], ["stage", "src/example.js"]);
+  assert.ok(dom.byLabel("Unstage src/example.js"));
+  window.dispatchEvent = () => true;
+  await dom.change(dom.byLabel("Switch branch"), "feature");
+  await dom.flush();
+  assert.ok(dom.byText("Changes would be overwritten"));
+  assert.ok(dom.byText("Technical details"));
+  assert.ok(dom.byText("Stash & switch"));
+  await dom.click(dom.byText("Stay on main"));
+  assert.throws(() => dom.byText("Technical details"));
+  const form = dom.ancestor(dom.byLabel("Commit message"), "FORM");
+  await React.act(async () => { await reactProps(form).onSubmit(testEvent(form)); });
+  await dom.flush();
+  assert.deepEqual(actions[1], ["commit", "Update example"]);
+  assert.ok(dom.byText("Working tree clean"));
+  assert.throws(() => dom.byLabel("Commit message"));
+  await dom.unmount();
+});
+
+test("source control bulk actions stay within their group and confirm discards once", async () => {
+  const initialEntries = [
+    { path: "staged.txt", status: "M", staged: true, unstaged: false },
+    { path: "one.txt", status: "M", staged: false, unstaged: true },
+    { path: "two.txt", status: "M", staged: false, unstaged: true },
+  ];
+  let snapshot = { active: true, branch: "main", branches: ["main"], entries: initialEntries };
+  const actions = [];
+  const confirmations = [];
+  const workspace = {
+    trustProjectRoot: async () => {},
+    listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => snapshot,
+    gitHistory: async () => ({ active: true, commits: [] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [] }),
+    gitFileAction: async (root, file, action) => {
+      actions.push([action, file]);
+      snapshot = { ...snapshot, entries: snapshot.entries.flatMap((entry) => entry.path !== file ? [entry]
+        : action.startsWith("revert") ? []
+          : [{ ...entry, staged: action === "stage", unstaged: action === "unstage" }]) };
+      return snapshot;
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" } }), createFetchMock([]), { desktop: { workspace } });
+  try {
+    await dom.click(dom.byLabel("Source control"));
+    await dom.flush();
+    window.dispatchEvent = () => true;
+    window.confirm = (message) => { confirmations.push(message); return false; };
+    assert.equal(dom.byText("Changes").textContent, "Changes");
+    await dom.click(dom.byLabel("Discard all unstaged changes"));
+    assert.deepEqual(actions, []);
+    window.confirm = (message) => { confirmations.push(message); return true; };
+    await dom.click(dom.byLabel("Stage all changes"));
+    await dom.flush();
+    assert.deepEqual(actions.splice(0), [["stage", "one.txt"], ["stage", "two.txt"]]);
+    assert.equal(allElements(dom.container).some((node) => node.getAttribute?.("aria-label") === "Unstaged"), false);
+    await dom.click(dom.byLabel("Unstage all changes"));
+    await dom.flush();
+    assert.deepEqual(actions.splice(0), [["unstage", "staged.txt"], ["unstage", "one.txt"], ["unstage", "two.txt"]]);
+    await dom.click(dom.byLabel("Discard all unstaged changes"));
+    await dom.flush();
+    assert.deepEqual(actions.splice(0), [["revert", "staged.txt"], ["revert", "one.txt"], ["revert", "two.txt"]]);
+    assert.equal(confirmations.length, 2);
+    assert.ok(dom.byText("Working tree clean"));
+
+    snapshot = { ...snapshot, entries: initialEntries };
+    await dom.click(dom.byLabel("Refresh source control"));
+    await dom.flush();
+    await dom.click(dom.byLabel("Discard all staged changes"));
+    await dom.flush();
+    assert.deepEqual(actions.splice(0), [["revert-staged", "staged.txt"]]);
+    assert.ok(dom.byLabel("Stage one.txt"));
+    snapshot = { ...snapshot, entries: [{ ...initialEntries[0], unstaged: true }] };
+    await dom.click(dom.byLabel("Refresh source control"));
+    await dom.flush();
+    await dom.click(dom.byLabel("Discard all staged changes"));
+    assert.deepEqual(actions, []);
+    assert.equal(confirmations.length, 3);
+    assert.ok(dom.byText("Technical details"));
+  } finally { await dom.unmount(); }
+});
+
+test("project search finds literal matches and respects ignored files and symlinks", async () => {
+  const { searchProject } = require("../../electron/project-search.cjs");
+  const runGit = require("node:util").promisify(require("node:child_process").execFile);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-search-"));
+  try {
+    await runGit("git", ["init", root]);
+    fs.writeFileSync(path.join(root, ".gitignore"), "ignored.txt\n");
+    fs.writeFileSync(path.join(root, "ignored.txt"), "hello");
+    fs.writeFileSync(path.join(root, "sample.txt"), "hello Hello helloworld\n[a.b] hello\n");
+    fs.writeFileSync(path.join(root, "binary"), Buffer.from("hello\0world"));
+    fs.symlinkSync(path.join(root, "sample.txt"), path.join(root, "link.txt"));
+    const result = await searchProject(root, { query: "hello", wholeWord: true });
+    assert.equal(result.count, 3);
+    assert.deepEqual(result.files.map((file) => file.relativePath), ["sample.txt"]);
+    assert.equal(result.files[0].matches[2].lineNumber, 2);
+    assert.equal(result.files[0].matches[2].column, 7);
+    assert.equal((await searchProject(root, { query: "hello", wholeWord: true, matchCase: true })).count, 2);
+    assert.equal((await searchProject(root, { query: "[a.b]" })).count, 1);
+    assert.equal((await searchProject(root, { query: "missing" })).count, 0);
+    fs.writeFileSync(path.join(root, "many.txt"), "hello\n".repeat(1100));
+    const capped = await searchProject(root, { query: "hello" });
+    assert.equal(capped.count, 1000);
+    assert.equal(capped.truncated, true);
+    fs.rmSync(path.join(root, ".git"), { recursive: true });
+    assert.ok((await searchProject(root, { query: "[a.b]" })).count === 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("project search preserves drafts and opens results at their line and column", async () => {
+  const opened = [];
+  const calls = [];
+  const workspace = {
+    trustProjectRoot: async () => {},
+    listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => ({ active: false, entries: [] }),
+    searchProject: async (root, options) => {
+      calls.push([root, options]);
+      return { count: 1, files: [{ path: "/workspace/project/example.js", relativePath: "example.js", matches: [{ lineNumber: 7, column: 3, text: "  hello()", offset: 2, length: 5 }] }] };
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" }, onOpenFile: (...args) => opened.push(args) }), createFetchMock([]), { desktop: { workspace } });
+  await dom.click(dom.byLabel("Search"));
+  const input = dom.byLabel("Search project");
+  input.focus();
+  await dom.change(input, "draft");
+  await dom.change(input, "");
+  await dom.change(input, "hello");
+  input.blur();
+  await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });
+  assert.equal(calls.at(-1)[1].query, "hello");
+  await dom.click(dom.byTitle("example.js:7:3"));
+  assert.deepEqual(opened, [["/workspace/project/example.js", { preview: true, lineNumber: 7, column: 3 }]]);
+  await dom.click(dom.byLabel("File explorer"));
+  await dom.click(dom.byLabel("Search"));
+  assert.equal(reactProps(dom.byLabel("Search project")).value, "hello");
+  await dom.click(dom.byLabel("Match case"));
+  await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });
+  assert.equal(calls.at(-1)[1].matchCase, true);
+  await dom.click(dom.byLabel("Clear search"));
+  assert.equal(reactProps(dom.byLabel("Search project")).value, "");
+  await dom.unmount();
+});
+
+test("regex replacement preserves line endings, supports captures, exclusions, and stale-file protection", async () => {
+  const { searchProject, replaceProject } = require("../../electron/project-search.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-replace-"));
+  const target = path.join(root, "sample.txt");
+  try {
+    fs.mkdirSync(path.join(root, "nested"));
+    fs.writeFileSync(target, "hello12\r\nhello34\r\n");
+    fs.writeFileSync(path.join(root, "nested", "ignored.log"), "hello56");
+    fs.writeFileSync(path.join(root, "keep.txt"), "hello78");
+    const options = { query: "hello(\\d+)", regex: true, exclude: "**/*.log, keep.txt" };
+    const found = await searchProject(root, options);
+    assert.equal(found.count, 2);
+    assert.deepEqual(found.files.map((file) => file.relativePath), ["sample.txt"]);
+    const replaced = await replaceProject(root, { ...options, files: found.files, replacement: "$1:$&" });
+    assert.equal(replaced.count, 2);
+    assert.equal(fs.readFileSync(target, "utf8"), "12:hello12\r\n34:hello34\r\n");
+    assert.equal(fs.readFileSync(path.join(root, "nested", "ignored.log"), "utf8"), "hello56");
+    await assert.rejects(replaceProject(root, { ...options, files: found.files, replacement: "gone" }), /changed since/);
+    await assert.rejects(searchProject(root, { query: "[", regex: true }), /regular expression/i);
+    assert.equal((await searchProject(root, { query: "(?=hello)", regex: true })).count, 4);
+    const literal = await searchProject(root, { query: "hello12" });
+    await replaceProject(root, { query: "hello12", files: literal.files, replacement: "$1" });
+    assert.equal(fs.readFileSync(target, "utf8"), "12:$1\r\n34:hello34\r\n");
+    const all = await searchProject(root, { query: "hello" });
+    await replaceProject(root, { query: "hello", files: all.files.slice(0, 1), replacement: "" });
+    assert.equal(fs.readFileSync(path.join(root, "keep.txt"), "utf8"), "78");
+    fs.writeFileSync(target, "hello\n".repeat(1001));
+    const capped = await searchProject(root, { query: "hello" });
+    await assert.rejects(replaceProject(root, { query: "hello", files: capped.files, replacement: "x" }), /incomplete/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("project search sends regex and exclusion drafts and replaces a file", async () => {
+  const calls = [];
+  const replacements = [];
+  const changed = [];
+  const file = { path: "/workspace/project/example.js", relativePath: "example.js", hash: "snapshot", matches: [{ lineNumber: 1, column: 1, text: "hello", offset: 0, length: 5 }] };
+  const workspace = {
+    trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }), gitStatus: async () => ({ active: false, entries: [] }),
+    searchProject: async (_root, options) => { calls.push(options); return { count: 1, files: [file] }; },
+    replaceProject: async (_root, options) => { replacements.push(options); return { count: 1, changed: [file.path] }; },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" }, onFilesystemChange: (change) => changed.push(change) }), createFetchMock([]), { desktop: { workspace } });
+  const originalDispatch = window.dispatchEvent;
+  const events = [];
+  window.dispatchEvent = (event) => { events.push(event); return true; };
+  const originalConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    await dom.click(dom.byLabel("Search"));
+    await dom.change(dom.byLabel("Search project"), "(hello)");
+    await dom.click(dom.byLabel("Use regular expression"));
+    const include = dom.byLabel("Files to include");
+    include.focus();
+    await dom.change(include, "draft");
+    await dom.change(include, "");
+    assert.equal(reactProps(include).value, "");
+    await dom.change(include, "src/**, *.js");
+    include.blur();
+    const exclude = dom.byLabel("Files to exclude");
+    exclude.focus();
+    await dom.change(exclude, "draft");
+    await dom.change(exclude, "");
+    await dom.change(exclude, "*.log, dist/**");
+    exclude.blur();
+    await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });
+    assert.equal(calls.at(-1).include, "src/**, *.js");
+    assert.equal(calls.at(-1).regex, true);
+    assert.equal(calls.at(-1).exclude, "*.log, dist/**");
+    await dom.click(dom.byText("Replace"));
+    const replacement = dom.byLabel("Replace with");
+    replacement.focus();
+    await dom.change(replacement, "draft");
+    await dom.change(replacement, "");
+    await dom.change(replacement, "$1!");
+    replacement.blur();
+    await dom.click(dom.byLabel("Replace matches in example.js"));
+    await dom.flush();
+    assert.deepEqual(events.map((event) => event.detail.busy), [true, false]);
+    assert.equal(replacements[0].include, "src/**, *.js");
+    assert.equal(replacements[0].replacement, "$1!");
+    assert.deepEqual(replacements[0].files, [{ path: file.path, hash: "snapshot" }]);
+    assert.equal(changed.at(-1).rootPath, "/workspace/project");
+    assert.ok(dom.byText("Replaced 1 match in 1 file."));
+  } finally { window.confirm = originalConfirm; window.dispatchEvent = originalDispatch; await dom.unmount(); }
+});
+
+test("search UI applies regex queries and regex exclusions through the real worker", async () => {
+  const { searchProject, replaceProject } = require("../../electron/project-search.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-regex-ui-"));
+  fs.writeFileSync(path.join(root, "sample.txt"), "hello12 hello34");
+  fs.writeFileSync(path.join(root, "skip12.log"), "hello56");
+  const workspace = {
+    trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }), gitStatus: async () => ({ active: false, entries: [] }),
+    searchProject, replaceProject,
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: root } }), createFetchMock([]), { desktop: { workspace } });
+  async function waitForText(text) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await React.act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+      if (textOf(dom.container).includes(text)) return;
+    }
+    assert.fail(`Search did not show: ${text}`);
+  }
+  try {
+    await dom.click(dom.byLabel("Search"));
+    const query = dom.byLabel("Search project");
+    query.focus();
+    await dom.change(query, "draft");
+    await dom.change(query, "");
+    await dom.change(query, "hello\\d{2}");
+    query.blur();
+    await waitForText("No results found.");
+    await dom.click(dom.byLabel("Use regular expression"));
+    await waitForText("3 results in 2 files");
+    await dom.click(dom.byLabel("Use regular expression for exclusions"));
+    const exclude = dom.byLabel("Files to exclude");
+    exclude.focus();
+    await dom.change(exclude, "draft");
+    await dom.change(exclude, "");
+    await dom.change(exclude, "skip\\d{1,3}\\.log$");
+    exclude.blur();
+    await waitForText("2 results in 1 files");
+    await dom.change(exclude, "[");
+    await waitForText("Search failed.");
+    assert.ok(dom.byText("Files to exclude expression"));
+    await dom.change(exclude, "");
+    await waitForText("3 results in 2 files");
+    await dom.change(query, "[");
+    await waitForText("Search failed.");
+    assert.ok(dom.byText("Search expression"));
+  } finally { await dom.unmount(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("regex exclusions preserve escapes and quantifier commas during replacement", async () => {
+  const { searchProject, replaceProject } = require("../../electron/project-search.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-regex-exclude-"));
+  try {
+    fs.mkdirSync(path.join(root, "nested"));
+    fs.writeFileSync(path.join(root, "nested", "skip12.log"), "hello56");
+    fs.writeFileSync(path.join(root, "keep.txt"), "hello78");
+    const options = { query: "hello(\\d+)", regex: true, excludeRegex: true, exclude: "(^|/)skip\\d{1,3}\\.log$" };
+    const result = await searchProject(root, options);
+    assert.deepEqual(result.files.map((file) => file.relativePath), ["keep.txt"]);
+    await replaceProject(root, { ...options, files: result.files, replacement: "$1" });
+    assert.equal(fs.readFileSync(path.join(root, "keep.txt"), "utf8"), "78");
+    assert.equal(fs.readFileSync(path.join(root, "nested", "skip12.log"), "utf8"), "hello56");
+    assert.equal((await searchProject(root, { query: "hello", excludeRegex: true, exclude: "" })).count, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("source control orders groups, omits tab counts, and scopes bulk actions", async () => {
+  let entries = [
+    { path: "staged.txt", staged: true, unstaged: false, status: "M" },
+    { path: "first.txt", staged: false, unstaged: true, status: "M" },
+    { path: "second.txt", staged: false, unstaged: true, status: "M" },
+  ];
+  const calls = [];
+  const confirmations = [];
+  let approved = false;
+  let failPath = "";
+  const workspace = {
+    trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => ({ active: true, entries }),
+    gitHistory: async () => ({ active: true, commits: [{ hash: "abc", subject: "Initial" }] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [{ path: "/workspace/project" }, { path: "/missing", missing: true }] }),
+    gitFileAction: async (_root, filePath, action) => {
+      calls.push([filePath, action]);
+      if (filePath === failPath) throw new Error("File changed during bulk action");
+      entries = entries.map((entry) => entry.path !== filePath ? entry : action === "stage" ? { ...entry, staged: true, unstaged: false } : action === "unstage" ? { ...entry, staged: false, unstaged: true } : { ...entry, [action === "revert-staged" ? "staged" : "unstaged"]: false }).filter((entry) => entry.staged || entry.unstaged);
+      return { active: true, entries };
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" } }), createFetchMock([]), { desktop: { workspace } });
+  const originalDispatch = window.dispatchEvent;
+  window.dispatchEvent = () => true;
+  const originalConfirm = window.confirm;
+  window.confirm = (message) => { confirmations.push(message); return approved; };
+  try {
+    await dom.click(dom.byLabel("Source control"));
+    await dom.flush();
+    assert.ok(dom.text().indexOf("Staged · 1") < dom.text().indexOf("Unstaged · 2"));
+    for (const label of ["Changes", "History", "Worktrees"]) {
+      assert.equal(dom.byText(label).textContent, label);
+    }
+    assert.ok(dom.byLabel("Discard unstaged changes to first.txt"));
+    await dom.click(dom.byLabel("Stage all changes"));
+    await dom.flush();
+    assert.deepEqual(calls, [["first.txt", "stage"], ["second.txt", "stage"]]);
+    assert.equal(allElements(dom.container).some((node) => node.getAttribute?.("aria-label") === "Unstaged"), false);
+    await dom.click(dom.byLabel("Unstage all changes"));
+    await dom.flush();
+    assert.deepEqual(calls.slice(2), [["staged.txt", "unstage"], ["first.txt", "unstage"], ["second.txt", "unstage"]]);
+    calls.length = 0;
+    await dom.click(dom.byLabel("Discard all unstaged changes"));
+    assert.deepEqual(calls, []);
+    approved = true;
+    await dom.click(dom.byLabel("Discard all unstaged changes"));
+    await dom.flush();
+    assert.equal(confirmations.length, 2);
+    assert.match(confirmations[1], /all 3 unstaged files/);
+    assert.deepEqual(calls, [["staged.txt", "revert"], ["first.txt", "revert"], ["second.txt", "revert"]]);
+    assert.match(dom.text(), /Working tree clean/);
+
+    entries = [{ path: "mixed.txt", staged: true, unstaged: true, status: "MM" }];
+    await dom.click(dom.byLabel("Refresh source control"));
+    await dom.flush();
+    calls.length = 0;
+    await dom.click(dom.byLabel("Discard all staged changes"));
+    assert.deepEqual(calls, []);
+    assert.match(dom.text(), /Some staged files also have unstaged edits/);
+
+    entries = [{ path: "one.txt", staged: true, unstaged: false }, { path: "two.txt", staged: true, unstaged: false }];
+    await dom.click(dom.byLabel("Refresh source control"));
+    await dom.flush();
+    failPath = "two.txt";
+    await dom.click(dom.byLabel("Discard all staged changes"));
+    await dom.flush();
+    assert.deepEqual(calls, [["one.txt", "revert-staged"], ["two.txt", "revert-staged"]]);
+    assert.match(dom.text(), /Staged · 1/);
+    assert.match(dom.text(), /File changed during bulk action/);
+  } finally { window.confirm = originalConfirm; window.dispatchEvent = originalDispatch; await dom.unmount(); }
+});
+
+for (const fail of [false, true]) {
+  test(`source control stages immediately and ${fail ? "cancels a waiting commit on failure" : "waits for every add before committing"}`, async () => {
+    let snapshot = { active: true, branch: "main", branches: ["main"], entries: [
+      { path: "one.txt", status: "M", staged: false, unstaged: true },
+      { path: "two.txt", status: "M", staged: false, unstaged: true },
+    ] };
+    const actions = [];
+    const releases = [];
+    const workspace = {
+      trustProjectRoot: async () => {},
+      listDirectory: async () => ({ entries: [] }),
+      gitStatus: async () => snapshot,
+      gitHistory: async () => ({ active: true, commits: [] }),
+      gitWorktrees: async () => ({ active: true, worktrees: [] }),
+      gitFileAction: async (root, file, action) => {
+        actions.push([action, file]);
+        await new Promise((resolve) => releases.push(resolve));
+        if (fail && file === "two.txt") throw new Error("Unable to stage two.txt");
+        snapshot = { ...snapshot, entries: snapshot.entries.map((entry) => entry.path === file ? { ...entry, staged: true, unstaged: false } : entry) };
+        return snapshot;
+      },
+      gitRepoAction: async (root, action, message) => {
+        actions.push([action, message]);
+        snapshot = { ...snapshot, entries: [] };
+        return snapshot;
+      },
+    };
+    const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/workspace/project" } }), createFetchMock([]), { desktop: { workspace } });
+    try {
+      await dom.click(dom.byLabel("Source control"));
+      await dom.flush();
+      await dom.change(dom.byLabel("Commit message"), "Save changes");
+      await dom.click(dom.byLabel("Stage all changes"));
+      assert.ok(dom.byLabel("Unstage one.txt"));
+      assert.ok(dom.byLabel("Unstage two.txt"));
+      assert.equal(reactProps(dom.byText("Commit 2 staged files")).disabled, false);
+      assert.deepEqual(actions, [["stage", "one.txt"]]);
+      const form = dom.ancestor(dom.byLabel("Commit message"), "FORM");
+      await React.act(async () => { reactProps(form).onSubmit(testEvent(form)); });
+      assert.deepEqual(actions, [["stage", "one.txt"]]);
+      await React.act(async () => releases.shift()());
+      await dom.flush();
+      assert.deepEqual(actions, [["stage", "one.txt"], ["stage", "two.txt"]]);
+      assert.ok(dom.byLabel("Unstage two.txt"));
+      await React.act(async () => releases.shift()());
+      await dom.flush();
+      if (fail) {
+        assert.equal(actions.length, 2);
+        assert.ok(dom.byLabel("Unstage one.txt"));
+        assert.ok(dom.byLabel("Stage two.txt"));
+        assert.equal(reactProps(dom.byLabel("Commit message")).value, "Save changes");
+        assert.ok(dom.byText("Technical details"));
+      } else {
+        assert.deepEqual(actions[2], ["commit", "Save changes"]);
+        assert.ok(dom.byText("Working tree clean"));
+      }
+    } finally { await dom.unmount(); }
+  });
+}
+
+
+test("Windows Markdown links retain drive paths and UNC shares", () => {
+  for (const href of ["C:/Users/Alice/My%20Project/readme.md:12", String.raw`C:\Users\Alice\readme.md:12`, String.raw`\\server\share\readme.md`]) {
+    assert.equal(markdownContentModule.markdownUrlTransform(href, "href"), href);
+  }
+  assert.equal(markdownContentModule.markdownUrlTransform("javascript:alert(1)", "href"), "");
+  assert.deepEqual(codeWorkspaceModule.markdownFileLinkTarget("/workspace/chat.md", "C:/Users/Alice/readme.md:12"), {
+    path: "C:/Users/Alice/readme.md", lineNumber: 12, column: 1,
+  });
+  assert.equal(codeWorkspaceModule.resolveMarkdownLinkPath(String.raw`C:\project\chat.md`, String.raw`\\server\share\readme.md`), String.raw`\\server\share\readme.md`);
+});
+
+test("project opening times out and propagates failures", async () => {
+  assert.equal(await appModule.withProjectOpenTimeout(Promise.resolve("opened"), 10), "opened");
+  await assert.rejects(appModule.withProjectOpenTimeout(Promise.reject(new Error("Missing folder")), 10), /Missing folder/);
+  await assert.rejects(appModule.withProjectOpenTimeout(new Promise(() => {}), 1), /Opening the project timed out/);
+});
+
+test("project sidebar announces project switching", () => {
+  const markup = renderToStaticMarkup(React.createElement(appModule.WorkflowSidebar, {
+    openingProjectRoot: "/workspace/second-brain",
+    workflows: [], recentProjectRoots: [], runState: {}, query: "", view: "code",
+  }));
+  assert.match(markup, /role="status"/);
+  assert.match(markup, /Opening second-brain/);
+  assert.match(markup, /aria-busy="true"/);
+});
+
+test("recent project switching shows progress and does not open discovered Radish files", async () => {
+  const workflow = { ...workflowFixture({ id: "second" }), projectRoot: "/second", sourceFormat: "radish", sourcePath: "/second/.taskurotta/demo/workflow.rad" };
+  let finishTrust;
+  const dom = await mountReact(React.createElement(appModule.default), createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/projects/open", { workflows: [workflow] }, { method: "POST" }),
+  ]), {
+    storage: {
+      "gofer.recentProjects": JSON.stringify(["/workspace", "/second"]),
+      [appModule.STUDIO_SESSION_STORAGE_KEY]: JSON.stringify({ projectRoot: "/workspace", view: "code", workflowId: "demo" }),
+    },
+    desktop: { workspace: {
+      trustProjectRoot: () => new Promise((resolve) => { finishTrust = resolve; }),
+      gitWorktrees: async () => ({ worktrees: [] }),
+    } },
+  });
+  await dom.flush();
+  await dom.click(dom.byTitle("/workspace\nChoose a recent project"));
+  await dom.click(dom.byTitle("/second"));
+  assert.match(dom.text(), /Opening second/);
+  finishTrust();
+  await dom.flush();
+  assert.ok(dom.byTitle("/second\nChoose a recent project"));
+  assert.doesNotMatch(dom.text(), /Opening second/);
+  assert.ok(dom.byText("Open File"));
+  await dom.unmount();
+});
+
+
+test("Rem avatar greets, blinks, restarts on reopen, and stops when disabled", async () => {
+  const { default: RemAvatar } = await viteServer.ssrLoadModule("/src/components/RemAvatar.jsx");
+  let update;
+  function Harness() {
+    const [props, setProps] = React.useState({});
+    update = setProps;
+    return React.createElement(RemAvatar, props);
+  }
+  const dom = await mountReact(React.createElement(Harness), createFetchMock([]));
+  const avatar = dom.first("div");
+  try {
+    await React.act(async () => {
+      for (const img of allElements(dom.container).filter((node) => node.tagName === "IMG")) reactProps(img).onLoad?.();
+    });
+    assert.equal(avatar.getAttribute("data-pose"), "waving");
+    await dom.flush(899);
+    assert.equal(avatar.getAttribute("data-pose"), "waving");
+    await dom.flush(900);
+    assert.equal(avatar.getAttribute("data-pose"), "seated");
+    await dom.flush(5500);
+    assert.equal(avatar.getAttribute("data-blinking"), "true");
+    await dom.flush(160);
+    assert.equal(avatar.getAttribute("data-blinking"), "false");
+    await React.act(async () => update({ visible: false }));
+    await dom.flush(6000);
+    assert.equal(avatar.getAttribute("data-animated"), "false");
+    await React.act(async () => update({ visible: true }));
+    assert.equal(avatar.getAttribute("data-pose"), "waving");
+    await React.act(async () => update({ animated: false }));
+    assert.equal(avatar.getAttribute("data-pose"), "seated");
+    await dom.flush(6000);
+    assert.equal(avatar.getAttribute("data-blinking"), "false");
+    await React.act(async () => update({ reducedMotion: "on" }));
+    assert.equal(avatar.getAttribute("data-animated"), "false");
+    document.visibilityState = "hidden";
+    await dom.dispatchWindow("visibilitychange");
+    await React.act(async () => update({}));
+    assert.equal(avatar.getAttribute("data-animated"), "false");
+  } finally { await dom.unmount(); }
+});
+
+test("Rem keeps its sleep deadline across scrolling and tab changes until explicitly restarted", async () => {
+  const { default: RemAvatar } = await viteServer.ssrLoadModule("/src/components/RemAvatar.jsx");
+  const previousObserver = globalThis.IntersectionObserver;
+  let intersect;
+  globalThis.IntersectionObserver = class {
+    constructor(callback) { intersect = callback; }
+    observe() {}
+    disconnect() {}
+  };
+  let update;
+  function Harness() {
+    const [props, setProps] = React.useState({ visible: true, home: true });
+    update = (patch) => setProps((current) => ({ ...current, ...patch }));
+    return props.home ? React.createElement(RemAvatar, props) : null;
+  }
+  const dom = await mountReact(React.createElement(Harness), createFetchMock([]));
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map();
+  window.setTimeout = (callback, delay) => {
+    const id = ++nextId;
+    timers.set(id, { callback, at: now + delay });
+    return id;
+  };
+  window.clearTimeout = (id) => timers.delete(id);
+  async function advance(ms) {
+    const end = now + ms;
+    while (true) {
+      const next = [...timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      await React.act(async () => next[1].callback());
+    }
+    now = end;
+  }
+  async function loadImages() {
+    await React.act(async () => {
+      for (const img of allElements(dom.container).filter((node) => node.tagName === "IMG")) reactProps(img).onLoad?.();
+    });
+  }
+  try {
+    await loadImages();
+    const avatar = dom.first("div");
+    assert.equal(avatar.getAttribute("data-pose"), "waving");
+    await advance(3000);
+    await React.act(async () => intersect([{ isIntersecting: false }]));
+    await advance(200000);
+    await React.act(async () => intersect([{ isIntersecting: true }]));
+    assert.equal(avatar.getAttribute("data-pose"), "seated");
+    document.visibilityState = "hidden";
+    await dom.dispatchWindow("visibilitychange");
+    await advance(396999);
+    assert.equal(avatar.getAttribute("data-pose"), "seated");
+    await advance(1);
+    assert.equal(avatar.getAttribute("data-pose"), "sleeping");
+    document.visibilityState = "visible";
+    await dom.dispatchWindow("visibilitychange");
+    await React.act(async () => intersect([{ isIntersecting: false }]));
+    await React.act(async () => intersect([{ isIntersecting: true }]));
+    await React.act(async () => update({ animated: false }));
+    await React.act(async () => update({ animated: true }));
+    await advance(600000);
+    assert.equal(avatar.getAttribute("data-pose"), "sleeping");
+    assert.equal(avatar.getAttribute("data-animated"), "false");
+    assert.equal(avatar.getAttribute("data-blinking"), "false");
+    await React.act(async () => update({ visible: false }));
+    await React.act(async () => update({ visible: true }));
+    assert.equal(avatar.getAttribute("data-pose"), "waving");
+    await advance(599999);
+    assert.equal(avatar.getAttribute("data-pose"), "seated");
+    await advance(1);
+    assert.equal(avatar.getAttribute("data-pose"), "sleeping");
+    // Opening a thread unmounts the home avatar; backing out mounts it again.
+    await React.act(async () => update({ home: false }));
+    await React.act(async () => update({ home: true }));
+    await loadImages();
+    assert.equal(dom.first("div").getAttribute("data-pose"), "waving");
+  } finally {
+    await dom.unmount();
+    if (previousObserver === undefined) delete globalThis.IntersectionObserver;
+    else globalThis.IntersectionObserver = previousObserver;
+  }
+});
+
+test("Rem avatar preferences default on and persist explicit opt-outs", () => {
+  const defaults = settingsModule.normalizeAppSettings({ assistant: { provider: "codex" } });
+  assert.equal(defaults.assistant.avatarEnabled, true);
+  assert.equal(defaults.assistant.avatarAnimated, true);
+  const storage = createStorage();
+  settingsModule.saveAppSettings({ assistant: { avatarEnabled: false, avatarAnimated: false } }, storage);
+  const saved = settingsModule.loadAppSettings(storage);
+  assert.equal(saved.assistant.avatarEnabled, false);
+  assert.equal(saved.assistant.avatarAnimated, false);
+});
+
+
+test("project search inclusion globs narrow search and replacement with exclusions taking precedence", async () => {
+  const { searchProject, replaceProject } = require("../../electron/project-search.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-include-"));
+  try {
+    fs.mkdirSync(path.join(root, "src"));
+    for (const file of ["main.py", "notes.txt", "src/app.py", "src/skip.py", "src/app.js"]) {
+      fs.writeFileSync(path.join(root, file), "hello");
+    }
+    const find = (include, exclude = "") => searchProject(root, { query: "hello", include, exclude });
+    assert.equal((await find("")).count, 5);
+    assert.equal((await find("missing/**")).count, 0);
+    assert.equal((await find("*.py")).count, 3);
+    assert.equal((await find("**/*.py")).count, 3);
+    assert.equal((await find("src/")).count, 3);
+    const include = "src/**, main.py";
+    const exclude = "skip.py";
+    const result = await find(include, exclude);
+    assert.deepEqual(result.files.map((file) => file.relativePath), ["main.py", "src/app.js", "src/app.py"]);
+    await replaceProject(root, { query: "hello", include, exclude, replacement: "done", files: result.files });
+    assert.equal(fs.readFileSync(path.join(root, "src/app.py"), "utf8"), "done");
+    assert.equal(fs.readFileSync(path.join(root, "src/skip.py"), "utf8"), "hello");
+    assert.equal(fs.readFileSync(path.join(root, "notes.txt"), "utf8"), "hello");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Git integration previews preserve worktrees, detect conflicts, and support resolution and abort", async () => {
+  const { runGit, gitRepositoryAction, readGitStatus, changeGitFile, readGitFileBaseline } = require("../../electron/git-status.cjs");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-integration-"));
+  const root = path.join(base, "main"); const feature = path.join(base, "feature");
+  fs.mkdirSync(root);
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "note.txt"), "base\n"); await git("add", "."); await git("commit", "-m", "Base");
+    await git("worktree", "add", "-b", "feature", feature);
+    fs.writeFileSync(path.join(feature, "note.txt"), "feature\n"); await runGit(["-C", feature, "commit", "-am", "Feature"]);
+    fs.writeFileSync(path.join(root, "note.txt"), "main\n"); await git("commit", "-am", "Main");
+    const before = await git("status", "--porcelain=v1");
+    const preview = await gitRepositoryAction(feature, "merge-preview", { source: "feature", target: "main" });
+    assert.deepEqual(preview.conflicts, ["note.txt"]); assert.equal(preview.blocked, false);
+    assert.equal(await git("status", "--porcelain=v1"), before);
+    assert.equal(fs.readFileSync(path.join(root, "note.txt"), "utf8"), "main\n");
+    let result = await gitRepositoryAction(feature, "merge-branch", { source: "feature", target: "main", ...preview });
+    assert.equal(result.error, undefined);
+    assert.deepEqual(result.conflicts, ["note.txt"]);
+    assert.match(result.notice, /Merge paused in main/);
+    assert.equal(result.destinationRoot, root); assert.equal(result.destinationStatus.operation, "merge");
+    assert.equal(result.destinationStatus.entries[0].status, "!"); assert.equal(result.destinationStatus.entries[0].staged, false);
+    const baseline = await readGitFileBaseline(path.join(root, "note.txt"), { group: "unstaged" });
+    assert.equal(baseline.conflict, true); assert.equal(baseline.content, "main\n"); assert.equal(baseline.incomingContent, "feature\n");
+    await assert.rejects(changeGitFile(root, "note.txt", "stage"), /conflict markers/);
+    await assert.rejects(gitRepositoryAction(root, "merge-continue"), /Resolve and stage/);
+    await gitRepositoryAction(root, "merge-abort"); assert.equal((await readGitStatus(root)).operation, undefined);
+    const failed = await gitRepositoryAction(feature, "merge-branch", { source: "feature", target: "main", ...preview }, {
+      runGit: args => {
+        if (args.includes("--no-edit")) throw Object.assign(new Error("Merge failed"), { stderr: "Merge hook refused the operation." });
+        return runGit(args);
+      },
+    });
+    assert.equal(failed.error, "Merge hook refused the operation.");
+    assert.equal(failed.conflicts, undefined);
+    const rebase = await gitRepositoryAction(root, "rebase-preview", { source: "feature", target: "main" });
+    assert.deepEqual(rebase.conflicts, ["note.txt"]);
+    result = await gitRepositoryAction(root, "rebase-branch", { source: "feature", target: "main", ...rebase });
+    assert.equal(result.error, undefined);
+    assert.deepEqual(result.conflicts, ["note.txt"]);
+    assert.equal(result.destinationStatus.operation, "rebase");
+    await gitRepositoryAction(feature, "rebase-abort");
+    await gitRepositoryAction(feature, "merge-branch", { source: "feature", target: "main", ...preview });
+    fs.writeFileSync(path.join(root, "note.txt"), "resolved\n"); await changeGitFile(root, "note.txt", "stage");
+    await gitRepositoryAction(root, "merge-continue"); assert.equal((await readGitStatus(root)).operation, undefined);
+    assert.equal((await readGitStatus(root)).entries.length, 0);
+    await assert.rejects(gitRepositoryAction(root, "merge-branch", { source: "feature", target: "main", ...preview }), /branch changed/);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("stash previews include untracked files, detect conflicts and guard discard against stale lists", async () => {
+  const { runGit, gitRepositoryAction, readGitStatus } = require("../../electron/git-status.cjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-stashes-"));
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "note.txt"), "base\n"); await git("add", "."); await git("commit", "-m", "Base");
+    fs.writeFileSync(path.join(root, "note.txt"), "stash\n"); fs.writeFileSync(path.join(root, "new.txt"), "untracked\n");
+    await git("stash", "push", "-u", "-m", "Saved work");
+    const { stashes } = await gitRepositoryAction(root, "stash-list");
+    let preview = await gitRepositoryAction(root, "stash-preview", stashes[0]);
+    assert.match(preview.diff, /untracked/); assert.deepEqual(preview.conflicts, []); assert.equal(preview.blocked, false);
+    assert.equal(fs.existsSync(path.join(root, "new.txt")), false); assert.equal((await readGitStatus(root)).entries.length, 0);
+    await gitRepositoryAction(root, "stash-apply-selected", stashes[0]);
+    assert.equal(fs.readFileSync(path.join(root, "new.txt"), "utf8"), "untracked\n"); assert.equal((await readGitStatus(root)).stashCount, 1);
+    preview = await gitRepositoryAction(root, "stash-preview", stashes[0]); assert.equal(preview.blocked, true);
+    await git("reset", "--hard", "HEAD"); fs.unlinkSync(path.join(root, "new.txt"));
+    fs.writeFileSync(path.join(root, "note.txt"), "main\n"); await git("commit", "-am", "Main");
+    preview = await gitRepositoryAction(root, "stash-preview", stashes[0]);
+    assert.ok(preview.conflicts?.includes("note.txt") || preview.blocked); assert.equal((await readGitStatus(root)).entries.length, 0);
+    await assert.rejects(gitRepositoryAction(root, "stash-clear", { hashes: [] }), /Stashes changed/);
+    await gitRepositoryAction(root, "stash-drop", stashes[0]); assert.equal((await readGitStatus(root)).stashCount, 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("conflict choices handle diff3, multiple blocks and preserve selected content", async () => {
+  const { conflictBlocks, resolvedConflict } = await viteServer.ssrLoadModule("/src/lib/mergeConflicts.js");
+  const blocks = conflictBlocks("before\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> feature\nafter\n<<<<<<< HEAD\n=======\nadded\n>>>>>>> feature\n");
+  assert.equal(blocks.length, 2); assert.equal(blocks[0].start, 2); assert.equal(blocks[0].end, 8);
+  assert.equal(resolvedConflict(blocks[0], "current"), "ours"); assert.equal(resolvedConflict(blocks[0], "incoming"), "theirs");
+  assert.equal(resolvedConflict(blocks[0], "both"), "ours\ntheirs"); assert.equal(resolvedConflict(blocks[1], "both"), "added");
+});
+
+test("editor Rem context actions capture the exact selection and its location", async () => {
+  const { installRemActions } = await viteServer.ssrLoadModule("/src/lib/editorRem.js");
+  const actions = []; const events = [];
+  globalThis.window.dispatchEvent = event => events.push(event);
+  const editor = { addAction(action) { actions.push(action); return { dispose() {} }; }, getSelection: () => ({ startLineNumber: 4, endLineNumber: 7 }), getModel: () => ({ getValueInRange: () => "selected text" }) };
+  const installed = installRemActions(editor, () => ({ path: "/repo/file.py" }));
+  assert.deepEqual(actions.map(a => a.label), ["Ask Rem", "Explain with Rem"]);
+  actions[0].run(editor); actions[1].run(editor);
+  assert.equal(events[0].detail.text, "selected text"); assert.equal(events[0].detail.path, "/repo/file.py");
+  assert.equal(events[0].detail.startLine, 4); assert.equal(events[1].detail.mode, "explain"); installed.dispose();
+});
+
+test("Ask Rem keeps the selected text attached in a new thread scoped to its own project", async () => {
+  const fetchMock = createFetchMock([jsonResponse("/api/provider/capabilities", { providers: [] })]);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, {
+    workflows: [], width: 380, recentProjectRoots: ["/projects/alpha", "/projects/beta"], workflow: { projectRoot: "/projects/alpha" },
+  }), fetchMock);
+  await dom.dispatchWindow("gofer:rem-context", { detail: { mode: "ask", path: "/projects/beta/code.py", text: "print('selected')", startLine: 2, endLine: 2 } });
+  await dom.flush();
+  assert.match(dom.text(), /editor-selection.txt/);
+  assert.ok(dom.byLabel("Scoped to beta. Change project scope"));
+  assert.equal(dom.first("textarea").value, "");
+  assert.equal(fetchMock.calls.filter(call => call.url?.includes("/chat/stream")).length, 0);
+  await dom.change(dom.first("textarea"), "Why does this work?");
+  assert.equal(dom.first("textarea").value, "Why does this work?");
+  assert.match(dom.text(), /editor-selection.txt/);
+  await dom.unmount();
+});
+
+test("Explain with Rem sends the selection once in a fresh project thread", async () => {
+  let uploaded;
+  const chatStream = streamResponse(['{"type":"final","message":{"body":"An explanation"}}\n']);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", { providers: [] }),
+    (url, options) => {
+      if (url !== "/api/chat/attachments") return null;
+      uploaded = JSON.parse(options.body);
+      return jsonResponse(url, { attachments: [{ id: "selection", name: "editor-selection.txt", type: "text/plain", storageName: "selection.txt" }] }, { method: "POST" })(url, options);
+    },
+    url => url === "/api/chat/stream" ? chatStream(url) : null,
+  ]);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, { workflows: [], width: 380 }), fetchMock);
+  await dom.dispatchWindow("gofer:rem-context", { detail: { mode: "explain", projectRoot: "/projects/beta", path: "/projects/beta/code.py", text: "print('selected')", startLine: 2, endLine: 2 } });
+  await dom.flush();
+  assert.ok(uploaded.threadId);
+  assert.match(Buffer.from(uploaded.files[0].data, "base64").toString(), /File: \/projects\/beta\/code.py[\s\S]*print\('selected'\)/);
+  const requests = fetchMock.calls.filter(call => call.url === "/api/chat/stream");
+  assert.equal(requests.length, 1);
+  const request = JSON.parse(requests[0].options.body);
+  assert.equal(request.workflow.projectRoot, "/projects/beta");
+  assert.match(request.messages.at(-1).body || request.messages.at(-1).content, /Explain the highlighted/);
+  await dom.unmount();
+});
+
+test("source control exposes conflicts and locks parent controls during integration previews", async () => {
+  let finishPreview;
+  const snapshot = { active: true, root: "/repo", branch: "main", branches: ["main", "feature", "available"], stashCount: 0, entries: [{ path: "code.py", status: "!", staged: false, unstaged: true }], operation: "merge" };
+  const workspace = { trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }), gitStatus: async () => snapshot,
+    gitHistory: async () => ({ active: true, commits: [] }), gitWorktrees: async () => ({ active: true, worktrees: [{ path: "/repo", branch: "main" }, { path: "/feature", branch: "feature" }] }),
+    gitRepoAction: async (_root, action) => action === "stash-list" ? { stashes: [] } : new Promise(resolve => { finishPreview = resolve; }),
+  };
+  const opened = [];
+  const selected = [];
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/repo" }, onOpenFile: (...args) => opened.push(args), onSelectProject: root => selected.push(root) }), createFetchMock([]), { desktop: { workspace } });
+  await dom.click(dom.byLabel("Source control")); await dom.flush();
+  assert.deepEqual(dom.byLabel("Switch branch").childNodes.filter(node => node.tagName === "OPTION").map(node => reactProps(node).value), ["main", "available"]);
+  assert.ok(dom.byText("Resolve conflicts with Rem")); assert.ok(dom.byText("Merge paused"));
+  assert.ok(allElements(dom.byLabel("Staged")).some(el => el.getAttribute("title") === "code.py"));
+  assert.ok(allElements(dom.byLabel("Unstaged")).some(el => el.getAttribute("title") === "code.py"));
+  assert.equal(reactProps(dom.byLabel("Unstage code.py")).disabled, true);
+  assert.equal(reactProps(dom.byLabel("Stage code.py")).disabled, false);
+  await dom.click(dom.byTitle("code.py")); assert.deepEqual(opened[0], ["/repo/code.py", { diff: true, gitGroup: "unstaged" }]);
+  assert.equal(reactProps(dom.byText("Continue merge")).disabled, true);
+  await dom.click(dom.byText("Worktrees")); await dom.click(dom.byLabel("Integrate feature worktree"));
+  await dom.change(dom.byLabel("Target branch"), "main"); await dom.click(dom.byText("Preview merge"));
+  assert.equal(reactProps(dom.byLabel("Remove feature worktree")).disabled, true);
+  await React.act(async () => { finishPreview({ diff: "+new", conflicts: ["code.py"], notice: "1 file will conflict." }); });
+  assert.equal(reactProps(dom.byLabel("Remove feature worktree")).disabled, false);
+  assert.match(dom.text(), /1 file will conflict/); assert.ok(dom.byText("Merge branch"));
+  const previousConfirm = window.confirm;
+  window.confirm = () => true;
+  window.dispatchEvent = () => true;
+  try {
+    await dom.click(dom.byText("Merge branch"));
+    await React.act(async () => { finishPreview({ ...snapshot, destinationRoot: "/feature", destinationStatus: snapshot, conflicts: ["code.py"], notice: "Merge paused. Resolve the files marked !." }); });
+    await dom.flush();
+    assert.deepEqual(selected, ["/feature"]);
+    assert.equal(dom.byText("Changes").getAttribute("aria-selected"), "true");
+    assert.ok(dom.byTitle("code.py"));
+    assert.doesNotMatch(dom.text(), /Command failed/);
+  } finally { window.confirm = previousConfirm; }
+  await dom.unmount();
+});
+
+test("worktree context menus list operations and defer target selection without Git mutations", async () => {
+  const calls = [];
+  const workspace = {
+    trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => ({ active: true, root: "/repo", branch: "main", branches: ["main", "feature", "release"], entries: [] }),
+    gitHistory: async () => ({ active: true, commits: [] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [{ path: "/repo", branch: "main" }, { path: "/feature", branch: "feature" }] }),
+    gitRepoAction: async (root, action, value) => {
+      calls.push({ root, action, value });
+      return action === "stash-list" ? { stashes: [] } : { notice: "Ready to review", diff: "+change" };
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/repo" } }), createFetchMock([]), { desktop: { workspace } });
+  try {
+    window.innerWidth = 1024;
+    window.innerHeight = 768;
+    await dom.click(dom.byLabel("Source control")); await dom.flush();
+    await dom.click(dom.byText("Worktrees"));
+    const icon = dom.byLabel("Integrate feature worktree");
+    assert.equal(textOf(icon), "");
+    const row = icon.parentNode;
+    const menu = label => allElements(document.body).find(el => el.getAttribute("role") === "menu" && el.getAttribute("aria-label") === label);
+    for (const kind of ["merge", "rebase", "squash", "ff-only", "no-ff"]) {
+      await dom.pointer(row, "onContextMenu", { target: icon, clientX: 100, clientY: 100 });
+      const actions = menu("Actions for feature");
+      assert.ok(actions);
+      const operation = allElements(actions).find(el => el.getAttribute("data-operation") === kind);
+      await dom.pointer(operation, "onMouseEnter", { currentTarget: operation });
+      assert.equal(document.activeElement, operation, "Hover moves focus to the visible operation");
+      assert.equal(operation.getAttribute("aria-haspopup"), null);
+      assert.equal(allElements(actions).filter(el => el.tagName === "BUTTON").length, 5);
+      await dom.click(operation);
+      assert.equal(menu("Actions for feature"), undefined);
+      assert.equal(reactProps(dom.byLabel("Integration operation")).value, kind);
+      assert.equal(reactProps(dom.byLabel("Target branch")).value, "");
+      await dom.change(dom.byLabel("Target branch"), "main");
+      await dom.click(dom.byText(`Preview ${kind}`));
+      assert.deepEqual(calls.at(-1), { root: "/repo", action: `${kind === "rebase" ? "rebase" : "merge"}-preview`, value: { source: "feature", target: "main", ...(["merge", "rebase"].includes(kind) ? {} : { strategy: kind }) } });
+    }
+    assert.ok(calls.every(call => call.action === "stash-list" || call.action.endsWith("-preview")));
+    await dom.keyDown(row, "F10", { shiftKey: true, target: icon });
+    const actions = menu("Actions for feature");
+    assert.ok(actions);
+    await dom.keyDown(actions.parentNode, "Escape");
+    assert.equal(menu("Actions for feature"), undefined);
+    assert.equal(document.activeElement, icon);
+  } finally { await dom.unmount(); }
+});
+
+test("Git merge strategies, commit resets, and worktree starting commits preserve their distinct semantics", async () => {
+  const { runGit, gitRepositoryAction, addGitWorktree } = require("../../electron/git-status.cjs");
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "taskurotta-history-"));
+  const root = path.join(base, "repo"); fs.mkdirSync(root);
+  const git = (...args) => runGit(["-C", root, ...args]);
+  try {
+    await git("init", "-b", "main"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
+    fs.writeFileSync(path.join(root, "note"), "base\n"); await git("add", "."); await git("commit", "-m", "Base");
+    const first = (await git("rev-parse", "HEAD")).trim();
+    const subfolder = path.join(root, "nested"); fs.mkdirSync(subfolder);
+    await assert.rejects(gitRepositoryAction(subfolder, "reset-hard", { hash: first }), /repository root/);
+    await assert.rejects(gitRepositoryAction(subfolder, "staged-diff"), /repository root/);
+
+    await git("switch", "-c", "feature");
+    fs.writeFileSync(path.join(root, "note"), "feature\n"); await git("commit", "-am", "Feature");
+    const second = (await git("rev-parse", "HEAD")).trim();
+    await git("switch", "main");
+    for (const strategy of ["squash", "ff-only", "no-ff"]) {
+      const preview = await gitRepositoryAction(root, "merge-preview", { source: "feature", target: "main", strategy });
+      assert.equal(preview.blocked, false);
+      assert.equal((await git("rev-parse", "HEAD")).trim(), first);
+      await gitRepositoryAction(root, "merge-branch", { source: "feature", target: "main", strategy, ...preview });
+      if (strategy === "squash") {
+        assert.equal((await git("rev-parse", "HEAD")).trim(), first);
+        assert.match((await gitRepositoryAction(root, "staged-diff")).diff, /\+feature/);
+      } else if (strategy === "ff-only") assert.equal((await git("rev-parse", "HEAD")).trim(), second);
+      else assert.equal((await git("rev-list", "--parents", "-n", "1", "HEAD")).trim().split(" ").length, 3);
+      await gitRepositoryAction(root, "reset-hard", { hash: first });
+    }
+    await gitRepositoryAction(root, "reset-soft", { hash: second });
+    assert.equal(fs.readFileSync(path.join(root, "note"), "utf8"), "base\n");
+    assert.match(await git("diff", "--cached"), /\+base/);
+    await gitRepositoryAction(root, "reset-hard", { hash: first });
+    await gitRepositoryAction(root, "branch-commit", { hash: second, branch: "from-history" });
+    assert.equal((await git("branch", "--show-current")).trim(), "from-history");
+    await gitRepositoryAction(root, "detach-commit", { hash: first });
+    assert.equal((await git("branch", "--show-current")).trim(), "");
+    const destination = path.join(base, "worktree"); fs.mkdirSync(destination);
+    await addGitWorktree(root, destination, "historic", { createBranch: true, startPoint: second });
+    assert.equal((await runGit(["-C", destination, "rev-parse", "HEAD"])).trim(), second);
+    await assert.rejects(gitRepositoryAction(root, "reset-hard", { hash: "--bad-option" }), /valid commit/);
+    await git("switch", "main");
+    fs.writeFileSync(path.join(root, "other"), "diverged\n"); await git("add", "."); await git("commit", "-m", "Diverge");
+    const blocked = await gitRepositoryAction(root, "merge-preview", { source: "feature", target: "main", strategy: "ff-only" });
+    assert.equal(blocked.blocked, true);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test("Conventional Commit generation uses the restricted endpoint and rejects invalid output", async () => {
+  const { generateConventionalCommit, conventionalCommitMessage } = await import("../lib/commit-message.js");
+  assert.equal(conventionalCommitMessage("fix(git): expose resolved edits"), "fix(git): expose resolved edits");
+  assert.throws(() => conventionalCommitMessage("Here is your message"), /Conventional Commit/);
+  const previousFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (_url, options) => {
+    request = JSON.parse(options.body);
+    assert.match(_url, /chat\/commit-message$/);
+    return { ok: true, json: async () => ({ message: "feat(git): add squash merge" }) };
+  };
+  try {
+    assert.equal(await generateConventionalCommit({ provider: "codex", model: "gpt-6-astra", effort: "high", diff: "+staged" }), "feat(git): add squash merge");
+    assert.equal(request.model, "gpt-6-astra");
+    assert.equal(request.provider, "codex");
+    assert.equal(request.effort, "high");
+    assert.equal(request.diff, "+staged");
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test("commit history menu requests resets and prepopulates a worktree at the selected commit", async () => {
+  const hash = "a".repeat(40), calls = [];
+  const workspace = { trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => ({ active: true, branch: "main", branches: ["main"], entries: [] }),
+    gitHistory: async () => ({ active: true, commits: [{ hash, shortHash: "aaaaaaa", subject: "Historic change" }] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [] }),
+    gitRepoAction: async (_root, action, value) => { calls.push({ action, value }); return { active: true, branch: "main", branches: ["main"], entries: [], stashes: [] }; },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/repo" } }), createFetchMock([]), { desktop: { workspace } });
+  const confirm = window.confirm; window.confirm = () => false;
+  window.dispatchEvent = () => true;
+  try {
+    window.innerWidth = 1024; window.innerHeight = 768;
+    await dom.click(dom.byLabel("Source control")); await dom.click(dom.byText("History")); await dom.flush();
+    const open = async () => {
+      const button = dom.byText("Historic change").parentNode.parentNode;
+      await dom.pointer(button.parentNode.parentNode, "onContextMenu", { target: button, clientX: 50, clientY: 50 });
+    };
+    await open(); await dom.click(allElements(document.body).find(el => el.getAttribute("data-operation") === "reset-hard")); assert.equal(calls.length, 0);
+    window.confirm = () => true;
+    await open(); await dom.click(allElements(document.body).find(el => el.getAttribute("data-operation") === "reset-soft")); await dom.flush();
+    assert.deepEqual(calls[0], { action: "reset-soft", value: { hash } });
+    await open(); await dom.click(allElements(document.body).find(el => el.getAttribute("data-operation") === "branch-commit"));
+    await dom.focus(dom.byLabel("New branch name"));
+    await dom.change(dom.byLabel("New branch name"), "");
+    await dom.change(dom.byLabel("New branch name"), "history-branch");
+    await dom.blur(dom.byLabel("New branch name"));
+    await React.act(async () => { const form = dom.byLabel("New branch name").parentNode.parentNode; await reactProps(form).onSubmit(testEvent(form)); });
+    await dom.flush();
+    assert.deepEqual(calls.at(-1), { action: "branch-commit", value: { hash, branch: "history-branch" } });
+    await open(); await dom.click(allElements(document.body).find(el => el.getAttribute("data-operation") === "worktree-commit"));
+    assert.equal(dom.byText("Worktrees").getAttribute("aria-selected"), "true");
+    assert.match(dom.text(), /Starting at aaaaaaaa/);
+  } finally { window.confirm = confirm; await dom.unmount(); }
+});
+
+test("Rem commit button uses staged diff, preserves typed drafts, and rejects stale index results", async () => {
+  let tree = "tree-1", pending;
+  const calls = [];
+  const snapshot = { active: true, branch: "main", branches: ["main"], entries: [{ path: "note", status: "M", staged: true, unstaged: true }] };
+  const workspace = { trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }), gitStatus: async () => snapshot,
+    gitHistory: async () => ({ active: true, commits: [] }), gitWorktrees: async () => ({ active: true, worktrees: [] }),
+    gitRepoAction: async (_root, action) => { calls.push(action); return { tree, diff: "+staged-only" }; },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: "/repo" } }), createFetchMock([]), { desktop: { workspace } });
+  window.dispatchEvent = event => { if (event.type === "gofer:rem-commit-message") pending = event.detail; return true; };
+  try {
+    await dom.click(dom.byLabel("Source control")); await dom.flush();
+    await dom.click(dom.byLabel("Generate commit message with Rem")); await dom.flush();
+    assert.equal(pending.diff, "+staged-only");
+    await React.act(async () => pending.resolve("fix: expose working edits")); await dom.flush();
+    assert.equal(reactProps(dom.byLabel("Commit message")).value, "fix: expose working edits");
+    await dom.click(dom.byLabel("Generate commit message with Rem")); await dom.flush();
+    await dom.change(dom.byLabel("Commit message"), "fix: my edited draft");
+    await React.act(async () => pending.resolve("fix: generated replacement")); await dom.flush();
+    assert.equal(reactProps(dom.byLabel("Commit message")).value, "fix: my edited draft");
+    await dom.click(dom.byLabel("Generate commit message with Rem")); await dom.flush();
+    tree = "tree-2";
+    await React.act(async () => pending.resolve("feat: outdated message")); await dom.flush();
+    assert.match(dom.text(), /Staged changes changed/);
+    assert.equal(reactProps(dom.byLabel("Commit message")).value, "fix: my edited draft");
+    assert.ok(calls.every(action => action === "staged-diff"));
+  } finally { await dom.unmount(); }
+});
+
+test("Rem accepts staged diffs larger than 200000 characters", async () => {
+  const { gitRepositoryAction } = require("../../electron/git-status.cjs");
+  const diff = Array.from({ length: 92 }, (_, i) => `diff --git a/file-${i} b/file-${i}\n${"+change\n".repeat(1000)}`).join("");
+  const result = await gitRepositoryAction("/repo", "staged-diff", "", { runGit: async args => {
+    if (args.includes("rev-parse")) return "/repo\n";
+    if (args.includes("--diff-filter=U")) return "";
+    if (args.includes("write-tree")) return "staged-tree\n";
+    if (args.includes("--cached")) return diff;
+    throw new Error(`Unexpected Git command: ${args}`);
+  } });
+  assert.equal(result.diff, diff);
+  assert.equal(result.tree, "staged-tree");
+});

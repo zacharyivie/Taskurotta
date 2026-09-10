@@ -1,4 +1,4 @@
-import taskurottaIcon from "../assets/taskurotta-icon.svg";
+import taskurottaIcon from "../assets/roundel.png";
 
 export default function TaskurottaMark({ className = "" }) {
   return (

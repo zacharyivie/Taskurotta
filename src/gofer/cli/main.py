@@ -35,6 +35,18 @@ ui_app = typer.Typer(help="Run the workflow studio API", no_args_is_help=True)
 app.add_typer(ui_app, name="ui")
 
 
+@ui_app.command("second-brain", hidden=True)
+def second_brain(
+    root: Path = typer.Option(..., "--root"),
+    report_format: str = typer.Option("md", "--report-format"),
+    report_theme: str = typer.Option("auto", "--report-theme"),
+) -> None:
+    """Serve the native Rem knowledge tools over MCP stdio."""
+    from gofer.ui.second_brain import serve_second_brain
+
+    serve_second_brain(root, report_format, report_theme)
+
+
 @ui_app.command("serve")
 def serve_ui(
     host: str = typer.Option("127.0.0.1", "--host", help="API bind host"),

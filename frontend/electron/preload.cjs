@@ -109,6 +109,16 @@ async function invokeDesktop(channel, payload = {}) {
 }
 
 contextBridge.exposeInMainWorld("goferDesktop", {
+  developer: {
+    info: () => invokeDesktop("gofer:developer-info"),
+    action: (action) => invokeDesktop("gofer:developer-action", { action }),
+    log: (message) => invokeDesktop("gofer:renderer-log", { message }),
+  },
+  rem: {
+    settings: () => invokeDesktop("gofer:rem-settings"),
+    configure: (key, value) => invokeDesktop("gofer:configure-rem", { key, value, grantId: typeof value === "string" ? grantForPath(value) : "" }),
+    archive: (thread, messages, deleted = false) => invokeDesktop("gofer:archive-rem", { thread, messages, deleted }),
+  },
   getDataDir: () => ipcRenderer.invoke("gofer:get-data-dir"),
   appearance: {
     setZoomFactor: (value) => {
@@ -139,6 +149,8 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     get: () => ipcRenderer.invoke("gofer:get-data-dir"),
   },
   workspace: {
+    replaceProject: (projectRoot, options = {}) => invokeDesktop("gofer:replace-project", { ...options, projectRoot, grantId: grantForPath(projectRoot) }),
+    searchProject: (projectRoot, options = {}) => invokeDesktop("gofer:search-project", { ...options, projectRoot, grantId: grantForPath(projectRoot) }),
     listDirectory: (options = {}) =>
       listDirectory(options),
     openPath: (targetPath) =>
@@ -147,10 +159,13 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       revealPath(targetPath),
     getPathInfo: (targetPath) =>
       getPathInfo(targetPath),
+    gitRepoAction: (projectRoot, action, value) => invokeDesktop("gofer:git-repo-action", { projectRoot, action, value, grantId: grantForPath(projectRoot) }),
+    gitFileAction: (projectRoot, relativePath, action) => invokeDesktop("gofer:git-file-action", { projectRoot, relativePath, action, grantId: grantForPath(projectRoot) }),
+    gitSwitchBranch: (projectRoot, branch) => invokeDesktop("gofer:git-switch-branch", { projectRoot, branch, grantId: grantForPath(projectRoot) }),
     gitStatus: (projectRoot) =>
       gitStatus(projectRoot),
-    gitFileBaseline: (targetPath) =>
-      gitFileBaseline(targetPath),
+    gitFileBaseline: (targetPath, group) =>
+      gitFileBaseline(targetPath, group),
     gitHistory: (projectRoot) => gitHistory(projectRoot),
     gitWorktrees: (projectRoot) => gitWorktrees(projectRoot),
     addWorktree: (options = {}) => addWorktree(options),
@@ -358,8 +373,9 @@ function gitStatus(projectRoot) {
   });
 }
 
-function gitFileBaseline(targetPath) {
+function gitFileBaseline(targetPath, group) {
   return invokeDesktop("gofer:git-file-baseline", {
+    group,
     grantId: grantForPath(targetPath),
     targetPath: typeof targetPath === "string" ? targetPath : "",
   });
@@ -377,6 +393,7 @@ function addWorktree(options = {}) {
   return invokeDesktop("gofer:git-worktree-add", {
     branch: typeof options.branch === "string" ? options.branch : "",
     createBranch: options.createBranch === true,
+    startPoint: typeof options.startPoint === "string" ? options.startPoint : undefined,
     grantId: grantForPath(options.projectRoot),
     projectRoot: typeof options.projectRoot === "string" ? options.projectRoot : "",
     targetGrantId: grantForPath(options.targetPath),
@@ -386,6 +403,7 @@ function addWorktree(options = {}) {
 
 function removeWorktree(options = {}) {
   return invokeDesktop("gofer:git-worktree-remove", {
+    force: options.force === true,
     grantId: grantForPath(options.projectRoot),
     projectRoot: typeof options.projectRoot === "string" ? options.projectRoot : "",
     targetGrantId: grantForPath(options.targetPath),
@@ -496,3 +514,6 @@ contextBridge.exposeInMainWorld("goferUpdates", {
     return () => ipcRenderer.removeListener("gofer:update-state", listener);
   },
 });
+
+globalThis.window?.addEventListener("error", (event) => { void ipcRenderer.invoke("gofer:renderer-log", { message: event.error?.stack || event.message || "Renderer error" }).catch(() => {}); });
+globalThis.window?.addEventListener("unhandledrejection", (event) => { void ipcRenderer.invoke("gofer:renderer-log", { message: event.reason?.stack || String(event.reason) }).catch(() => {}); });

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from typing import cast
 
@@ -293,6 +294,48 @@ def test_resolve_claude_executable_uses_nvm_default_when_not_on_path(
     monkeypatch.setattr(provider_capabilities.shutil, "which", lambda _name: None)
 
     assert resolve_provider_executable("claude_code") == str(executable)
+
+
+def test_resolve_codex_executable_uses_nvm_default_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    executable = tmp_path / "versions" / "node" / "v20.20.0" / "bin" / "codex"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(0o755)
+    default = tmp_path / "alias" / "default"
+    default.parent.mkdir()
+    default.write_text("v20.20.0\n", encoding="utf-8")
+    monkeypatch.setenv("NVM_DIR", str(tmp_path))
+    monkeypatch.setattr(provider_capabilities.shutil, "which", lambda _name: None)
+
+    assert resolve_provider_executable("codex") == str(executable)
+
+
+@pytest.mark.asyncio
+async def test_probe_puts_nvm_executable_directory_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The npm-global CLI shebang needs the ``node`` sitting beside it."""
+    executable = "/home/user/.nvm/versions/node/v20.20.0/bin/codex"
+    seen_env: dict[str, str] = {}
+
+    async def fake_run_subprocess(
+        command: list[str],
+        **kwargs: object,
+    ) -> tuple[int, str, str]:
+        seen_env.update(cast(dict[str, str], kwargs["env"]))
+        return 0, "", ""
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(provider_capabilities, "run_subprocess", fake_run_subprocess)
+
+    await provider_capabilities._run_probe([executable, "debug", "models"])
+
+    assert seen_env["PATH"].split(os.pathsep)[0] == (
+        "/home/user/.nvm/versions/node/v20.20.0/bin"
+    )
 
 
 def test_selection_validation_rejects_model_effort_not_in_host_catalog() -> None:

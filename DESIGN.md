@@ -3,13 +3,15 @@ name: Taskurotta Studio
 description: A compact local workflow cockpit built around the graph.
 colors:
   primary: "#4f46e5"
-  canvas: "#fafafa"
-  sidebar: "#f7f7f8"
-  surface: "#ffffff"
-  surface-muted: "#f4f4f5"
-  ink: "#1c1c1f"
-  muted: "#71717a"
-  line: "#e4e4e7"
+  canvas: "#e4dfd5"
+  sidebar: "#30364f"
+  assistant: "#dce5df"
+  editor: "#eee9df"
+  surface: "#f4f0e7"
+  surface-muted: "#d9d4ca"
+  ink: "#30343b"
+  muted: "#62635f"
+  line: "#b6b3aa"
   success: "#059669"
   warning: "#d97706"
   error: "#dc2626"
@@ -60,7 +62,7 @@ components:
 
 **Creative North Star: "The Local Workflow Cockpit"**
 
-The graph is the workspace, not a card inside a dashboard. Navigation and assistance frame it with compact, predictable tools. Zinc neutrals keep long sessions calm, while indigo marks selection, focus, and the primary action.
+The graph is the workspace, not a card inside a dashboard. Navigation and assistance frame it with compact, predictable tools. Light mode uses a deep indigo navigation rail, a warm stone workspace and editor, and a muted sage assistant pane. Indigo marks selection, focus, and the primary action. Dark mode retains its existing zinc palette.
 
 The interface is dense enough for builders but uses plain labels and familiar controls so workflow authors do not need to know the TOML model first.
 
@@ -73,7 +75,7 @@ The interface is dense enough for builders but uses plain labels and familiar co
 
 ## Colors
 
-Indigo is the only general accent. Green, amber, red, and blue are reserved for actual state.
+Indigo is the action accent. Large regions have distinct roles: navigation uses #30364f with pale text, the workspace uses #e4dfd5, the editor uses #eee9df, and chat uses #dce5df with green-black text. Inputs and floating content use lighter fills within their region. Sage is a panel background, never a success indicator. Green, amber, red, and blue retain their semantic state meanings.
 
 **The One Accent Rule.** Use indigo for selection, focus, and primary actions. Do not introduce another brand accent.
 
@@ -115,7 +117,7 @@ Persistent panes are not cards. Popovers use a 14px corner, a one-pixel neutral 
 
 ### Inputs / Fields
 
-Inputs use a white or dark-surface fill and a neutral border. Focus shifts the border to indigo and may add a restrained translucent ring.
+Inputs use warm paper in the workspace, pale sage in chat, and a raised indigo fill in navigation, with contrasting borders. Focus shifts the border to indigo and may add a restrained translucent ring.
 
 ### Navigation
 

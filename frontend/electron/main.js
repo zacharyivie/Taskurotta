@@ -20,6 +20,9 @@ const {
 const { autoUpdater } = require("electron-updater");
 const pty = require("node-pty");
 const {
+  gitRepositoryAction,
+  changeGitFile,
+  switchGitBranch,
   addGitWorktree,
   readGitFileBaseline,
   readGitHistory,
@@ -35,6 +38,11 @@ const {
   browserSessionShortcutAction,
   normalizeBrowserUrl,
 } = require("./browser-utils.cjs");
+const { searchProject, replaceProject } = require("./project-search.cjs");
+const { createAppLog } = require("./app-log.cjs");
+const { archiveConversation } = require("./conversation-archive.cjs");
+const REPORT_THEMES = ["auto", "light", "dark", "sepia", "vaporwave", "steam", "carbon", "botanical", "blueprint", "arcade", "sakura", "deep-sea", "solarpunk", "noir", "candy-lab", "cosmic"];
+let applicationLog;
 const { registerIpcHandlers } = require("./ipc-handlers.cjs");
 const { inspectPath } = require("./path-info.cjs");
 const { createIpcSecurity, isSafeExternalUrl } = require("./security.cjs");
@@ -114,6 +122,7 @@ function createWindow(apiBaseUrl, apiToken = "") {
     minWidth: 980,
     minHeight: 640,
     title: "Taskurotta",
+    icon: path.join(__dirname, app.isPackaged ? "../dist/icon.png" : "../public/icon.png"),
     backgroundColor: "#1f1f1f",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -405,15 +414,11 @@ function stopBackend() {
 }
 
 function createBackendLogStream() {
-  const logsPath = app.getPath("logs");
-  fs.mkdirSync(logsPath, { recursive: true });
-  const timestamp = new Date().toISOString().replaceAll(":", "-");
-  return fs.createWriteStream(path.join(logsPath, `backend-${timestamp}.log`), {
-    flags: "a",
-  });
+  return null;
 }
 
 function writeBackendLog(message) {
+  applicationLog?.write("info", "backend", message);
   if (!backendLogStream) return;
   backendLogStream.write(message);
 }
@@ -472,6 +477,18 @@ function createBackendErrorWindow(error, { title = "Taskurotta backend did not s
 }
 
 app.whenReady().then(async () => {
+  applicationLog = createAppLog(app.getPath("logs"));
+  applicationLog.write("info", "desktop", `Starting Taskurotta ${app.getVersion()} on ${process.platform} ${process.arch}`);
+  process.on("uncaughtExceptionMonitor", (error) => applicationLog.write("error", "desktop", error.stack || error.message));
+  process.on("unhandledRejection", (error) => applicationLog.write("error", "desktop", error?.stack || error));
+  app.on("web-contents-created", (_event, contents) => {
+    contents.on("console-message", (_event, details, message) => {
+      if (contents !== mainWindow?.webContents && contents !== backendErrorWindow?.webContents) return;
+      const level = typeof details === "object" ? details.level : details;
+      if ([2, 3, "warning", "error"].includes(level)) applicationLog.write(level === 3 || level === "error" ? "error" : "warn", "renderer", typeof details === "object" ? details.message : message);
+    });
+  });
+  app.on("render-process-gone", (_event, _contents, details) => applicationLog.write("error", "renderer", JSON.stringify(details)));
   Menu.setApplicationMenu(null);
   setupIpcHandlers();
   setupAutoUpdater();
@@ -545,6 +562,12 @@ function setupIpcHandlers() {
     isProduction,
   });
   registerIpcHandlers(ipcMain, {
+    developerInfo,
+    developerAction,
+    rendererLog,
+    remSettings,
+    configureRem,
+    archiveRem,
     checkForUpdates,
     copyPath,
     browserAction,
@@ -556,6 +579,9 @@ function setupIpcHandlers() {
     deletePath,
     downloadAndInstallUpdate,
     getGoferDataDir,
+    gitRepoAction,
+    gitFileAction,
+    gitSwitchBranch,
     gitStatus,
     gitFileBaseline,
     gitHistory,
@@ -566,6 +592,8 @@ function setupIpcHandlers() {
     getUpdateState,
     installDownloadedUpdate,
     listDirectory,
+    searchProject: (_event, options = {}) => searchProject(resolveExactPath(options.projectRoot, { grantId: options.grantId, mustExist: true }), options),
+    replaceProject: (_event, options = {}) => replaceProject(resolveExactPath(options.projectRoot, { grantId: options.grantId, mustExist: true }), options),
     openLogsFolder,
     openPath,
     openUpdateRelease,
@@ -592,7 +620,11 @@ function setupIpcHandlers() {
       ) {
         return backendErrorIpcSecurity.secureHandler(handler)(event, ...args);
       }
-      return ipcSecurity.secureHandler(handler)(event, ...args);
+      try { return await ipcSecurity.secureHandler(handler)(event, ...args); }
+      catch (error) {
+        applicationLog?.write("error", "ipc", `${channel}: ${error.message}`);
+        throw error;
+      }
     },
   });
 }
@@ -678,6 +710,10 @@ function adoptBrowserContents(event, session, webContentsId) {
 }
 
 function browserAction(event, options = {}) {
+  // Destruction of a guest can precede the renderer's cleanup IPC.
+  if (["close", "adopt", "focus", "set-preferences"].includes(options.action) && !browserSessions.has(options.id)) {
+    return { closed: true, ready: false };
+  }
   const session = ownedBrowserSession(event, options.id);
   if (options.action === "adopt") {
     adoptBrowserContents(event, session, options.webContentsId);
@@ -698,6 +734,7 @@ function browserAction(event, options = {}) {
     return browserSessionState(session);
   }
   const contents = browserSessionContents(session);
+  if (!contents && options.action === "focus") return browserSessionState(session);
   if (!contents) throw new Error("Browser view is unavailable.");
   switch (options.action) {
     case "back":
@@ -948,6 +985,7 @@ function browserSessionState(session, fallbackUrl = "") {
       };
     }
     return {
+      ready: false,
       canGoBack: false,
       canGoForward: false,
       clientId: session.clientId,
@@ -961,6 +999,7 @@ function browserSessionState(session, fallbackUrl = "") {
   }
   const currentUrl = contents.getURL() || fallback;
   return {
+    ready: true,
     canGoBack: contents.navigationHistory.canGoBack(),
     canGoForward: contents.navigationHistory.canGoForward(),
     clientId: session.clientId,
@@ -1940,6 +1979,78 @@ async function listDirectory(_event, options = {}) {
   };
 }
 
+function developerInfo() {
+  return { version: app.getVersion(), platform: `${process.platform} ${process.arch}`, electron: process.versions.electron,
+    node: process.versions.node, dataDir: getGoferDataDir(), userData: app.getPath("userData"), logs: app.getPath("logs"),
+    appLog: applicationLog?.file || "", backend: backendProcess && !backendProcess.killed ? "Running" : "Stopped",
+    archiveFolder: remSettings().archiveFolder };
+}
+async function developerAction(_event, { action } = {}) {
+  if (action === "logs") return shell.openPath(app.getPath("logs"));
+  if (action === "data") return shell.openPath(getGoferDataDir());
+  if (action === "user-data") return shell.openPath(app.getPath("userData"));
+  if (action === "devtools") { mainWindow?.webContents.openDevTools({ mode: "detach" }); return; }
+  if (action === "restart") return restartBackend();
+  if (action === "read-log") {
+    const file = applicationLog?.file;
+    if (!file || !fs.existsSync(file)) return "";
+    const size = fs.statSync(file).size;
+    const fd = fs.openSync(file, "r");
+    try { const buffer = Buffer.alloc(Math.min(size, 64000)); fs.readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length)); return buffer.toString("utf8"); }
+    finally { fs.closeSync(fd); }
+  }
+  throw new Error("Unknown developer action.");
+}
+function rendererLog(_event, { message } = {}) {
+  applicationLog?.write("error", "renderer", String(message || ""));
+}
+function remSettings() {
+  try { return JSON.parse(fs.readFileSync(path.join(app.getPath("userData"), "rem-settings.json"), "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; return { archiveFolder: "", secondBrainEnabled: false, secondBrainRoot: "", secondBrainFormat: "md", secondBrainTheme: "auto" }; }
+}
+async function configureRem(_event, options = {}) {
+  const config = remSettings();
+  if (options.key === "reset") Object.assign(config, { archiveFolder: "", secondBrainEnabled: false, secondBrainRoot: "", secondBrainFormat: "md", secondBrainTheme: "auto" });
+  else if (["archiveFolder", "secondBrainRoot"].includes(options.key)) {
+    const folder = options.value ? resolveExactPath(options.value, { grantId: options.grantId, mustExist: true }) : "";
+    if (folder && !(await fs.promises.stat(folder)).isDirectory()) throw new Error("Choose a folder.");
+    config[options.key] = folder;
+  } else if (options.key === "secondBrainEnabled") {
+    if (options.value && !config.secondBrainRoot) throw new Error("Choose a Second Brain folder first.");
+    config.secondBrainEnabled = options.value === true;
+  } else if (options.key === "secondBrainFormat" && ["md", "html"].includes(options.value)) config.secondBrainFormat = options.value;
+  else if (options.key === "secondBrainTheme" && REPORT_THEMES.includes(options.value)) config.secondBrainTheme = options.value;
+  else throw new Error("Unknown Rem setting.");
+  if (!config.secondBrainRoot) config.secondBrainEnabled = false;
+  const file = path.join(app.getPath("userData"), "rem-settings.json");
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(config), { mode: 0o600 });
+  fs.renameSync(`${file}.tmp`, file);
+  return config;
+}
+function archiveRem(_event, { thread, messages, deleted } = {}) {
+  const config = remSettings();
+  if (!config.archiveFolder) return { skipped: true };
+  const result = archiveConversation(config.archiveFolder, thread, messages, { dataDir: getGoferDataDir(), deleted: deleted === true });
+  for (const warning of result.warnings || []) applicationLog?.write("warn", "archive", warning);
+  return result;
+}
+
+async function gitRepoAction(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  try { return await gitRepositoryAction(projectRoot, options.action, options.value, { authorizeTarget: (target) => resolveGitProjectDirectory({ projectRoot: target, grantId: getIpcSecurity().grantForPath(target) }) }); }
+  catch (error) { return { ...await readGitStatus(projectRoot), error: String(error.stderr || error.message).replace(/^Command failed:[^\n]*\n?/, "").trim() }; }
+}
+
+async function gitFileAction(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  return changeGitFile(projectRoot, options.relativePath, options.action, { trashItem: (target) => shell.trashItem(target) });
+}
+
+async function gitSwitchBranch(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  return switchGitBranch(projectRoot, options.branch);
+}
+
 async function gitStatus(_event, options = {}) {
   const projectRoot = resolveExactPath(options.projectRoot, {
     grantId: options.grantId,
@@ -1953,15 +2064,8 @@ async function gitStatus(_event, options = {}) {
 }
 
 async function gitFileBaseline(_event, options = {}) {
-  const targetPath = resolveExactPath(options.targetPath, {
-    grantId: options.grantId,
-    mustExist: true,
-  });
-  const stat = await fs.promises.stat(targetPath);
-  if (!stat.isFile()) {
-    throw new Error(`Git comparison path is not a file: ${targetPath}`);
-  }
-  return readGitFileBaseline(targetPath);
+  const targetPath = resolveExactPath(options.targetPath, { grantId: options.grantId, mustExist: false });
+  return readGitFileBaseline(targetPath, { group: options.group });
 }
 
 async function gitHistory(_event, options = {}) {
@@ -1988,7 +2092,7 @@ async function gitWorktreeAdd(_event, options = {}) {
   const targetPath = resolveExactPath(options.targetPath, { grantId: options.targetGrantId, mustExist: true });
   const targetStat = await fs.promises.stat(targetPath);
   if (!targetStat.isDirectory()) throw new Error("The worktree target must be a folder.");
-  const result = await addGitWorktree(projectRoot, targetPath, options.branch.trim(), { createBranch: options.createBranch === true });
+  const result = await addGitWorktree(projectRoot, targetPath, options.branch.trim(), { createBranch: options.createBranch === true, startPoint: options.startPoint });
   const handle = pathHandle(targetPath);
   await registerBackendPathGrant(handle);
   return { ...result, createdPath: targetPath, grantId: handle.grantId };
@@ -2008,7 +2112,7 @@ async function gitWorktreeRemove(_event, options = {}) {
         mustExist: true,
       });
   if (path.resolve(targetPath) === path.resolve(projectRoot)) throw new Error("The current worktree cannot be removed.");
-  return removeGitWorktree(projectRoot, targetPath);
+  return removeGitWorktree(projectRoot, targetPath, { force: options.force === true });
 }
 
 async function resolveGitProjectDirectory(options = {}) {
@@ -2076,6 +2180,7 @@ async function registerBackendPathGrant(handle) {
       method: "POST",
       headers,
       body: JSON.stringify({ grantId: handle.grantId, path: handle.path }),
+      signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) {
       writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${response.status}\n`);

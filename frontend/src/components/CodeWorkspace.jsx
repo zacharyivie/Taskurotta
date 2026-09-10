@@ -1,3 +1,5 @@
+import { installRemActions } from "../lib/editorRem.js";
+import { installConflictControls } from "../lib/mergeConflicts.js";
 import {
   forwardRef,
   useCallback,
@@ -29,7 +31,7 @@ import {
   matchesKeybinding,
   settingBinding,
 } from "../lib/settings.js";
-import taskurottaIcon from "../assets/taskurotta-icon.svg";
+import taskurottaIcon from "../assets/roundel.png";
 import { Dialog } from "./Dialog.jsx";
 import MarkdownContent from "./MarkdownContent.jsx";
 import IntegratedBrowser, { HtmlModeToggle } from "./IntegratedBrowser.jsx";
@@ -43,7 +45,18 @@ export function codeCloseProtection(dirtyPaths, autosaveEnabled) {
   return autosaveEnabled ? "confirm-discard" : "prompt-to-save";
 }
 
+export function hasUnsavedCodeChanges(rootPath) {
+  return [...textEditorSessions].some(([path, session]) => pathMatchesChange(path, rootPath, true) && session.content !== session.savedContent);
+}
+
 export function applyCodeFilesystemChange(change) {
+  if (change?.type === "git") {
+    for (const [path, session] of textEditorSessions) {
+      if (pathMatchesChange(path, change.rootPath, true) && session.content === session.savedContent) textEditorSessions.delete(path);
+    }
+    window.dispatchEvent(new CustomEvent("gofer:git-files-changed", { detail: change }));
+    return;
+  }
   if (!change?.path) return;
   if (change.kind === "create") {
     discardedSessionPaths.delete(change.path);
@@ -113,6 +126,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   const [browserViewStates, setBrowserViewStates] = useState({});
   const [documentModes, setDocumentModes] = useState({});
   const [diffOnOpenPaths, setDiffOnOpenPaths] = useState(() => new Set());
+  const [gitGroups, setGitGroups] = useState({});
   const [tabMenu, setTabMenu] = useState(null);
   const [unsavedClosePrompt, setUnsavedClosePrompt] = useState(null);
   const [draggedPath, setDraggedPath] = useState("");
@@ -312,7 +326,13 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   }, [tabMenu]);
 
   useEffect(() => {
-    if (!navigationRequest?.path || !navigationRequest.lineNumber) return;
+    if (!navigationRequest?.path) return;
+    if (!navigationRequest.diff) setDiffOnOpenPaths((current) => withoutSetValue(current, navigationRequest.path));
+    if (!navigationRequest.lineNumber && !navigationRequest.diff) return;
+    if (navigationRequest.diff) {
+      setDiffOnOpenPaths((current) => withSetValue(current, navigationRequest.path));
+      setGitGroups((current) => ({ ...current, [navigationRequest.path]: navigationRequest.gitGroup || "" }));
+    }
     setDocumentModes((current) => current[navigationRequest.path] === "edit"
       ? current
       : { ...current, [navigationRequest.path]: "edit" });
@@ -518,7 +538,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
           className={`flex min-h-0 min-w-0 flex-col ${selected ? "visible z-10" : "invisible z-0 pointer-events-none"} ${splitGroup && column === 2 ? "border-l border-line" : ""}`}
           style={{ gridColumn: column, gridRow: 2 }}
         >
-          {browserTab || pdf || (html && mode === "preview") ? (
+          {diffOnOpenPaths.has(path) && (image || pdf) ? <BinaryGitComparison path={path} group={gitGroups[path]} onClose={() => setDiffOnOpenPaths((current) => withoutSetValue(current, path))} /> : browserTab || pdf || (html && mode === "preview") ? (
             <PreviewBrowser
               active={active && currentPath === path}
               applicationKeybindings={settings.keybindings}
@@ -637,7 +657,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   return (
     <section
       ref={workspaceRef}
-      className="flex min-h-0 flex-1 flex-col bg-white"
+      className="code-workspace flex min-h-0 flex-1 flex-col bg-white"
       aria-label="Code workspace"
     >
       <div
@@ -845,6 +865,24 @@ export function UnsavedChangesDialog({
   );
 }
 
+function BinaryGitComparison({ path, group, onClose }) {
+  const [baseline, setBaseline] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let disposed = false;
+    setBaseline(null); setError("");
+    window.goferDesktop?.workspace?.gitFileBaseline?.(path, group).then((value) => { if (!disposed) setBaseline(value); }).catch((cause) => { if (!disposed) setError(cause.message); });
+    return () => { disposed = true; };
+  }, [path, group]);
+  const extension = path.split(".").at(-1)?.toLowerCase();
+  const mime = { avif: "image/avif", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", ico: "image/x-icon", bmp: "image/bmp" }[extension];
+  return <section className="flex min-h-0 flex-1 flex-col" aria-label="Binary file comparison">
+    <div className="flex h-9 items-center justify-between border-b border-line px-3 text-xs"><span>{group === "staged" ? "HEAD → Staged" : "Staged → Working file"}</span><button type="button" className="rounded px-2 py-1 hover:bg-slate-100" onClick={onClose}>Close diff</button></div>
+    {error ? <p role="alert" className="p-3 text-xs text-red-700">{error}</p> : null}
+    {!baseline ? <p className="p-3 text-xs text-muted">Loading comparison…</p> : <div className="grid min-h-0 flex-1 grid-cols-2 divide-x divide-line overflow-auto">{[["Original", "original"], ["Changed", "modified"]].map(([label, key]) => <div key={key} className="min-w-0 p-3"><p className="mb-3 text-xs text-muted">{label} · {baseline[`${key}Bytes`] || 0} bytes</p>{mime && baseline[`${key}Data`] ? <img alt={`${label} version`} className="max-w-full object-contain" src={`data:${mime};base64,${baseline[`${key}Data`]}`} /> : <p className="text-xs text-muted">{baseline[`${key}Bytes`] ? "Binary content. Text diff is unavailable." : "File does not exist in this version."}</p>}</div>)}</div>}
+  </section>;
+}
+
 function PreviewBrowser({ diffPath = "", ...props }) {
   const [diffAvailable, setDiffAvailable] = useState(false);
   useEffect(() => {
@@ -960,6 +998,12 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   const navigationRequestRef = useRef(navigationRequest);
   const [diffMode, setDiffMode] = useState(initialDiffMode);
   const [gitBaseline, setGitBaseline] = useState(null);
+  const [gitGroup, setGitGroup] = useState(navigationRequest?.gitGroup || "");
+  const [diskRevision, setDiskRevision] = useState(0);
+  const gitOperationRef = useRef(false);
+  useEffect(() => {
+    if (navigationRequest) { setGitGroup(navigationRequest.diff ? navigationRequest.gitGroup || "" : ""); setDiffMode(navigationRequest.diff === true); }
+  }, [navigationRequest]);
   const [state, setState] = useState({
     content: null,
     dirty: false,
@@ -968,6 +1012,30 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
     saving: false,
   });
 
+  useEffect(() => {
+    function gitChanged(event) {
+      if (!pathMatchesChange(path, event.detail?.rootPath, true)) return;
+      const model = modelRef.current;
+      if (model && editableRef.current && model.getValue() !== savedContentRef.current) {
+        setState((current) => ({ ...current, error: "This file changed on disk. Your unsaved edits have been kept." }));
+        return;
+      }
+      discardedSessionPaths.add(path);
+      setDiskRevision((value) => value + 1);
+    }
+    function gitBusy(event) {
+      if (!pathMatchesChange(path, event.detail?.rootPath, true)) return;
+      gitOperationRef.current = event.detail.busy;
+      editorRef.current?.updateOptions({ readOnly: event.detail.busy || !editableRef.current });
+    }
+    window.addEventListener("gofer:git-files-changed", gitChanged);
+    window.addEventListener("gofer:git-working-tree-busy", gitBusy);
+    return () => {
+      window.removeEventListener("gofer:git-files-changed", gitChanged);
+      window.removeEventListener("gofer:git-working-tree-busy", gitBusy);
+    };
+  }, [path]);
+
   const refreshGitBaseline = useCallback(async () => {
     const readBaseline = window.goferDesktop?.workspace?.gitFileBaseline;
     if (!readBaseline) {
@@ -975,7 +1043,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       return null;
     }
     try {
-      const baseline = await readBaseline(path);
+      const baseline = await readBaseline(path, gitGroup);
       setGitBaseline(baseline?.tracked ? baseline : null);
       if (!baseline?.changed) setDiffMode(false);
       return baseline;
@@ -984,7 +1052,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       setDiffMode(false);
       return null;
     }
-  }, [path]);
+  }, [path, gitGroup]);
 
   useEffect(() => {
     void refreshGitBaseline();
@@ -1160,13 +1228,18 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   useEffect(() => {
     let disposed = false;
     let contentListener;
+    let remActions;
+    let originalRemActions;
+    let conflictControls;
     let resizeObserver;
-    import("../lib/monaco.js").then(({ loadRadishMonaco }) => {
+    import("../lib/monaco.js").then(async ({ loadRadishMonaco }) => {
       if (disposed || !containerRef.current) return;
       const monaco = loadRadishMonaco();
       monacoRef.current = monaco;
       const session = textEditorSessions.get(path);
-      const initialGitBaseline = gitBaselineRef.current;
+      editableRef.current = false;
+      const initialGitBaseline = await refreshGitBaseline();
+      if (disposed || !containerRef.current) return;
       const model = monaco.editor.createModel(
         session?.content ?? "",
         languageForPath(path),
@@ -1214,13 +1287,16 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
         editor = monaco.editor.create(containerRef.current, { ...editorOptions, model });
       }
       editorRef.current = editor;
+      remActions = installRemActions(editor, () => ({ path }));
+      if (diffEditorRef.current) originalRemActions = installRemActions(diffEditorRef.current.getOriginalEditor(), () => ({ path, version: "Original Git version" }));
+      conflictControls = installConflictControls(monaco, editor, model);
       decorationIdsRef.current = editor.deltaDecorations(
         [],
         trackedChangeDecorations(initialGitBaseline, diffMode),
       );
       contentListener = model.onDidChangeContent(() => {
         const content = model.getValue();
-        textEditorSessions.set(path, {
+        if (editableRef.current) textEditorSessions.set(path, {
           content,
           savedContent: savedContentRef.current,
           viewState: editor.saveViewState(),
@@ -1228,7 +1304,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
         setState((current) => ({
           ...current,
           content,
-          dirty: content !== savedContentRef.current,
+          dirty: editableRef.current && content !== savedContentRef.current,
           error: "",
         }));
         if (editableRef.current) {
@@ -1239,7 +1315,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       resizeObserver = new ResizeObserver(() => (diffEditorRef.current ?? editor).layout());
       resizeObserver.observe(containerRef.current);
 
-      if (session) {
+      if (session && !initialGitBaseline?.deleted && !initialGitBaseline?.binary && gitGroup !== "staged") {
         editableRef.current = true;
         savedContentRef.current = session.savedContent;
         editor.restoreViewState(session.viewState);
@@ -1266,13 +1342,17 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
         });
         return;
       }
-      readTextFile(path).then((payload) => {
+      const comparisonOnly = initialGitBaseline?.deleted || (gitGroup === "staged");
+      const read = initialGitBaseline?.binary ? Promise.resolve({ content: "Binary file changed. Text comparison is unavailable." }) : comparisonOnly ? Promise.resolve({ content: initialGitBaseline?.modifiedContent || "" }) : readTextFile(path);
+      read.then((payload) => {
         if (disposed) return;
         const content = payload?.content ?? "";
-        editableRef.current = true;
+        discardedSessionPaths.delete(path);
+        editableRef.current = !comparisonOnly && !initialGitBaseline?.binary;
+        editor.updateOptions({ readOnly: Boolean(comparisonOnly || initialGitBaseline?.binary || gitOperationRef.current) });
         savedContentRef.current = content;
         model.setValue(content);
-        textEditorSessions.set(path, { content, savedContent: content, viewState: null });
+        if (!comparisonOnly && !initialGitBaseline?.binary) textEditorSessions.set(path, { content, savedContent: content, viewState: null });
         setState({ content, dirty: false, error: "", loading: false, saving: false });
         revealEditorLocation(editor, navigationRequestRef.current);
       }).catch((error) => {
@@ -1302,6 +1382,9 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
           });
         }
       }
+      remActions?.dispose();
+      originalRemActions?.dispose();
+      conflictControls?.dispose();
       contentListener?.dispose();
       resizeObserver?.disconnect();
       decorationIdsRef.current = [];
@@ -1315,16 +1398,18 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       monacoRef.current = null;
       originalModelRef.current = null;
     };
-  }, [diffMode, path, save, theme]);
+  }, [diffMode, gitGroup, diskRevision, path, refreshGitBaseline, save, theme]);
 
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor) return;
+    if (originalModelRef.current && gitBaseline) originalModelRef.current.setValue(gitBaseline.content || "");
+    if (gitGroup === "staged" && modelRef.current && gitBaseline) modelRef.current.setValue(gitBaseline.modifiedContent || "");
     decorationIdsRef.current = editor.deltaDecorations(
       decorationIdsRef.current,
       trackedChangeDecorations(gitBaseline, diffMode),
     );
-  }, [diffMode, gitBaseline]);
+  }, [diffMode, gitBaseline, gitGroup]);
 
   useEffect(() => {
     editorSettingsRef.current = editorSettings;
@@ -1616,6 +1701,7 @@ export function codeDiffEditorOptions(editorOptions = {}) {
   return {
     ...editorOptions,
     diffAlgorithm: "advanced",
+    diffCodeLens: true,
     enableSplitViewResizing: true,
     ignoreTrimWhitespace: false,
     originalEditable: false,
@@ -1785,7 +1871,9 @@ export function resolveMarkdownLinkPath(sourcePath, href) {
   const parts = absolute
     ? []
     : source.split("/").slice(0, -1).filter(Boolean);
-  const prefix = target.startsWith("/") || source.startsWith("/") ? "/" : "";
+  const prefix = target.startsWith("//") || (!absolute && source.startsWith("//"))
+    ? "//"
+    : target.startsWith("/") || (!absolute && source.startsWith("/")) ? "/" : "";
 
   for (const segment of target.split("/")) {
     if (!segment || segment === ".") continue;

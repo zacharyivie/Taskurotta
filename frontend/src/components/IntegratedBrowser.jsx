@@ -51,6 +51,7 @@ export default function IntegratedBrowser({
     error: "",
     favicon: "",
     loading: true,
+    ready: false,
     title: "",
     url: initialUrl,
   });
@@ -163,19 +164,19 @@ export default function IntegratedBrowser({
         return;
       }
       const id = sessionIdRef.current;
-      if (!id || !bridge?.[action]) return;
+      if (!id || !state.ready || !bridge?.[action]) return;
       void bridge[action](id).catch(() => {});
     }
     window.addEventListener("keydown", handleBrowserChromeShortcut, true);
     return () => window.removeEventListener("keydown", handleBrowserChromeShortcut, true);
-  }, [active, bridge]);
+  }, [active, bridge, state.ready]);
 
   useEffect(() => {
     if (!addressFocused) setAddressDraft(displayBrowserUrl(state.url));
   }, [addressFocused, state.url]);
 
   useEffect(() => {
-    if (!active || state.error || !state.id) return undefined;
+    if (!active || state.error || !state.id || (!state.ready && !focusLocationOnCreatePendingRef.current)) return undefined;
     const frame = window.requestAnimationFrame(() => {
       const id = sessionIdRef.current;
       const webview = webviewRef.current;
@@ -185,6 +186,7 @@ export default function IntegratedBrowser({
         addressRef.current?.select?.();
         return;
       }
+      if (!state.ready) return;
       if (!id || !bridge?.focus) {
         webview?.focus?.();
         return;
@@ -194,7 +196,7 @@ export default function IntegratedBrowser({
       });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [active, bridge, state.error, state.id]);
+  }, [active, bridge, state.error, state.id, state.ready]);
 
   useEffect(() => {
     if (webviewRef.current) webviewRef.current.style.pointerEvents = dragActive ? "none" : "";
@@ -202,14 +204,14 @@ export default function IntegratedBrowser({
 
   function run(action) {
     const id = sessionIdRef.current;
-    if (!id || !bridge?.[action]) return;
+    if (!id || !state.ready || !bridge?.[action]) return;
     void bridge[action](id).catch(() => {});
   }
 
   function navigate(event) {
     event.preventDefault();
     const id = sessionIdRef.current;
-    if (!id || !addressDraft.trim()) return;
+    if (!id || !state.ready || !addressDraft.trim()) return;
     addressRef.current?.blur();
     setState((current) => ({ ...current, error: "" }));
     void bridge.navigate(id, browserAddress(addressDraft, searchUrl)).catch((error) => {
@@ -352,6 +354,7 @@ function browserInputLooksLikeUrl(input) {
 }
 
 export function browserChromeShortcutAction(event, platform = "") {
+  if (event.defaultPrevented || event.target?.closest?.("[data-terminal-workspace], .xterm")) return null;
   if (event.repeat) return "";
   const key = String(event.key ?? "").toLowerCase();
   if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && key === "d") {
@@ -415,6 +418,7 @@ function attachBrowserWebview(bridge, sessionId, container, webviewRef, src, onU
         if (adoptedState && webviewRef.current === element) onUpdate?.(adoptedState);
       })
       .catch((error) => {
+        if (webviewRef.current !== element) return;
         console.error("Integrated browser adopt failed:", error);
         emit({
           error: error instanceof Error ? error.message : "Could not attach the browser view.",

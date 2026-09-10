@@ -1,3 +1,70 @@
+export const REPORT_THEMES = [
+  {
+    "id": "auto",
+    "label": "System"
+  },
+  {
+    "id": "light",
+    "label": "Light"
+  },
+  {
+    "id": "dark",
+    "label": "Dark"
+  },
+  {
+    "id": "sepia",
+    "label": "Sepia"
+  },
+  {
+    "id": "vaporwave",
+    "label": "Vaporwave"
+  },
+  {
+    "id": "steam",
+    "label": "Steam"
+  },
+  {
+    "id": "carbon",
+    "label": "Carbon"
+  },
+  {
+    "id": "botanical",
+    "label": "Botanical"
+  },
+  {
+    "id": "blueprint",
+    "label": "Blueprint"
+  },
+  {
+    "id": "arcade",
+    "label": "Arcade"
+  },
+  {
+    "id": "sakura",
+    "label": "Sakura"
+  },
+  {
+    "id": "deep-sea",
+    "label": "Deep Sea"
+  },
+  {
+    "id": "solarpunk",
+    "label": "Solarpunk"
+  },
+  {
+    "id": "noir",
+    "label": "Noir"
+  },
+  {
+    "id": "candy-lab",
+    "label": "Candy Lab"
+  },
+  {
+    "id": "cosmic",
+    "label": "Cosmic"
+  }
+];
+
 export const SETTINGS_STORAGE_KEY = "taskurotta.settings.v1";
 export const TASKUROTTA_BROWSER_HOME = "taskurotta://home";
 
@@ -9,7 +76,7 @@ export const KEYBINDING_COMMANDS = [
   { id: "view.graph", label: "Show graph editor", group: "Application", scope: "global", defaultBinding: "Mod+Digit1" },
   { id: "view.code", label: "Show code editor", group: "Application", scope: "global", defaultBinding: "Mod+Digit2" },
   { id: "view.toggleProjectPane", label: "Toggle project pane", group: "View", scope: "global", defaultBinding: "Ctrl+KeyB" },
-  { id: "view.toggleAssistantPane", label: "Toggle workflow assistant", group: "View", scope: "global", defaultBinding: "Ctrl+KeyL" },
+  { id: "view.toggleAssistantPane", label: "Toggle Rem", group: "View", scope: "global", defaultBinding: "Ctrl+KeyL" },
   { id: "workflow.run", label: "Run workflow", group: "Workflow", scope: "global", defaultBinding: "Mod+Enter" },
   { id: "file.new", label: "New file", group: "Code editor", scope: "code", defaultBinding: "Mod+KeyN" },
   { id: "file.save", label: "Save active file", group: "Code editor", scope: "code", defaultBinding: "Mod+KeyS" },
@@ -65,10 +132,14 @@ export const DEFAULT_APP_SETTINGS = Object.freeze({
     scrollback: 5000,
   },
   assistant: {
+    avatarEnabled: true,
+    avatarAnimated: true,
+    resources: { shell: true, web: false, skills: [], mcpServers: [] },
     effort: "",
     model: "",
     provider: "codex",
   },
+  memory: { archiveFolder: "", secondBrainEnabled: false, secondBrainRoot: "", secondBrainFormat: "md", secondBrainTheme: "auto" },
   layout: {
     assistantPaneWidth: 380,
     bottomPanelHeight: 300,
@@ -107,6 +178,8 @@ export function normalizeAppSettings(value = {}) {
   const settings = mergeSettings(cloneDefaults(), value);
   const storedVersion = Number(value?.version) || 1;
   settings.version = 2;
+  settings.assistant.avatarEnabled = settings.assistant.avatarEnabled !== false;
+  settings.assistant.avatarAnimated = settings.assistant.avatarAnimated !== false;
   settings.general.autosave = settings.general.autosave !== false;
   settings.general.defaultView = enumValue(settings.general.defaultView, ["graph", "code"], "graph");
   settings.general.executionMode = enumValue(settings.general.executionMode, ["local", "remote"], "local");
@@ -134,6 +207,11 @@ export function normalizeAppSettings(value = {}) {
   settings.terminal.fontSize = boundedNumber(settings.terminal.fontSize, 8, 28, 12.5);
   settings.terminal.lineHeight = boundedNumber(settings.terminal.lineHeight, 1, 2, 1.25);
   settings.terminal.scrollback = boundedNumber(settings.terminal.scrollback, 100, 100000, 5000);
+  settings.memory.secondBrainEnabled = settings.memory.secondBrainEnabled === true;
+  settings.memory.secondBrainTheme = enumValue(settings.memory.secondBrainTheme, REPORT_THEMES.map((theme) => theme.id), "auto");
+  settings.memory.secondBrainFormat = enumValue(settings.memory.secondBrainFormat, ["md", "html"], "md");
+  settings.memory.archiveFolder = safeString(settings.memory.archiveFolder, "", 4096);
+  settings.memory.secondBrainRoot = safeString(settings.memory.secondBrainRoot, "", 4096);
   settings.assistant.provider = safeString(settings.assistant.provider, "codex", 80);
   settings.assistant.model = safeString(settings.assistant.model, "", 160);
   settings.assistant.effort = safeString(settings.assistant.effort, "", 80);

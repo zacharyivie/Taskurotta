@@ -1,3 +1,4 @@
+import { installRemActions } from "../lib/editorRem.js";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { AlertTriangle, Check, FileCode2, Loader2, RefreshCw, Save } from "lucide-react";
 import { apiUrl } from "../lib/api.js";
@@ -264,6 +265,8 @@ const RadishEditor = forwardRef(function RadishEditor({
         wordWrap: "off",
       });
       editorRef.current = editor;
+      const remActions = installRemActions(editor, () => ({ path: documentRef.current?.sourcePath || workflow?.sourcePath, projectRoot: workflow?.projectRoot }));
+      editor.onDidDispose?.(() => remActions.dispose());
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveSource());
       contentListener = model.onDidChangeContent(() => {
         if (suppressChangeRef.current) return;

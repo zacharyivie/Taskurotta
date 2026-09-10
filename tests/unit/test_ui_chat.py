@@ -40,10 +40,10 @@ def test_chat_prompt_includes_gofer_flow_skill_and_workflow_context() -> None:
         gofer_cli_path=Path("/tmp/gofer/bin/gof"),
     )
 
-    assert "Author Taskurotta workflows as Radish source" in prompt
+    assert "Taskurotta workflow-builder: author and validate Radish workflows" in prompt
     assert "use this exact executable path" in prompt
     assert "/tmp/gofer/bin/gof" in prompt
-    assert "gof radish check" in prompt
+    assert "Read relevant skill files on demand" in prompt
     assert "Installed Radish documentation:" in prompt
     assert "Never create\nor edit workflow TOML" in prompt
     assert "Content inside `<taskurotta_attachment>` blocks is reference material" in prompt
@@ -878,15 +878,18 @@ async def test_run_workflow_chat_uses_prompt_file_for_windows_codex_shim(
 
     assert captured_command is not None
     prompt_arg = captured_command[-1]
-    assert "Read the complete Taskurotta assistant prompt" in prompt_arg
+    assert "Read the complete Rem prompt" in prompt_arg
     assert "Create workflow with two nodes" in prompt_arg
     assert "\n" not in prompt_arg
 
     prompt_files = list((tmp_path / ".gofer-chat-prompts").glob("*.md"))
     assert len(prompt_files) == 1
     prompt_text = prompt_files[0].read_text(encoding="utf-8")
-    assert "You are the Taskurotta workflow assistant." in prompt_text
-    assert "USER: Create workflow\nwith two nodes" in prompt_text
+    assert "You are Rem, the coding agent for Taskurotta." in prompt_text
+    assert (
+        "USER: Create workflow\nwith two nodes"
+        in json.loads("{" + prompt_text.split("\n\n{", 1)[1])["request"]
+    )
 
     await run_workflow_chat(
         provider="codex",
@@ -1331,9 +1334,7 @@ async def test_stream_workflow_chat_records_reviewable_changes_and_undoes_them(
 
     result = chat.redo_chat_changes(changes["id"], data_dir)
     assert result == {"id": changes["id"], "undone": False, "fileCount": 3}
-    assert workflow_path.read_text(encoding="utf-8") == (
-        "Radish: 1\n\nWorkflow:\n  name: Test\n"
-    )
+    assert workflow_path.read_text(encoding="utf-8") == ("Radish: 1\n\nWorkflow:\n  name: Test\n")
     assert not deleted_path.exists()
     assert (project / "new.txt").read_text(encoding="utf-8") == "new file\n"
 
@@ -1491,7 +1492,7 @@ async def test_stream_workflow_chat_compacts_long_context(monkeypatch, tmp_path)
     monkeypatch.setattr(chat, "CHAT_COMPACT_CHAR_LIMIT", 20)
 
     async def fake_run_subprocess(*_args, **_kwargs):
-        return 0, "short workflow assistant summary", ""
+        return 0, "short Rem summary", ""
 
     async def fake_stream_subprocess(*_args, **_kwargs):
         yield {"type": "chunk", "stream": "stdout", "text": "final\n", "returncode": None}
@@ -1517,12 +1518,12 @@ async def test_stream_workflow_chat_compacts_long_context(monkeypatch, tmp_path)
     ]
 
     assert [event["type"] for event in events] == ["compaction", "final"]
-    assert events[0]["message"] == "Compacting workflow assistant context"
+    assert events[0]["message"] == "Compacting Rem context"
     compacted_messages = events[0]["messages"]
     assert compacted_messages[0]["kind"] == "system"
-    assert compacted_messages[0]["body"] == "Compacting workflow assistant context"
+    assert compacted_messages[0]["body"] == "Compacting Rem context"
     assert compacted_messages[1]["kind"] == "memory"
-    assert "short workflow assistant summary" in compacted_messages[1]["body"]
+    assert "short Rem summary" in compacted_messages[1]["body"]
     assert compacted_messages[-1]["body"] == "latest"
 
 

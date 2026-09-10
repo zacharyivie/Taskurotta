@@ -160,3 +160,10 @@ function chatAttachmentId(file) {
   const random = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
   return `attachment:${file.name}:${file.size}:${random}`;
 }
+
+// Keep large reference text out of the textarea, localStorage, and prompt body.
+export const CHAT_PASTE_FILE_THRESHOLD = 16 * 1024;
+export function largePasteFile(text) {
+  if (!text || new TextEncoder().encode(text).byteLength < CHAT_PASTE_FILE_THRESHOLD) return null;
+  return new File([text], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
+}

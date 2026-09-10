@@ -33,6 +33,33 @@ def build_subprocess_env(overrides: dict[str, str] | None = None) -> dict[str, s
     return env
 
 
+def env_with_executable_on_path(
+    executable: str,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return env overrides that put an executable's own directory on PATH.
+
+    Provider CLIs installed as npm globals (``claude``, ``codex``) are Node
+    scripts with a ``#!/usr/bin/env node`` shebang.  When such a CLI is resolved
+    outside PATH -- the nvm fallback in ``resolve_provider_executable`` -- the
+    ``node`` binary sitting beside it is not findable either, so exec fails
+    before the CLI can produce any output.  A bare command name is left alone:
+    it was found on PATH already, or cannot be located here at all.
+    """
+
+    env = dict(overrides or {})
+    directory = os.path.dirname(executable)
+    if not directory:
+        return env
+    directory = os.path.abspath(directory)
+    current_path = env.get("PATH", os.environ.get("PATH", ""))
+    entries = [entry for entry in current_path.split(os.pathsep) if entry]
+    if directory in entries:
+        return env
+    env["PATH"] = os.pathsep.join([directory, *entries])
+    return env
+
+
 def _sanitize_packaged_runtime_env(env: dict[str, str]) -> None:
     """Avoid leaking AppImage/PyInstaller dynamic library paths into user tools."""
     original_library_path = env.pop("LD_LIBRARY_PATH_ORIG", None)

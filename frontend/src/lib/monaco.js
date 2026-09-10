@@ -4,6 +4,7 @@ import "monaco-editor/esm/vs/basic-languages/monaco.contribution";
 import "monaco-editor/esm/vs/editor/contrib/bracketMatching/browser/bracketMatching";
 import "monaco-editor/esm/vs/editor/contrib/caretOperations/browser/caretOperations";
 import "monaco-editor/esm/vs/editor/contrib/clipboard/browser/clipboard";
+import "monaco-editor/esm/vs/editor/contrib/codelens/browser/codelensController";
 import "monaco-editor/esm/vs/editor/contrib/comment/browser/comment";
 import "monaco-editor/esm/vs/editor/contrib/contextmenu/browser/contextmenu";
 import "monaco-editor/esm/vs/editor/contrib/find/browser/findController";
@@ -80,21 +81,33 @@ function registerRadishLanguage() {
     base: "vs",
     inherit: true,
     colors: {
-      "editor.background": "#fbfbfc",
+      "editor.background": "#eee9df",
+      "editor.foreground": "#30343b",
+      "editorLineNumber.foreground": "#62635f",
+      "editor.selectionBackground": "#c4ccf4",
+      "editorWidget.background": "#f4f0e7",
+      "editorWidget.border": "#b6b3aa",
+      "editorSuggestWidget.background": "#f4f0e7",
+      "editorSuggestWidget.selectedBackground": "#c4ccf4",
+      "editorHoverWidget.background": "#f4f0e7",
+      "editorHoverWidget.border": "#b6b3aa",
       "editor.lineHighlightBackground": "#4f46e512",
-      "editorGutter.background": "#fbfbfc",
+      "editorGutter.background": "#e4dfd5",
+      "editorLineNumber.activeForeground": "#4338ca",
+      "minimap.background": "#e4dfd5",
+      "editorOverviewRuler.background": "#e4dfd5",
     },
     rules: [
       { token: "keyword.radish", foreground: "6D28D9", fontStyle: "bold" },
       { token: "type.identifier", foreground: "18181B", fontStyle: "bold" },
-      { token: "attribute.name", foreground: "2563EB" },
-      { token: "type", foreground: "0E7490", fontStyle: "bold" },
-      { token: "variable.predefined", foreground: "0E7490" },
-      { token: "string", foreground: "15803D" },
-      { token: "number", foreground: "B45309" },
+      { token: "attribute.name", foreground: "1D4ED8" },
+      { token: "type", foreground: "0D6F8A", fontStyle: "bold" },
+      { token: "variable.predefined", foreground: "0D6F8A" },
+      { token: "string", foreground: "137537" },
+      { token: "number", foreground: "92400E" },
       { token: "keyword.operator", foreground: "7C3AED", fontStyle: "bold" },
       { token: "operator", foreground: "7C3AED" },
-      { token: "comment", foreground: "8A8A93", fontStyle: "italic" },
+      { token: "comment", foreground: "62635F", fontStyle: "italic" },
     ],
   });
   monaco.editor.defineTheme("gofer-radish-dark", {

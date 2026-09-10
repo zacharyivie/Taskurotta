@@ -244,7 +244,7 @@ export default function ChatComposer({
             />
           </div>
           <button
-            aria-label={sending ? "Stop workflow assistant" : "Send message"}
+            aria-label={sending ? "Stop Rem" : "Send message"}
             className={`grid h-9 w-9 place-items-center rounded-[10px] transition disabled:cursor-not-allowed disabled:opacity-60 ${
               sending
                 ? "border border-line bg-white text-red-600 hover:border-red-200 hover:bg-red-50"
@@ -255,7 +255,7 @@ export default function ChatComposer({
               || transcribing
               || transcriptionPending
             }
-            title={sending ? "Stop workflow assistant" : "Send message"}
+            title={sending ? "Stop Rem" : "Send message"}
             type="button"
             onClick={sending ? onStop : onSend}
           >

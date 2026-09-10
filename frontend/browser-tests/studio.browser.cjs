@@ -1,4 +1,4 @@
-/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, process, self, setTimeout, window */
+/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, MouseEvent, process, self, setTimeout, window */
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

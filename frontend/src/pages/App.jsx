@@ -27,7 +27,6 @@ import {
   Play,
   RefreshCw,
   Redo2,
-  Search,
   Settings as SettingsIcon,
   Sun,
   Trash2,

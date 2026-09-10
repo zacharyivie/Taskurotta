@@ -76,6 +76,28 @@ def _project_version(repo: Path) -> str:
     return cast(str, document["project"]["version"])
 
 
+def test_bump_version_refreshes_checksums_for_existing_version(tmp_path: Path) -> None:
+    repo = _copy_release_fixture(tmp_path)
+    version = _project_version(repo)
+    appimage_sha = "a" * 64
+    cli_sha = "b" * 64
+    args = [
+        "node",
+        "scripts/bump-version.cjs",
+        version,
+        "--appimage-sha256",
+        appimage_sha,
+        "--cli-sha256",
+        cli_sha,
+    ]
+    for _ in range(2):
+        result = _run(args, cwd=repo)
+        assert result.returncode == 0, result.stderr
+        for package, checksum in (("arch", appimage_sha), ("arch-cli", cli_sha)):
+            for manifest in ("PKGBUILD", ".SRCINFO"):
+                assert checksum in (repo / "packaging" / package / manifest).read_text()
+
+
 def test_release_metadata_uses_agpl_3_only() -> None:
     license_id = "AGPL-3.0-only"
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf8")
@@ -83,18 +105,16 @@ def test_release_metadata_uses_agpl_3_only() -> None:
     assert _read_json(REPO_ROOT / "frontend" / "package.json")["license"] == license_id
     package_lock = _read_json(REPO_ROOT / "frontend" / "package-lock.json")
     assert package_lock["packages"][""]["license"] == license_id
-    assert f'license=("{license_id}")' in (
-        REPO_ROOT / "packaging" / "arch" / "PKGBUILD"
-    ).read_text(encoding="utf8")
+    assert f'license=("{license_id}")' in (REPO_ROOT / "packaging" / "arch" / "PKGBUILD").read_text(
+        encoding="utf8"
+    )
     assert f'license=("{license_id}")' in (
         REPO_ROOT / "packaging" / "arch-cli" / "PKGBUILD"
     ).read_text(encoding="utf8")
     assert f"License:        {license_id}" in (
         REPO_ROOT / "scripts" / "package-cli-linux.sh"
     ).read_text(encoding="utf8")
-    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in (
-        REPO_ROOT / "LICENSE"
-    ).read_text(encoding="utf8")
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in (REPO_ROOT / "LICENSE").read_text(encoding="utf8")
 
 
 def test_release_metadata_uses_canonical_repository() -> None:
@@ -105,9 +125,7 @@ def test_release_metadata_uses_canonical_repository() -> None:
     assert frontend_package["build"]["publish"] == [
         {"provider": "github", "owner": "zacharyivie", "repo": "Taskurotta"}
     ]
-    assert repository in (
-        REPO_ROOT / "scripts" / "package-cli-linux.sh"
-    ).read_text(encoding="utf8")
+    assert repository in (REPO_ROOT / "scripts" / "package-cli-linux.sh").read_text(encoding="utf8")
 
 
 def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path) -> None:
@@ -130,9 +148,7 @@ def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path)
 
     assert result.returncode == 0, result.stderr
     assert 'version = "1.2.3"' in (repo / "pyproject.toml").read_text(encoding="utf8")
-    assert 'name = "gofer-flow"\nversion = "1.2.3"' in (
-        repo / "uv.lock"
-    ).read_text(encoding="utf8")
+    assert 'name = "gofer-flow"\nversion = "1.2.3"' in (repo / "uv.lock").read_text(encoding="utf8")
     assert _read_json(repo / "frontend" / "package.json")["version"] == "1.2.3"
     package_lock = _read_json(repo / "frontend" / "package-lock.json")
     assert package_lock["version"] == "1.2.3"

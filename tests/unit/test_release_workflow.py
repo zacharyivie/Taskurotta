@@ -217,7 +217,7 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
         "macos": {
             "name": "macos",
             "os": "macos-latest",
-            "electron_builder_args": "--mac dmg",
+            "electron_builder_args": "--mac dmg zip",
             "artifact-name": "gofer-flow-macos",
             "artifact-glob": (
                 "frontend/release/*.dmg\n"

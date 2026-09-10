@@ -248,11 +248,10 @@ function replaceOnce(text, pattern, replacement, label) {
 }
 
 function replaceAll(text, pattern, replacement, label) {
-  const next = text.replace(pattern, replacement);
-  if (next === text) {
+  if (!text.match(pattern)) {
     console.error(`Could not find ${label}.`);
     process.exit(1);
   }
 
-  return next;
+  return text.replace(pattern, replacement);
 }

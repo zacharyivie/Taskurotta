@@ -2,8 +2,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 function redactLog(value) {
+  // ANSI color sequences start with the ESC control character.
+  // eslint-disable-next-line no-control-regex
   return String(value).replace(/\x1b\[[0-9;]*m/g, "")
-    .replace(/(bearer\s+)[\w.\-]+/gi, "$1[redacted]")
+    .replace(/(bearer\s+)[\w.-]+/gi, "$1[redacted]")
     .replace(/((?:api[_-]?key|apiToken|access[_-]?token|password|secret|authorization)["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi, "$1[redacted]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/g, "$1[redacted]@")
     .slice(0, 32768);

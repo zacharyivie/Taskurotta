@@ -29,7 +29,7 @@
     "dist:deb": "npm run backend:build && npm run build && electron-builder --linux deb",
     "dist:rpm": "npm run backend:build && npm run build && electron-builder --linux rpm",
     "dist:win": "npm run backend:build && npm run build && electron-builder --win nsis",
-    "dist:mac": "npm run backend:build && npm run build && electron-builder --mac dmg",
+    "dist:mac": "npm run backend:build && npm run build && electron-builder --mac dmg zip",
     "preview": "vite preview",
     "lint": "eslint ."
   },

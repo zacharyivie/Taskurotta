@@ -130,10 +130,10 @@ yay -S gofer-flow-cli
 ## Release Builds
 
 Release artifacts for Linux, Windows, and macOS are built by the GitHub Actions
-workflow in `.github/workflows/release.yml`. It runs on `workflow_dispatch` and
-`v*` tags, builds the Python backend binary, builds the React frontend, packages
-Electron, and uploads desktop installer plus CLI-only artifacts with SHA-256
-checksum files.
+workflow in `.github/workflows/release.yml` on `v*` tags. Pushes to `main` and
+manual runs of `.github/workflows/release-dry-run.yml` run the same validation
+and packaging jobs without publishing. These jobs build the Python backend and
+React frontend, then package Electron and CLI artifacts with SHA-256 checksums.
 
 Use the version bump script before tagging a release:
 

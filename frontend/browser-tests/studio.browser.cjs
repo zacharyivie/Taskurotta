@@ -13,6 +13,7 @@ const timeout = setTimeout(() => fail(new Error("Browser studio smoke test timed
 
 let server;
 let windowRef;
+const rendererErrors = [];
 
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
@@ -24,13 +25,22 @@ process.on("unhandledRejection", fail);
 process.on("uncaughtException", fail);
 app.whenReady().then(run).catch(fail);
 
+function observeRendererErrors(browserWindow) {
+  browserWindow.webContents.on("console-message", (details) => {
+    if (details.level === "error") rendererErrors.push(details.message);
+  });
+}
+
 async function run() {
   const baseUrl = await startServer();
   windowRef = new BrowserWindow({
     width: 1440,
     height: 900,
-    show: false,
+    // Map the window on Xvfb so Chromium paints Monaco and handles native input.
+    show: true,
     webPreferences: {
+      // An in-memory partition prevents earlier runs from restoring UI state.
+      partition: "studio-browser-test",
       contextIsolation: false,
       nodeIntegration: false,
       preload: path.join(__dirname, "studio-preload-mock.cjs"),
@@ -38,6 +48,7 @@ async function run() {
     },
   });
 
+  observeRendererErrors(windowRef);
   await windowRef.loadURL(baseUrl);
   await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Studio view']"))));
   if (process.env.GOFER_TERMINAL_ONLY === "1") {
@@ -70,6 +81,7 @@ async function run() {
   await exerciseSourceControl();
 
   clearTimeout(timeout);
+  assert.deepEqual(rendererErrors, [], "Renderer must not log errors");
   console.log("Browser studio accessibility smoke test passed.");
   await cleanup(0);
 }
@@ -125,6 +137,15 @@ async function exerciseBottomPanelTerminal() {
   await waitFor(() => evaluate(() => document.querySelector("[aria-label='Bottom panel']").getBoundingClientRect().height === 36));
 }
 
+async function openRadishWorkflowFile() {
+  await evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .find((button) => button.textContent.includes("Radish editor"))
+    .parentElement.querySelector("button[title='Workflow actions']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[role='menu']"))), 25, "workflow actions menu");
+  await evaluate(() => [...document.querySelectorAll("[role='menuitem']")]
+    .find((button) => button.textContent.trim() === "Edit workflow file").click());
+}
+
 async function exerciseMonacoEditor() {
   await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
     .some((button) => button.textContent.includes("Radish editor"))));
@@ -140,9 +161,7 @@ async function exerciseMonacoEditor() {
   await waitFor(() => evaluate(() => !document.querySelector("[role='dialog']")));
   await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
     .some((button) => button.textContent.includes("Radish editor") && button.textContent.includes("Success"))));
-  await waitFor(() => evaluate(() => !document.querySelector("button[role='tab'][title*='Code view']")?.disabled));
-  await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
-    .find((button) => button.textContent.trim() === "Code").click());
+  await openRadishWorkflowFile();
   await waitFor(() => evaluate(() => Boolean(document.querySelector(".monaco-editor"))));
   assert.equal(await evaluate(() => Boolean(document.querySelector("[aria-label='Search files']"))), false);
   await waitFor(() => evaluate(() => [...document.querySelectorAll(".view-line")]
@@ -152,7 +171,7 @@ async function exerciseMonacoEditor() {
   assert.equal(await evaluate(() => Boolean(document.querySelector(".monaco-editor"))), true);
   await waitFor(() => evaluate(() => [...document.querySelectorAll("article")]
     .some((node) => node.textContent.includes("Prepare"))));
-  assert.equal(await evaluate(() => document.body.textContent.includes("Radish graph preview")), true);
+  assert.equal(await evaluate(() => document.querySelector("[aria-label='Studio view'] [aria-selected='true']")?.textContent.trim()), "Graph");
 }
 
 async function exercisePackagedMonacoWorker(baseUrl) {
@@ -160,8 +179,9 @@ async function exercisePackagedMonacoWorker(baseUrl) {
   const packagedWindow = new BrowserWindow({
     width: 1440,
     height: 900,
-    show: false,
+    show: true,
     webPreferences: {
+      partition: "studio-browser-test",
       additionalArguments: [`--gofer-api-base-url=${baseUrl}`],
       contextIsolation: false,
       nodeIntegration: false,
@@ -169,6 +189,7 @@ async function exercisePackagedMonacoWorker(baseUrl) {
       sandbox: false,
     },
   });
+  observeRendererErrors(packagedWindow);
   await packagedWindow.loadFile(path.join(distRoot, "index.html"));
   windowRef = packagedWindow;
   if (httpWindow && !httpWindow.isDestroyed()) httpWindow.destroy();
@@ -177,9 +198,10 @@ async function exercisePackagedMonacoWorker(baseUrl) {
     .some((button) => button.textContent.includes("Radish editor"))));
   await evaluate(() => [...document.querySelectorAll("[role='button']")]
     .find((button) => button.textContent.includes("Radish editor")).click());
-  await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
-    .find((button) => button.textContent.trim() === "Code").click());
+  await openRadishWorkflowFile();
   await waitFor(() => evaluate(() => Boolean(document.querySelector(".monaco-editor"))));
+  await waitFor(() => evaluate(() => [...document.querySelectorAll(".view-line")]
+    .some((line) => /command:\s*echo\s*ready/.test(line.textContent))), 25, "packaged editor to render indented Radish fields");
   const workerResult = await evaluate(() => {
     try {
       const worker = self.MonacoEnvironment.getWorker();
@@ -422,9 +444,12 @@ async function exerciseDesignRegressions() {
   )));
   await evaluate(() => [...document.querySelectorAll("details[open] button")]
     .find((button) => button.textContent.trim() === "Workflow settings").click());
-  await waitFor(() => evaluate(() => document.querySelectorAll("[role='tab']").length === 4));
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label='Workflow settings sections']"),
+  )), 25, "Workflow settings sections to open");
   assert.deepEqual(
-    await evaluate(() => [...document.querySelectorAll("[role='tab']")].map((tab) => tab.textContent.trim())),
+    await evaluate(() => [...document.querySelectorAll("[aria-label='Workflow settings sections'] [role='tab']")]
+      .map((tab) => tab.textContent.trim())),
     ["General", "Triggers", "Variables", "Access"],
   );
   await evaluate(() => document.querySelector("button[title='Hide workflow settings and node inspector']").click());
@@ -679,6 +704,12 @@ async function startServer() {
     const url = new URL(request.url, "http://127.0.0.1");
     if (url.pathname.startsWith("/api/")) {
       response.setHeader("Access-Control-Allow-Origin", "*");
+      if (request.method === "PUT" && url.pathname === "/api/workflows/demo") {
+        let body = "";
+        request.on("data", (chunk) => { body += chunk; });
+        request.on("end", () => json(response, { workflow: { ...workflowFixture(), ...JSON.parse(body) } }));
+        return;
+      }
       routeApi(url.pathname, response);
       return;
     }
@@ -953,7 +984,22 @@ async function waitFor(predicate, delay = 25, description = "browser condition")
     if (await predicate()) return;
     await wait(delay);
   }
-  throw new Error(`Timed out waiting for ${description}.`);
+  const pageState = await evaluate(() => ({
+    focusedElement: document.activeElement?.outerHTML.slice(0, 1000),
+    tabs: [...document.querySelectorAll("[role='tab']")].map((tab) => ({
+      label: tab.textContent.trim(),
+      selected: tab.getAttribute("aria-selected"),
+      disabled: tab.disabled,
+    })),
+    text: document.body.textContent.slice(-10000),
+    editor: [...document.querySelectorAll(".monaco-editor")].map((editor) => ({
+      width: editor.clientWidth,
+      height: editor.clientHeight,
+      text: editor.textContent,
+    })),
+    bridgeCalls: window.__goferBridgeCalls,
+  }));
+  throw new Error(`Timed out waiting for ${description}.\nPredicate: ${predicate}\nPage: ${JSON.stringify(pageState, null, 2)}`);
 }
 
 function wait(milliseconds) {
@@ -1016,15 +1062,20 @@ async function exerciseSourceControl() {
   }
   await evaluate(() => document.querySelector("#scm-tab-worktrees").click());
   for (const dark of [false, true]) {
+    windowRef.webContents.sendInputEvent({ type: "mouseMove", x: 10, y: 10 });
+    await wait(50);
     await windowRef.webContents.executeJavaScript(`document.documentElement.classList.toggle("dark", ${dark})`);
     await evaluate(() => document.querySelector('[aria-label="Integrate main worktree"]').dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 240 })));
-    await waitFor(() => evaluate(() => Boolean(document.querySelector('[data-operation="merge"]'))));
+    await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "merge"), 25, "initial worktree menu focus");
+    assert.deepEqual(await evaluate(() => [...document.querySelectorAll("[data-operation]")].map((item) => item.dataset.operation)),
+      ["merge", "squash", "ff-only", "no-ff", "rebase"]);
     const merge = await evaluate(() => {
       const item = document.querySelector('[data-operation="merge"]');
       const style = getComputedStyle(item);
-      return { background: style.backgroundColor, color: style.color, outline: style.outlineStyle };
+      const activeColor = style.getPropertyValue("--color-menu-active").trim().split(/\s+/).join(", ");
+      return { background: style.backgroundColor, expectedBackground: `rgb(${activeColor})`, outline: style.outlineStyle };
     });
-    assert.equal(merge.background, dark ? "rgb(45, 43, 65)" : "rgb(224, 227, 248)");
+    assert.equal(merge.background, merge.expectedBackground, "Focused menu item must use the theme's active color");
     assert.equal(merge.outline, "none", "Opening a context menu with the pointer should not paint a keyboard outline");
     const rebaseBounds = await evaluate(() => {
       const rect = document.querySelector('[data-operation="rebase"]').getBoundingClientRect();
@@ -1032,8 +1083,10 @@ async function exerciseSourceControl() {
     });
     windowRef.webContents.sendInputEvent({ type: "mouseMove", ...rebaseBounds });
     await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "rebase"));
-    assert.equal(await evaluate(() => document.querySelector('[data-operation="merge"]').getAttribute("aria-expanded")), "false");
-    windowRef.webContents.sendInputEvent({ type: "keyDown", keyCode: "Up" });
+    assert.equal(await evaluate(() => document.querySelector('[data-operation="merge"]').hasAttribute("aria-haspopup")), false);
+    await pressNativeKey("Up");
+    await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "no-ff"));
+    await pressNativeKey("Home");
     await waitFor(() => evaluate(() => document.activeElement?.dataset.operation === "merge"));
     assert.equal(await evaluate(() => getComputedStyle(document.activeElement).outlineStyle), "solid");
     fs.writeFileSync(`/tmp/taskurotta-worktree-menu-${dark ? "dark" : "light"}.png`, (await windowRef.webContents.capturePage()).toPNG());

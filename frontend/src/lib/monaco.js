@@ -61,9 +61,9 @@ function registerRadishLanguage() {
     ignoreCase: true,
     tokenizer: {
       root: [
-        [/^\s*(Radish)(\s*:)/, ["keyword.radish", "delimiter"]],
-        [/^\s*(Workflow)(\s*:)/, ["keyword.radish", "delimiter"]],
-        [/^\s*(Node)(\s+)([A-Za-z][A-Za-z0-9-]*)(\s*:)/, ["keyword.radish", "", "type.identifier", "delimiter"]],
+        [/^(\s*)(Radish)(\s*:)/, ["", "keyword.radish", "delimiter"]],
+        [/^(\s*)(Workflow)(\s*:)/, ["", "keyword.radish", "delimiter"]],
+        [/^(\s*)(Node)(\s+)([A-Za-z][A-Za-z0-9-]*)(\s*:)/, ["", "keyword.radish", "", "type.identifier", "delimiter"]],
         [/#.*$/, "comment"],
         [/\{\{[^}]+\}\}/, "variable.predefined"],
         [/"(?:\\.|[^"\\])*"/, "string"],
@@ -72,7 +72,7 @@ function registerRadishLanguage() {
         [/\b(?:and|or|not|contains|matches|exists|is)\b/, "keyword.operator"],
         [/(?:==|!=|<=|>=|<|>)/, "operator"],
         [/\b(?:agent|bash-command|python-script|prompt-file|file|folder|open-resource|http-request|notification|approval-gate|local-search|local-vectorize|common-llm-task|loop|break|workflow)\b/, "type"],
-        [/^\s*([A-Za-z][A-Za-z0-9-]*)(\s*:)/, ["attribute.name", "delimiter"]],
+        [/^(\s*)([A-Za-z][A-Za-z0-9-]*)(\s*:)/, ["", "attribute.name", "delimiter"]],
         [/[{},]/, "delimiter"],
       ],
     },

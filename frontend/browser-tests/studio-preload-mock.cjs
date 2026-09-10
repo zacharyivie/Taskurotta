@@ -78,7 +78,9 @@ window.goferDesktop = {
   textFiles: {
     read: async (targetPath) => {
       recordBridgeCall("textFiles.read", targetPath);
-      return { content: "{\n  \"enabled\": true\n}" };
+      return { content: targetPath.endsWith("workflow.rad")
+        ? "Radish: 1\n\nWorkflow:\n  name: Radish editor\n\nNode prepare:\n  type: bash-command\n  command: echo ready\n"
+        : "{\n  \"enabled\": true\n}" };
     },
     write: async (options) => {
       recordBridgeCall("textFiles.write", options);

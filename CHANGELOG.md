@@ -3,6 +3,28 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## 0.2.5 - 2026-09-10
+
+### Fixed
+
+- Fixed cached desktop folder grants skipping renewal after the backend's
+  15-minute expiry, which could prevent new and existing Rem threads from
+  sending messages when Second Brain was enabled.
+- Fixed folder access renewal failures being silently ignored. Unavailable
+  backends, timeouts, network errors, rejected registrations, and invalid
+  acknowledgments now stop the pending action with a specific retry message.
+  Failed renewal clears the stale cached grant so a later retry can recover.
+- Replaced the generic bundle-path error for denied Second Brain access with
+  guidance to retry the message, reselect the folder in Settings > Rem, or
+  restart Taskurotta.
+- Added folder registration success and failure logs with the folder path,
+  HTTP status when available, elapsed time, and failure reason, plus a dedicated
+  Second Brain access-denial log. Credentials and grant IDs stay out of these
+  log entries.
+- Added regression coverage for grant expiry and renewal, registration failures,
+  stale-cache removal, credential-safe logging, and blocking chat until folder
+  access renewal succeeds.
+
 ## 0.2.4 - 2026-09-10
 
 ### Added

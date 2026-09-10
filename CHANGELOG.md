@@ -3,6 +3,82 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## 0.2.4 - 2026-09-10
+
+### Added
+
+- Added Rem resource settings for command execution, web search, skill folders,
+  and HTTP or local stdio MCP servers, with defaults for new threads and
+  per-thread selections that survive provider changes.
+- Added a permissions selector beneath Rem's composer, with Codex sandbox modes
+  and Claude Code permission modes, plus matching provider-profile options.
+- Added conversation archiving to a chosen folder, including searchable thread
+  metadata, message revision journals, tool activity, and attachments. Archived
+  history remains available after a thread is deleted in Rem.
+- Added Second Brain knowledge folders with local search, note reading, and
+  report-saving tools for Rem. Reports support Markdown or standalone HTML,
+  with selectable HTML design themes.
+- Added project-wide search and replace with case, whole-word, and regex
+  matching, include and exclude filters, file-level replacement, and navigation
+  to matching lines.
+- Added editor actions to ask Rem about selected text, request an explanation,
+  and resolve Git conflicts with the relevant project and file context.
+- Added source-control actions to stage, unstage, revert, and commit changes;
+  switch branches; pull with fast-forward checks; push; and publish branches.
+  The panel shows staged and unstaged diffs and upstream ahead/behind counts.
+- Added stash-and-switch, stash previews and conflict checks, saved-stash
+  application, and discard actions for individual stashes or all stashes.
+- Added worktree merge and rebase previews, including squash, fast-forward-only,
+  and explicit merge-commit strategies, plus source-worktree removal controls.
+- Added inline conflict resolution with accept-current, accept-incoming, and
+  accept-both actions, alongside merge and rebase continue and abort controls.
+- Added commit-history actions for soft and hard resets, detached checkout,
+  and creating branches or worktrees at a selected commit.
+- Added Conventional Commits message generation from staged changes using
+  Rem's selected provider, model, and effort.
+- Added Developer settings with runtime diagnostics, data and log folder
+  access, recent logs, developer tools, and backend restart. Desktop logs now
+  collect backend and renderer errors with rotation and credential redaction.
+- Added an animated Rem avatar with visibility and animation settings and
+  reduced-motion support.
+
+### Changed
+
+- Established Rem as the coding agent across providers, preserving thread
+  identity, conversation history, project context, and resource selections
+  when the provider or model changes.
+- Separated instructions, context, and requests in Rem and workflow Agent node
+  prompts. Skills and tool schemas load on demand, and workflow context now
+  includes full graph details only for the selected workflow.
+- Paginated Rem's thread list and deferred message loading until a thread opens.
+  Large pasted text becomes a file attachment instead of filling the composer.
+- Refreshed the application logo and desktop icons, with indigo navigation,
+  a warm stone editor, muted sage Rem panels, and a parchment terminal theme.
+- Simplified project search controls, tightened Rem's welcome layout, and
+  improved thread scrolling and worktree menu keyboard focus.
+
+### Fixed
+
+- Fixed conversation prompt construction silently dropping all but the last
+  twelve messages, and made usage estimates reflect the prompt sent.
+- Fixed desktop discovery and launch of Codex and Claude Code installed through
+  nvm by making the provider's matching Node executable available on PATH.
+- Fixed generated commit messages failing on large staged diffs by including
+  every changed file with bounded, labeled patch excerpts.
+- Fixed merge conflicts opening in the wrong worktree and made unresolved
+  index entries and working-file resolutions visible until staged. Branch
+  switching now excludes branches checked out in other worktrees and shows
+  the branch name in repositories without an initial commit.
+- Fixed integrated-browser focus and navigation before the guest is ready,
+  stale attachment errors, and browser shortcuts intercepting terminal input.
+- Fixed Radish syntax highlighting for indented declarations and fields.
+- Fixed workflow studio browser-test timeouts caused by counting unrelated
+  settings tabs, updated stale editor and menu checks and desktop mocks, and
+  improved headless execution and failure diagnostics.
+- Fixed release lint errors and included macOS ZIP artifacts alongside DMGs
+  so desktop updates have the required archive.
+- Fixed same-version release-script runs skipping Arch checksum updates.
+
 ## 0.2.3 - 2026-09-05
 
 ### Added

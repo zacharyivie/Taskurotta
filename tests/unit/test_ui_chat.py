@@ -537,6 +537,7 @@ async def test_run_workflow_chat_adds_trusted_workflow_paths_to_provider_sandbox
     await run_workflow_chat(
         provider="codex",
         model="cli-default",
+        permission_mode="danger-full-access",
         messages=[{"role": "user", "body": "hello"}],
         workflow={
             "id": "trusted",
@@ -551,6 +552,7 @@ async def test_run_workflow_chat_adds_trusted_workflow_paths_to_provider_sandbox
     )
 
     assert captured_command is not None
+    assert option_value(captured_command, "--sandbox") == "danger-full-access"
     assert str(data_dir.resolve()) in option_values(captured_command, "--add-dir")
     assert str(trusted_dir.resolve()) in option_values(captured_command, "--add-dir")
     assert str((tmp_path / "read-only").resolve()) not in option_values(
@@ -1591,3 +1593,62 @@ def option_value(command: list[str], option: str) -> str:
 
 def option_values(command: list[str], option: str) -> list[str]:
     return [command[index + 1] for index, value in enumerate(command[:-1]) if value == option]
+
+
+@pytest.mark.parametrize(
+    "provider,mode,flag",
+    [
+        ("codex", mode, "--sandbox")
+        for mode in ("read-only", "workspace-write", "danger-full-access")
+    ]
+    + [
+        ("claude_code", mode, "--permission-mode")
+        for mode in ("acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions")
+    ],
+)
+def test_chat_permission_modes(provider, mode, flag, tmp_path):
+    command = _build_chat_command(
+        provider,
+        "cli-default",
+        "hello",
+        data_dir=tmp_path,
+        permission_mode=mode,
+    )
+    assert option_value(command, flag) == mode
+
+
+def test_chat_claude_default_permissions(tmp_path):
+    command = _build_chat_command(
+        "claude_code",
+        "cli-default",
+        "hello",
+        data_dir=tmp_path,
+        permission_mode="default",
+    )
+    assert "--permission-mode" not in command
+
+
+@pytest.mark.parametrize(
+    "provider,mode", [("codex", "bypassPermissions"), ("claude_code", "danger-full-access")]
+)
+@pytest.mark.asyncio
+async def test_chat_rejects_wrong_provider_permission_before_launch(provider, mode, tmp_path):
+    with pytest.raises(ChatProviderError, match="permission mode"):
+        await run_workflow_chat(
+            provider,
+            "cli-default",
+            [],
+            None,
+            data_dir=tmp_path,
+            permission_mode=mode,
+        )
+    with pytest.raises(ChatProviderError, match="permission mode"):
+        async for _ in stream_workflow_chat(
+            provider,
+            "cli-default",
+            [],
+            None,
+            data_dir=tmp_path,
+            permission_mode=mode,
+        ):
+            pass

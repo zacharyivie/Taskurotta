@@ -30,6 +30,7 @@ from gofer.core.provider_capabilities import (
     resolve_provider_executable,
     validate_provider_selection_async,
 )
+from gofer.core.provider_permissions import provider_permission_args
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits, byte_len
 from gofer.radish.artifacts import (
     RadishArtifactError,
@@ -433,12 +434,17 @@ async def run_workflow_chat(
     working_dir: Path | None = None,
     data_dir: Path | None = None,
     resource_limits: ResourceLimits | None = None,
+    permission_mode: str | None = None,
 ) -> dict[str, Any]:
     if provider not in {"codex", "claude_code"}:
         raise ChatProviderError(f"Unknown provider '{provider}'")
     # ``cli-default`` deliberately leaves model selection to the local CLI.
     # It remains supported for existing API clients and cannot be catalog
     # validated because the CLI may choose dynamically.
+    try:
+        provider_permission_args(provider, permission_mode)
+    except ValueError as exc:
+        raise ChatProviderError(str(exc)) from exc
     if model != "cli-default" or effort:
         try:
             await validate_provider_selection_async(
@@ -505,6 +511,7 @@ async def run_workflow_chat(
         working_dir=resolved_working_dir,
         extra_paths=extra_paths,
         image_paths=image_paths,
+        permission_mode=permission_mode,
         resources=AgentResources.model_validate((workflow or {}).get("remResources") or {}),
         second_brain_cli_path=(
             gofer_cli_path
@@ -548,10 +555,15 @@ async def stream_workflow_chat(
     working_dir: Path | None = None,
     data_dir: Path | None = None,
     resource_limits: ResourceLimits | None = None,
+    permission_mode: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     turn_started_at = monotonic()
     if provider not in {"codex", "claude_code"}:
         raise ChatProviderError(f"Unknown provider '{provider}'")
+    try:
+        provider_permission_args(provider, permission_mode)
+    except ValueError as exc:
+        raise ChatProviderError(str(exc)) from exc
     if model != "cli-default" or effort:
         try:
             await validate_provider_selection_async(
@@ -624,6 +636,7 @@ async def stream_workflow_chat(
         working_dir=resolved_working_dir,
         extra_paths=extra_paths,
         image_paths=image_paths,
+        permission_mode=permission_mode,
         resources=AgentResources.model_validate((workflow or {}).get("remResources") or {}),
         second_brain_cli_path=(
             gofer_cli_path
@@ -1465,6 +1478,7 @@ def _build_chat_command(
     effort: str | None = None,
     resources: AgentResources | None = None,
     second_brain_cli_path: Path | None = None,
+    permission_mode: str | None = None,
 ) -> list[str]:
     if provider == "codex":
         data_dir = data_dir or get_data_dir()
@@ -1476,8 +1490,7 @@ def _build_chat_command(
             "--color",
             "never",
             "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write",
+            *provider_permission_args(provider, permission_mode),
             "--json",
             "-c",
             'model_reasoning_summary="concise"',
@@ -1522,8 +1535,9 @@ def _build_chat_command(
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--permission-mode",
-        "dontAsk",
+        *provider_permission_args(
+            provider, "dontAsk" if permission_mode is None else permission_mode
+        ),
     ]
     allowed_tools = ["Read", "Edit", "Write"]
     if resources is not None:

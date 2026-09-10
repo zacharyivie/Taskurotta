@@ -1,3 +1,4 @@
+import { defaultPermissionMode } from "../lib/providerPermissions.js";
 import { generateConventionalCommit } from "../lib/commit-message.js";
 import RemResources, { DEFAULT_REM_RESOURCES, remResourceError } from "../components/RemResources.jsx";
 import RemAvatar from "../components/RemAvatar.jsx";
@@ -3921,11 +3922,12 @@ export function workflowLogUrls(workflowId, runId = null) {
   };
 }
 
-export function chatStreamRequestBody({ effort, provider, model, messages, workflow }) {
+export function chatStreamRequestBody({ effort, provider, model, messages, workflow, permissionMode }) {
   return {
     provider,
     model,
     ...(effort ? { effort } : {}),
+    ...(permissionMode ? { permissionMode } : {}),
     messages,
     workflow,
   };
@@ -5482,6 +5484,8 @@ export function ChatPane({
   const [contextFocusRequest, setContextFocusRequest] = useState(0);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [providerId, setProviderId] = useState(assistantDefaults.provider || "codex");
+  const [permissionsByProvider, setPermissionsByProvider] = useState({});
+  const permissionMode = permissionsByProvider[providerId] || defaultPermissionMode(providerId);
   const [model, setModel] = useState(assistantDefaults.model || "");
   const [effort, setEffort] = useState(assistantDefaults.effort || "");
   const {
@@ -5830,6 +5834,7 @@ export function ChatPane({
         },
         signal: abortController.signal,
         body: JSON.stringify(chatStreamRequestBody({
+          permissionMode,
           provider: providerId,
           model,
           effort: effort || undefined,
@@ -6569,6 +6574,9 @@ export function ChatPane({
             <p className="mb-2 text-xs text-red-600">{providerDiscoveryError}</p>
           ) : null}
           <ChatComposer
+            provider={providerId}
+            permissionMode={permissionMode}
+            onPermissionModeChange={(value) => setPermissionsByProvider((current) => ({ ...current, [providerId]: value }))}
             attachments={attachments}
             attachmentError={attachmentError}
             audioInputDeviceId={audioInputDeviceId}

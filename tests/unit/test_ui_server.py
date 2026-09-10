@@ -1436,9 +1436,11 @@ def test_ui_server_provider_profile_runner_prune_and_resume_routes(
 
 def test_ui_server_chat_routes_and_stream_headers(monkeypatch, tmp_path) -> None:
     async def fake_chat(**kwargs):
+        assert kwargs["permission_mode"] == "danger-full-access"
         return {"reply": "ok", "provider": kwargs["provider"]}
 
     async def fake_stream(**kwargs):
+        assert kwargs["permission_mode"] == "read-only"
         yield {"type": "message", "body": "one"}
         yield {"type": "done"}
 
@@ -1463,8 +1465,15 @@ def test_ui_server_chat_routes_and_stream_headers(monkeypatch, tmp_path) -> None
         },
     )
 
-    chat = _request(tmp_path, "POST", "/api/chat", body={"provider": "codex", "messages": []})
-    stream = _request(tmp_path, "POST", "/api/chat/stream", body={"messages": []})
+    chat = _request(
+        tmp_path,
+        "POST",
+        "/api/chat",
+        body={"provider": "codex", "messages": [], "permissionMode": "danger-full-access"},
+    )
+    stream = _request(
+        tmp_path, "POST", "/api/chat/stream", body={"messages": [], "permissionMode": "read-only"}
+    )
     undo = _request(
         tmp_path,
         "POST",

@@ -11443,3 +11443,41 @@ test("Rem accepts staged diffs larger than 200000 characters", async () => {
   assert.equal(result.diff, diff);
   assert.equal(result.tree, "staged-tree");
 });
+
+
+test("Rem permissions show provider-specific choices and update the request", async () => {
+  function Harness() {
+    const [provider, setProvider] = React.useState("codex");
+    const [modes, setModes] = React.useState({ codex: "workspace-write", claude_code: "dontAsk" });
+    return React.createElement(React.Fragment, null,
+      React.createElement("button", { onClick: () => setProvider(provider === "codex" ? "claude_code" : "codex") }, "Switch provider"),
+      React.createElement(chatComposerModule.default, {
+        draft: "hello", provider, permissionMode: modes[provider],
+        onPermissionModeChange: (value) => setModes({ ...modes, [provider]: value }),
+        onDraftChange() {}, onSend() {},
+      }),
+    );
+  }
+  const dom = await mountReact(React.createElement(Harness), createFetchMock([]));
+  let select = dom.selectWithOption("danger-full-access");
+  assert.equal(select.getAttribute("aria-label"), "Rem permissions");
+  await dom.change(select, "danger-full-access");
+  assert.equal(reactProps(select).value, "danger-full-access");
+  assert.equal(appModule.chatStreamRequestBody({ provider: "codex", permissionMode: reactProps(select).value }).permissionMode, "danger-full-access");
+  await dom.click(dom.byText("Switch provider"));
+  select = dom.selectWithOption("bypassPermissions");
+  assert.equal(reactProps(select).value, "dontAsk");
+
+  await dom.change(select, "plan");
+  assert.equal(reactProps(select).value, "plan");
+  await dom.click(dom.byText("Switch provider"));
+  assert.equal(reactProps(dom.selectWithOption("danger-full-access")).value, "danger-full-access");
+  await dom.unmount();
+});
+
+test("Rem permissions cannot change while a message is running", () => {
+  const markup = renderToStaticMarkup(React.createElement(chatComposerModule.default, {
+    draft: "hello", sending: true, provider: "codex", permissionMode: "read-only",
+  }));
+  assert.match(markup, /<select[^>]*aria-label="Rem permissions"[^>]*disabled=""/);
+});

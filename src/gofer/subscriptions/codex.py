@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from gofer.core.provider_capabilities import resolve_provider_executable
+from gofer.core.provider_permissions import provider_permission_args
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions import base as subscription_base
 from gofer.subscriptions.base import Subscription
@@ -19,19 +20,15 @@ class CodexSubscription(Subscription):
         provider_settings: ResolvedProviderSettings | None = None,
     ) -> list[str]:
         _validate_codex_settings(provider_settings)
-        sandbox = "workspace-write"
-        if provider_settings and provider_settings.sandbox_mode not in (None, "default"):
-            sandbox_mode = provider_settings.sandbox_mode
-            if sandbox_mode is not None:
-                sandbox = sandbox_mode
         cmd = [
             resolve_provider_executable("codex") or "codex",
             "exec",
             "--color",
             "never",
             "--skip-git-repo-check",
-            "--sandbox",
-            sandbox,
+            *provider_permission_args(
+                "codex", provider_settings.sandbox_mode if provider_settings else None
+            ),
             "--json",
         ]
         if provider_settings:

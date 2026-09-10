@@ -9,6 +9,7 @@ import {
   startStreamingTranscription,
   streamTranscriptionChunk,
 } from "../lib/chatAttachments.js";
+import { PROVIDER_PERMISSIONS, defaultPermissionMode } from "../lib/providerPermissions.js";
 import { audioInputConstraints } from "../lib/audioDevices.js";
 
 export default function ChatComposer({
@@ -25,6 +26,9 @@ export default function ChatComposer({
   onSend,
   onStop,
   sending = false,
+  provider = "codex",
+  permissionMode = defaultPermissionMode(provider),
+  onPermissionModeChange = () => {},
 }) {
   const fileInputRef = useRef(null);
   const recorderRef = useRef(null);
@@ -192,7 +196,7 @@ export default function ChatComposer({
           }}
         />
         <div className="flex items-center justify-between px-1.5 pb-1.5 pt-0.5">
-          <div className="flex items-center gap-0.5">
+          <div className="flex min-w-0 flex-1 items-center gap-0.5">
             <button
               aria-label={
                 transcriptionPending
@@ -234,6 +238,20 @@ export default function ChatComposer({
             >
               <Paperclip aria-hidden="true" size={16} />
             </button>
+            {PROVIDER_PERMISSIONS[provider] ? (
+              <select
+                aria-label="Rem permissions"
+                className="ml-1 h-8 min-w-0 max-w-40 rounded-md border border-line bg-transparent px-1.5 text-xs text-ink outline-none hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-brand disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={sending}
+                value={permissionMode}
+                title={PROVIDER_PERMISSIONS[provider].find(([id]) => id === permissionMode)?.[2]}
+                onChange={(event) => onPermissionModeChange(event.target.value)}
+              >
+                {PROVIDER_PERMISSIONS[provider].map(([id, label]) => (
+                  <option key={id} value={id}>{label}</option>
+                ))}
+              </select>
+            ) : null}
             <input
               ref={fileInputRef}
               className="sr-only"

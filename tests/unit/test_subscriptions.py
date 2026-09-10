@@ -544,3 +544,27 @@ async def test_claude_subscription_execute_uses_prompt_file_instead_of_full_prom
     assert "Read the complete Taskurotta agent prompt" in str(captured["prompt_arg"])
     assert long_prompt not in list(captured["cmd"])  # type: ignore[arg-type]
     assert not Path(captured["prompt_path"]).exists()
+
+
+@pytest.mark.parametrize("mode", ["read-only", "workspace-write", "danger-full-access"])
+def test_codex_adapter_permission_modes(mode):
+    command = CodexSubscription()._build_command(
+        "hello",
+        [],
+        [],
+        provider_settings=ResolvedProviderSettings(subscription="codex", sandbox_mode=mode),
+    )
+    assert command[command.index("--sandbox") + 1] == mode
+
+
+@pytest.mark.parametrize(
+    "mode", ["acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"]
+)
+def test_claude_adapter_permission_modes(mode):
+    command = ClaudeCodeSubscription()._build_command(
+        "hello",
+        [],
+        [],
+        provider_settings=ResolvedProviderSettings(subscription="claude_code", approval_mode=mode),
+    )
+    assert command[command.index("--permission-mode") + 1] == mode

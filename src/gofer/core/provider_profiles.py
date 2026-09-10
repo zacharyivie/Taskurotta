@@ -20,7 +20,18 @@ DEFAULT_DIRECT_API_KEY_ENVS = {
     "openai_api": "OPENAI_API_KEY",
     "anthropic_api": "ANTHROPIC_API_KEY",
 }
-ApprovalMode = Literal["default", "auto", "manual", "never", "on-request", "on-failure"]
+ApprovalMode = Literal[
+    "default",
+    "auto",
+    "manual",
+    "never",
+    "on-request",
+    "on-failure",
+    "acceptEdits",
+    "dontAsk",
+    "plan",
+    "bypassPermissions",
+]
 SandboxMode = Literal["default", "read-only", "workspace-write", "danger-full-access"]
 
 PROFILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")

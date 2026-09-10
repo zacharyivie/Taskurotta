@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from gofer.core.provider_capabilities import resolve_provider_executable
+from gofer.core.provider_permissions import provider_permission_args
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions.base import Subscription
 
@@ -29,10 +30,7 @@ class ClaudeCodeSubscription(Subscription):
                 cmd += ["--model", provider_settings.model]
             if provider_settings.effort:
                 cmd += ["--effort", provider_settings.effort]
-            if provider_settings.approval_mode not in (None, "default"):
-                approval_mode = provider_settings.approval_mode
-                if approval_mode is not None:
-                    cmd += ["--permission-mode", approval_mode]
+            cmd += provider_permission_args("claude_code", provider_settings.approval_mode)
             cmd += provider_settings.extra_args
         for path in extra_paths or []:
             cmd += ["--add-dir", str(path)]

@@ -1,3 +1,4 @@
+import { PROVIDER_PERMISSIONS } from "../lib/providerPermissions.js";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -8166,7 +8167,10 @@ function ProviderProfileEditor({
               setDraft({
                 ...draft,
                 ...profilePatch,
-                ...(provider !== undefined ? { subscription: provider } : {}),
+                ...(provider !== undefined ? {
+                  subscription: provider,
+                  ...(provider !== draft.subscription ? { approval_mode: "", sandbox_mode: "" } : {}),
+                } : {}),
               });
             }}
             onRefresh={onProviderCapabilitiesRefresh}
@@ -8179,30 +8183,22 @@ function ProviderProfileEditor({
             onChange={(value) => setDraft({ ...draft, timeout: value })}
             placeholder="Seconds"
           />
-          <SelectField
-            label="Approval mode"
-            value={draft.approval_mode}
-            options={[
-              ["", "Default"],
-              ["auto", "Auto"],
-              ["manual", "Manual"],
-              ["never", "Never"],
-              ["on-request", "On request"],
-              ["on-failure", "On failure"],
-            ]}
-            onChange={(value) => setDraft({ ...draft, approval_mode: value })}
-          />
-          <SelectField
-            label="Sandbox mode"
-            value={draft.sandbox_mode}
-            options={[
-              ["", "Default"],
-              ["read-only", "Read only"],
-              ["workspace-write", "Workspace write"],
-              ["danger-full-access", "Danger full access"],
-            ]}
-            onChange={(value) => setDraft({ ...draft, sandbox_mode: value })}
-          />
+          {draft.subscription === "claude_code" ? (
+            <SelectField
+              label="Permissions"
+              value={draft.approval_mode || "default"}
+              options={PROVIDER_PERMISSIONS.claude_code}
+              onChange={(value) => setDraft({ ...draft, approval_mode: value })}
+            />
+          ) : null}
+          {draft.subscription === "codex" ? (
+            <SelectField
+              label="Permissions"
+              value={draft.sandbox_mode || "default"}
+              options={[["default", "Default"], ...PROVIDER_PERMISSIONS.codex]}
+              onChange={(value) => setDraft({ ...draft, sandbox_mode: value })}
+            />
+          ) : null}
           <ListField
             label="Extra args"
             value={draft.extra_args}

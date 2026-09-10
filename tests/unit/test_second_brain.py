@@ -120,11 +120,20 @@ def test_native_cli_serves_mcp_in_packaged_command_tree(tmp_path: Path) -> None:
     assert len(json.loads(result.output)["result"]["tools"]) == 4
 
 
-def test_codex_grants_only_builtin_second_brain_tools(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("inherited", [False, True])
+def test_codex_grants_only_builtin_second_brain_tools(
+    tmp_path: Path, monkeypatch, inherited: bool
+) -> None:
     from gofer.core.prompt_envelope import AgentResources
     from gofer.ui.chat import _build_chat_command
 
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    if inherited:
+        (tmp_path / "codex").mkdir()
+        (tmp_path / "codex" / "config.toml").write_text(
+            '[mcp_servers.second_brain]\nurl="https://old.example/mcp"\n'
+        )
+    server_name = "taskurotta_second_brain_1" if inherited else "second_brain"
     cli = tmp_path / "gof"
     workflow = with_second_brain({"remSecondBrain": {"enabled": True, "root": str(tmp_path)}}, cli)
     assert workflow is not None
@@ -139,11 +148,11 @@ def test_codex_grants_only_builtin_second_brain_tools(tmp_path: Path, monkeypatc
     )
     command = _build_chat_command(**kwargs, second_brain_cli_path=cli)
     assert (
-        'mcp_servers.second_brain.enabled_tools=["rules", "search", "read_note", "save_note"]'
+        f'mcp_servers.{server_name}.enabled_tools=["rules", "search", "read_note", "save_note"]'
         in command
     )
     for tool in ("rules", "search", "read_note", "save_note"):
-        assert f'mcp_servers.second_brain.tools.{tool}.approval_mode="approve"' in command
+        assert f'mcp_servers.{server_name}.tools.{tool}.approval_mode="approve"' in command
     assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert not any("approval_mode" in arg for arg in _build_chat_command(**kwargs))
     resources.mcpServers[0].command = "/untrusted/gof"

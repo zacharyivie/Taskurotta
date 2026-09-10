@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 
 from gofer.core.prompt_envelope import (
     AgentResources,
+    codex_mcp_server_names,
     prompt_envelope,
     resource_cli_args,
     resource_index,
@@ -1516,12 +1517,13 @@ def _build_chat_command(
                 and server.args[:2] == ["ui", "second-brain"]
                 for server in resources.mcpServers
             ):
+                server_name = codex_mcp_server_names(resources, working_dir)["second_brain"]
                 tools = ["rules", "search", "read_note", "save_note"]
-                command += ["-c", f"mcp_servers.second_brain.enabled_tools={json.dumps(tools)}"]
+                command += ["-c", f"mcp_servers.{server_name}.enabled_tools={json.dumps(tools)}"]
                 for tool in tools:
                     command += [
                         "-c",
-                        f'mcp_servers.second_brain.tools.{tool}.approval_mode="approve"',
+                        f'mcp_servers.{server_name}.tools.{tool}.approval_mode="approve"',
                     ]
         command.append(prompt)
         return command

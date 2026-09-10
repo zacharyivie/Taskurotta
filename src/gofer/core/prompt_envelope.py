@@ -104,9 +104,12 @@ def resource_cli_args(
             )
             args += ["-c", f"skills.config=[{skills}]"]
         for name in _codex_mcp_names(working_dir):
-            args += ["-c", f"mcp_servers.{json.dumps(name)}.enabled=false"]
+            # Codex splits CLI keys on dots without parsing TOML key quoting.
+            # Quotes would create a different server with no command or URL.
+            args += ["-c", f"mcp_servers.{name}.enabled=false"]
+        server_names = codex_mcp_server_names(resources, working_dir)
         for server in resources.mcpServers:
-            # Replace the whole entry so changing transport cannot retain an old URL/command.
+            # A fresh name prevents Codex from merging inherited transport or credentials.
             fields = [f"enabled={str(server.enabled).lower()}"]
             if server.type == "stdio":
                 fields += [
@@ -115,7 +118,7 @@ def resource_cli_args(
                 ]
             else:
                 fields += [f"url={json.dumps(server.url)}"]
-            args += ["-c", f"mcp_servers.{server.name}={{" + ",".join(fields) + "}"]
+            args += ["-c", f"mcp_servers.{server_names[server.name]}={{" + ",".join(fields) + "}"]
         return args
     if provider == "claude_code":
         tools = ["Read", "Edit", "Write", "Glob", "Grep"]
@@ -141,6 +144,29 @@ def resource_cli_args(
             json.dumps({"mcpServers": servers}),
         ]
     raise ValueError(f"Resource configuration is unsupported by provider '{provider}'")
+
+
+def codex_mcp_server_names(
+    resources: AgentResources, working_dir: Path | None = None
+) -> dict[str, str]:
+    """Map selected servers to invocation names free of inherited configuration."""
+    inherited = set(_codex_mcp_names(working_dir))
+    occupied = inherited | {server.name for server in resources.mcpServers}
+    names: dict[str, str] = {}
+    for server in resources.mcpServers:
+        if server.name in names:
+            continue
+        name = server.name
+        if name in inherited:
+            suffix = 1
+            while True:
+                name = f"taskurotta_{server.name[:40]}_{suffix}"
+                if name not in occupied:
+                    break
+                suffix += 1
+        occupied.add(name)
+        names[server.name] = name
+    return names
 
 
 def _codex_mcp_names(working_dir: Path | None) -> list[str]:

@@ -3,6 +3,61 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## 0.2.6 - 2026-09-11
+
+### Added
+
+- Added persistent desktop records for trusted project folders and a one-time
+  migration of existing recent projects, including temporarily offline folders.
+- Added release gates for Python lint, type checks, tests, and dependency audits,
+  plus native terminal and Electron security smoke tests across platforms.
+- Added required Windows signing and macOS signing and notarization for tagged
+  releases, artifact verification, provenance attestations, and a release
+  verification guide. Unsigned dry runs remain available.
+
+### Changed
+
+- Updated Electron to 41.10.7 and refreshed frontend, Python, and packaging
+  dependencies to address dependency audit findings.
+- Pinned GitHub Actions to commit hashes, added Dependabot updates, and made
+  release validation and packaging use the same commit and locked dependencies.
+- Reduced Rem change-tracking memory by storing file snapshots on disk and
+  reusing unchanged contents. Bounded scans and throttled previews limit work
+  on large projects while retaining compatibility with older undo records.
+- Moved conversation archive writes to a worker, combined pending updates, and
+  skipped unchanged archive writes. Cached message serialization and batched
+  streamed updates reduce repeated work when saving long conversations.
+- Added a filesystem-watched Second Brain search index with polling fallback,
+  incremental updates, and immediate invalidation after saving a note.
+- Reduced repeated Git commands, project validation, workflow discovery, and
+  Radish asset loading through caching and shared pending requests. Background
+  polling pauses while the window is hidden and resumes on focus.
+
+### Fixed
+
+- Hardened backend authentication and origin checks across API methods and
+  streaming responses, and kept backend credentials out of request URLs.
+- Restricted folder grant renewal to previously authorized paths and required
+  authorization for directory listings. Hardened file writes, workflow bundle
+  extraction, chat undo, and Second Brain access against path traversal,
+  symbolic links, and filesystem replacement races.
+- Added a studio content security policy and navigation restrictions, denied
+  protected permissions for remote pages, and kept microphone access scoped
+  to the studio and local HTML previews isolated.
+- Limited workflow HTTP responses to 16 MiB and enforced request deadlines and
+  cancellation. Bounded backend connections, expensive requests, request-body
+  sizes, and asynchronous job lifetimes.
+- Verified speech-model archive and file hashes, rejected unsafe or oversized
+  extraction layouts, and checked cached models for tampering.
+- Fixed stale results during rapid project and worktree switching, repeated
+  file-explorer refreshes, and late editor callbacks restoring closed-tab state.
+- Fixed local Markdown link resolution and link target tooltips, and removed
+  the dark backdrop from Rem's avatar sprites.
+- Fixed release dry-run failures involving unsigned macOS certificate settings,
+  Windows ZIP path normalization, and schema tests without an active project.
+- Fixed Linux Electron platform smoke tests aborting on the unconfigured SUID
+  sandbox helper by passing `--no-sandbox` when launching the test processes.
+
 ## 0.2.5 - 2026-09-10
 
 ### Fixed

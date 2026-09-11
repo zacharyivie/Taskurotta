@@ -251,6 +251,10 @@ jobs:
           SIGNED_RELEASE: ${{ inputs.signed_release }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.signed_release && 'true' || 'false' }}
         run: |
+          # Empty CSC_LINK is resolved as a certificate path by electron-builder.
+          if [ "$SIGNED_RELEASE" != "true" ]; then
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+          fi
           npm run build
           signing_args=()
           if [ "$SIGNED_RELEASE" = "true" ] && [ "$RUNNER_OS" != "Linux" ]; then

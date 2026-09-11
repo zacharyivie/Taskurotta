@@ -388,7 +388,8 @@ def _safe_extract_zip(archive: zipfile.ZipFile, target: Path) -> None:
         destination = (target / name).resolve()
         kind = stat.S_IFMT(member.external_attr >> 16)
         if (
-            "\\" in name
+            member.orig_filename != name
+            or "\\" in name
             or ":" in name
             or name.startswith("/")
             or ".." in Path(name).parts

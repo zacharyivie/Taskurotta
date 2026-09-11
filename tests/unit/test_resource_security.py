@@ -122,13 +122,32 @@ def archive_bytes(
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=compression) as archive:
         for name, body in entries:
-            archive.writestr(name, body)
+            if isinstance(name, str):
+                member = zipfile.ZipInfo(name)
+                # Preserve malicious names that ZipInfo normalizes on Windows.
+                member.filename = name
+                member.compress_type = compression
+            else:
+                member = name
+            archive.writestr(member, body)
     return output.getvalue()
 
 
 @pytest.mark.parametrize("name", ["../outside", "/outside", "C:/outside", "x\\y", "x/../../bad"])
 def test_model_archive_rejects_unsafe_paths(tmp_path, name):
     with zipfile.ZipFile(io.BytesIO(archive_bytes([(name, b"x")]))) as archive:
+        assert archive.infolist()[0].orig_filename == name
+        with pytest.raises(media.ChatMediaError, match="unsafe path"):
+            media._safe_extract_zip(archive, tmp_path)
+    assert [p for p in tmp_path.iterdir() if p.name != "gofer-env"] == []
+
+
+def test_model_archive_rejects_windows_normalized_path(tmp_path):
+    with zipfile.ZipFile(io.BytesIO(archive_bytes([("x\\y", b"x")]))) as archive:
+        member = archive.infolist()[0]
+        assert member.orig_filename == "x\\y"
+        # Reproduce Windows ZIP reading on every platform.
+        member.filename = "x/y"
         with pytest.raises(media.ChatMediaError, match="unsafe path"):
             media._safe_extract_zip(archive, tmp_path)
     assert [p for p in tmp_path.iterdir() if p.name != "gofer-env"] == []

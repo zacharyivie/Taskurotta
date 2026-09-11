@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, cast
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -112,6 +117,57 @@ def _parse_workflow_yaml(path: Path) -> dict[str, Any]:
 
 def _release_workflow() -> dict[str, Any]:
     return _parse_workflow_yaml(REPO_ROOT / ".github" / "workflows" / "release-build.yml")
+
+
+@pytest.mark.parametrize("runner_os", ["macOS", "Windows", "Linux"])
+@pytest.mark.parametrize("signed", [False, True])
+def test_electron_build_signing_environment(runner_os: str, signed: bool) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is required to exercise the release build step")
+    step = _steps_by_name(_build_job(_release_workflow()))["Build Electron packages"]
+    script = step["run"].replace("${{ matrix.electron_builder_args }}", "--mac dmg zip")
+    credential_names = (
+        "CSC_LINK",
+        "CSC_KEY_PASSWORD",
+        "APPLE_ID",
+        "APPLE_APP_SPECIFIC_PASSWORD",
+        "APPLE_TEAM_ID",
+    )
+    env = {
+        **os.environ,
+        **dict.fromkeys(credential_names, "test-credential" if signed else ""),
+        "SIGNED_RELEASE": str(signed).lower(),
+        "RUNNER_OS": runner_os,
+        "CSC_IDENTITY_AUTO_DISCOVERY": str(signed).lower(),
+    }
+    # Replace build tools with shell functions to inspect the actual workflow script.
+    probe = r"""
+    npm() { :; }
+    npx() {
+      for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+        if [ "$SIGNED_RELEASE" = "true" ]; then
+          [ "${!name}" = "test-credential" ] || return 1
+        else
+          [ -z "${!name+x}" ] || return 1
+        fi
+      done
+      [ "$CSC_IDENTITY_AUTO_DISCOVERY" = "$SIGNED_RELEASE" ] || return 1
+      printf '%s\n' "$@"
+    }
+    """
+    result = subprocess.run(
+        [bash, "-eo", "pipefail", "-c", probe + script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    args = result.stdout.splitlines()
+    assert "--publish=never" in args
+    assert ("--config.forceCodeSigning=true" in args) == (signed and runner_os != "Linux")
+    assert ("--config.mac.notarize=true" in args) == (signed and runner_os == "macOS")
+    assert ("--config.dmg.sign=true" in args) == (signed and runner_os == "macOS")
 
 
 def _entry_workflow(name: str) -> dict[str, Any]:

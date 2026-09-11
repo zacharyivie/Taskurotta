@@ -14,6 +14,8 @@ from jsonschema import (  # type: ignore[import-untyped]
     ValidationError,
 )
 from pydantic import BaseModel
+from rich.text import Text
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from gofer.cli.main import app
@@ -530,14 +532,29 @@ def test_installed_entrypoint_discovers_schema_without_repository_cwd(tmp_path: 
     assert json.loads(result.stdout)["operation"]["type"] == "pass"
 
 
-def test_human_help_and_missing_skill_recovery_point_to_authoring_contract(monkeypatch) -> None:
-    root_help = runner.invoke(app, ["--help"])
-    node_help = runner.invoke(app, ["workflow", "add-node", "--help"])
+@pytest.mark.parametrize("width", [60, 80, 120])
+@pytest.mark.parametrize("color", [False, True])
+def test_human_help_and_missing_skill_recovery_point_to_authoring_contract(
+    monkeypatch, width: int, color: bool
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(rich_utils, "MAX_WIDTH", width)
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", color)
+    monkeypatch.setattr(rich_utils, "COLOR_SYSTEM", "standard" if color else None)
+    root_help = runner.invoke(app, ["--help"], color=color)
+    node_help = runner.invoke(app, ["workflow", "add-node", "--help"], color=color)
     monkeypatch.setattr(
         "gofer.ui.chat.radish_assistant_skill_path",
         lambda: (_ for _ in ()).throw(RadishArtifactError("missing")),
     )
 
-    assert "gof schema --format json" in root_help.output
-    assert "gof schema --operation TYPE" in node_help.output
+    assert root_help.exit_code == 0
+    assert node_help.exit_code == 0
+    if color:
+        assert "\x1b[" in root_help.output
+    # Rich styles options and wraps help at the terminal width, including in CI.
+    root_text = " ".join(Text.from_ansi(root_help.output).plain.split())
+    node_text = " ".join(Text.from_ansi(node_help.output).plain.split())
+    assert "gof schema --format json" in root_text
+    assert "gof schema --operation TYPE" in node_text
     assert "gof radish docs --format json" in _load_skill_text()

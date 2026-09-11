@@ -395,8 +395,10 @@ def test_release_security_gates_are_mandatory_and_publish_provenance() -> None:
     assert "--omit=dev" not in npm_audit["run"]
     assert "continue-on-error" not in npm_audit
     evidence = validation["Save dependency audit evidence"]
-    assert evidence["if"] == "always()"
+    assert evidence["if"] == "always() && hashFiles('audit-evidence/*') != ''"
     assert evidence["with"]["name"] == "gofer-flow-audit-evidence"
+    assert evidence["with"]["path"] == "audit-evidence/*"
+    assert evidence["with"]["if-no-files-found"] == "error"
     build = _steps_by_name(_build_job(workflow))
     assert "--locked" in build["Install Python dependencies"]["run"]
     filesystem_tests = build["Test platform filesystem security"]

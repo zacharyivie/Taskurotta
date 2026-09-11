@@ -25,7 +25,8 @@ if (fs.existsSync(release)) {
 if (archives.length !== 1) throw new Error("Build exactly one native unpacked desktop package before test:platform.");
 env.TASKUROTTA_SMOKE_ASAR = archives[0];
 for (const fixture of ["native-runtime.browser.cjs", "studio-policy.browser.cjs", "legacy-project-migration.browser.cjs", "conversation-storage.browser.cjs"]) {
-  const args = [electron, path.join(__dirname, fixture)];
+  // Linux CI needs this before Electron starts; fixture JS runs after sandbox setup.
+  const args = [electron, ...(process.platform === "linux" ? ["--no-sandbox"] : []), path.join(__dirname, fixture)];
   const result = process.platform === "linux"
     ? spawnSync("xvfb-run", ["-a", ...args], { env, stdio: "inherit", timeout: 60000 })
     : spawnSync(args[0], args.slice(1), { env, stdio: "inherit", timeout: 60000 });

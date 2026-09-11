@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any, TextIO
 
 from gofer.core.prompt_envelope import AgentResources, McpReference
-
-MAX_NOTE_BYTES = 2 * 1024 * 1024
-
+from gofer.ui.second_brain_index import MAX_NOTE_BYTES, note_index, read_note_bytes
+from gofer.utils.atomic_output import atomic_binary_output
 
 REPORT_THEME_PROMPTS = {
     "auto": "System: design coordinated light and dark palettes using prefers-color-scheme. "
@@ -177,10 +175,12 @@ class SecondBrain:
         return target
 
     def search(self, query: str) -> list[dict[str, Any]]:
-        # Reconcile edits made outside Rem before each search. IDs depend only on relative paths.
         database = self.resolve(".taskurotta/second-brain.sqlite3")
-        database.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(database) as connection:
+        database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        index = note_index(self.root)
+        if not database.exists():
+            index.invalidate(self.root, directory=True)
+        with index.lock, closing(sqlite3.connect(database, timeout=5)) as connection:
             connection.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS notes USING fts5(id UNINDEXED, path, content)"
             )
@@ -188,47 +188,8 @@ class SecondBrain:
                 "CREATE TABLE IF NOT EXISTS note_state "
                 "(id TEXT PRIMARY KEY, mtime_ns INTEGER, size INTEGER)"
             )
-            seen: set[str] = set()
-            count = 0
-            for directory, folders, files in os.walk(self.root, followlinks=False):
-                folders[:] = sorted(
-                    name
-                    for name in folders
-                    if not name.startswith(".") and name not in {"node_modules", "__pycache__"}
-                )
-                for name in sorted(files):
-                    file = Path(directory) / name
-                    if file.suffix.lower() not in {".md", ".markdown", ".html", ".htm", ".txt"}:
-                        continue
-                    if file.is_symlink() or file.stat().st_size > MAX_NOTE_BYTES:
-                        continue
-                    count += 1
-                    if count > 10000:
-                        raise ValueError(
-                            "Second Brain has more than 10,000 notes. Choose a smaller root."
-                        )
-                    relative = file.relative_to(self.root).as_posix()
-                    note_id = hashlib.sha256(relative.encode()).hexdigest()
-                    seen.add(note_id)
-                    stat = file.stat()
-                    old = connection.execute(
-                        "SELECT mtime_ns, size FROM note_state WHERE id=?", (note_id,)
-                    ).fetchone()
-                    if old and old == (stat.st_mtime_ns, stat.st_size):
-                        continue
-                    content = file.read_text(encoding="utf-8", errors="replace")
-                    connection.execute("DELETE FROM notes WHERE id=?", (note_id,))
-                    connection.execute(
-                        "INSERT INTO notes VALUES (?, ?, ?)", (note_id, relative, content)
-                    )
-                    connection.execute(
-                        "INSERT OR REPLACE INTO note_state VALUES (?, ?, ?)",
-                        (note_id, stat.st_mtime_ns, stat.st_size),
-                    )
-            for (note_id,) in connection.execute("SELECT id FROM notes").fetchall():
-                if note_id not in seen:
-                    connection.execute("DELETE FROM notes WHERE id=?", (note_id,))
-                    connection.execute("DELETE FROM note_state WHERE id=?", (note_id,))
+            connection.commit()
+            index.synchronize(database)
             words = query.split()[:20]
             if not words:
                 rows = connection.execute(
@@ -254,9 +215,15 @@ class SecondBrain:
                 raise ValueError("Read a Markdown, HTML, or text note.")
             if target.stat().st_size > MAX_NOTE_BYTES:
                 raise ValueError("The note exceeds 2 MB.")
-            return {"path": str(target), "content": target.read_text(encoding="utf-8")}
+            # Use the original relative path so internal symlink aliases cannot
+            # bypass the same no-link policy used by the index.
+            data = read_note_bytes(self.root, Path(str(arguments.get("path", ""))))
+            if data is None:
+                raise ValueError("Read a regular note of at most 2 MB without symbolic links.")
+            return {"path": str(target), "content": data[0].decode("utf-8")}
         if name == "save_note":
-            target = self.resolve(str(arguments.get("path", "")))
+            relative = str(arguments.get("path", ""))
+            target = self.resolve(relative)
             if target.suffix.lower() != f".{self.report_format}":
                 raise ValueError(
                     f"Save reports with the configured .{self.report_format} extension."
@@ -264,10 +231,11 @@ class SecondBrain:
             content = arguments.get("content")
             if not isinstance(content, str) or len(content.encode()) > MAX_NOTE_BYTES:
                 raise ValueError("Provide note text of at most 2 MB.")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # Exclusive creation keeps existing knowledge intact. Give revisions a new filename.
-            with target.open("x", encoding="utf-8") as output:
-                output.write(content)
+            # Publish a complete note without following swapped parents or
+            # replacing existing knowledge, including concurrent creations.
+            with atomic_binary_output(self.root / relative, exclusive=True) as output:
+                output.write(content.encode("utf-8"))
+            note_index(self.root).invalidate(target)
             return {"path": str(target), "link": f"[{target.stem}](<{target}>)"}
         raise ValueError("Unknown Second Brain tool.")
 

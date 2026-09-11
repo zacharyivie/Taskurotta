@@ -1,3 +1,4 @@
+import { cloneJson } from "../lib/jsonValue.js";
 import { PROVIDER_PERMISSIONS } from "../lib/providerPermissions.js";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -967,7 +968,7 @@ function nextAvailableAgentNumber(nodes, agents, usedAgentIds = []) {
 }
 
 function structuredCloneCompatible(value) {
-  return JSON.parse(JSON.stringify(value));
+  return cloneJson(value);
 }
 
 export default function DagCanvas({

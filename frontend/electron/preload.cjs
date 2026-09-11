@@ -6,6 +6,18 @@ const BROWSER_PRELOAD_ARG = "--gofer-browser-preload=";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8765";
 const LOCAL_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
+// Capture pre-upgrade history before any page script runs. This capability stays
+// in the isolated world and is never part of the public desktop bridge.
+const migrationArgument = process.argv.find((value) => value.startsWith("--gofer-legacy-project-migration="));
+if (migrationArgument) {
+  const token = migrationArgument.slice("--gofer-legacy-project-migration=".length);
+  let recentProjects = null;
+  let unavailable = false;
+  try { recentProjects = globalThis.window.localStorage.getItem("gofer.recentProjects"); }
+  catch { unavailable = true; }
+  ipcRenderer.sendSync("gofer:migrate-legacy-projects", { token, recentProjects, unavailable });
+}
+
 function readApiBaseUrl() {
   const arg = process.argv.find((value) => value.startsWith(API_BASE_URL_ARG));
   const value = arg ? arg.slice(API_BASE_URL_ARG.length) : DEFAULT_API_BASE_URL;
@@ -86,7 +98,7 @@ function grantForPath(targetPath) {
   for (const [rootPath, grantId] of pathGrants.entries()) {
     const root = normalizeGrantPath(rootPath);
     if (!root) continue;
-    const matchesRoot = target === root || target.startsWith(`${root}/`);
+    const matchesRoot = target === root || target.startsWith(root.endsWith("/") ? root : `${root}/`);
     if (matchesRoot && root.length > selectedRootLength) {
       selectedGrantId = grantId;
       selectedRootLength = root.length;
@@ -96,10 +108,17 @@ function grantForPath(targetPath) {
 }
 
 function normalizeGrantPath(targetPath) {
-  return String(targetPath ?? "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/\/+$/, "");
+  let value = String(targetPath ?? "").trim();
+  const windows = process.platform === "win32";
+  if (windows) value = value.replace(/\\/g, "/").toLowerCase();
+  const prefix = value.startsWith("//") && windows ? "//" : value.startsWith("/") ? "/" : "";
+  const segments = [];
+  for (const segment of value.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") { if (segments.length) segments.pop(); }
+    else segments.push(segment);
+  }
+  return prefix + segments.join("/");
 }
 
 async function invokeDesktop(channel, payload = {}) {
@@ -109,6 +128,7 @@ async function invokeDesktop(channel, payload = {}) {
 }
 
 contextBridge.exposeInMainWorld("goferDesktop", {
+  apiSession: () => invokeDesktop("gofer:api-session"),
   developer: {
     info: () => invokeDesktop("gofer:developer-info"),
     action: (action) => invokeDesktop("gofer:developer-action", { action }),
@@ -172,6 +192,7 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     removeWorktree: (options = {}) => removeWorktree(options),
     pathGrantForApi: (targetPath) =>
       grantForPath(targetPath),
+    grantUserPath: (targetPath) => invokeDesktop("gofer:grant-user-path", { targetPath }),
     trustProjectRoot: (targetPath) =>
       trustProjectRoot(targetPath),
     copyPath: (options = {}) =>
@@ -201,7 +222,7 @@ contextBridge.exposeInMainWorld("goferDesktop", {
   grantDroppedPath: async (file) => {
     const targetPath = webUtils.getPathForFile(file) || "";
     if (!targetPath) return null;
-    const payload = await invokeDesktop("gofer:grant-path", { targetPath });
+    const payload = await invokeDesktop("gofer:grant-dropped-path", { targetPath });
     return payload?.path || targetPath;
   },
 });
@@ -326,6 +347,11 @@ async function trustProjectRoot(targetPath) {
   const previousGrantId = grantForPath(targetPath);
   try {
     const payload = await invokeDesktop("gofer:grant-path", { targetPath });
+    if (payload?.missing) {
+      const error = new Error(`Path does not exist: ${targetPath}`);
+      error.code = "ENOENT";
+      throw error;
+    }
     return payload?.path || targetPath;
   } catch (error) {
     for (const [root, grantId] of pathGrants.entries()) {

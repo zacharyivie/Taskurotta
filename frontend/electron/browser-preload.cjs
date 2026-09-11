@@ -24,12 +24,21 @@ window.addEventListener("click", (event) => {
   if (
     event.defaultPrevented
     || event.button !== 0
-    || (!event.ctrlKey && !event.metaKey)
   ) return;
   const anchor = event.composedPath().find((node) => node?.tagName === "A");
   if (!anchor || anchor.hasAttribute("download")) return;
-  const url = String(anchor.href || "").trim();
+  const rawHref = String(anchor.getAttribute?.("href") || "").trim();
+  const localPreview = /^file:/i.test(window.location.href);
+  const url = localPreview && rawHref.startsWith("//")
+    ? `https:${rawHref}`
+    : String(anchor.href || "").trim();
   if (!/^(?:https?|file):/i.test(url)) return;
+  const modified = event.ctrlKey || event.metaKey;
+  const localFile = /^file:/i.test(url);
+  // Keep same-document anchors in the preview, including full file URLs.
+  const sameDocument = url.split("#", 1)[0] === window.location.href.split("#", 1)[0];
+  const websiteFromPreview = localPreview && /^https?:/i.test(url);
+  if (!modified && !websiteFromPreview && (!localFile || sameDocument)) return;
   event.preventDefault();
   event.stopPropagation();
   ipcRenderer.send(LINK_CHANNEL, { url });

@@ -1,3 +1,4 @@
+import { shareInFlight } from "./refresh.js";
 const DEFAULT_API_BASE_URL = "/api";
 
 export function installGoferApiFetchAuth() {
@@ -6,22 +7,42 @@ export function installGoferApiFetchAuth() {
   const nativeFetch = window.fetch.bind(window);
   window.fetch = async (input, init = {}) => {
     if (shouldBootstrapGoferApiAuth(input, init)) {
-      await ensureGoferApiToken(nativeFetch);
+      const previousBase = apiUrl("/");
+      await ensureGoferApiToken(nativeFetch, { refresh: Boolean(window.goferDesktop?.apiSession) });
+      if (typeof input === "string" && input.startsWith(previousBase)) {
+        input = apiUrl("/") + input.slice(previousBase.length);
+      }
     }
-    return nativeFetch(...withGoferApiAuth(input, init));
+    const request = () => nativeFetch(...withGoferApiAuth(input, init));
+    const method = String(init.method || input?.method || "GET").toUpperCase();
+    const mutation = !["GET", "HEAD", "OPTIONS"].includes(method) && isGoferApiRequest(input);
+    if (mutation) window.__goferApiReadGeneration = (window.__goferApiReadGeneration || 0) + 1;
+    const share = method === "GET" && typeof input === "string" && !init.signal && !init.headers && isGoferApiRequest(input);
+    const response = share
+      ? (await shareInFlight(`api:${window.__goferApiReadGeneration || 0}:${input}:${currentApiToken()}`, request)).clone()
+      : await request();
+    if (mutation) window.__goferApiReadGeneration = (window.__goferApiReadGeneration || 0) + 1;
+    if (response.status === 401 && isGoferApiRequest(input) && window.goferDesktop?.apiSession) {
+      const previousToken = currentApiToken();
+      const token = await ensureGoferApiToken(nativeFetch, { refresh: true });
+      if (token && token !== previousToken) {
+        return nativeFetch(...withGoferApiAuth(input, init));
+      }
+    }
+    return response;
   };
   window.__goferApiFetchAuthInstalled = true;
 }
 
 export function apiUrl(path) {
-  const baseUrl = normalizeApiBaseUrl(window.goferApiBaseUrl || DEFAULT_API_BASE_URL);
+  const baseUrl = normalizeApiBaseUrl(window.__goferSessionBaseUrl || window.goferApiBaseUrl || DEFAULT_API_BASE_URL);
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
 
   return `${baseUrl}${normalizedPath}`;
 }
 
 export function withGoferApiAuth(input, init = {}) {
-  const token = window.goferApiToken;
+  const token = currentApiToken();
   if (!token || !isGoferApiRequest(input)) return [input, init];
 
   const headers = new Headers(init.headers || requestHeaders(input));
@@ -31,17 +52,37 @@ export function withGoferApiAuth(input, init = {}) {
   return [input, { ...init, headers }];
 }
 
-export async function ensureGoferApiToken(fetchImpl = window.fetch.bind(window)) {
-  if (window.goferApiToken || window.__goferApiTokenPromise) {
-    return window.__goferApiTokenPromise || window.goferApiToken;
+function currentApiToken() {
+  return window.__goferSessionToken || window.goferApiToken || "";
+}
+
+function launchCapability() {
+  // Fragments are not sent to the server or in HTTP Referer headers.
+  const hash = window.location?.hash || "";
+  const fragment = new URLSearchParams(hash.replace(/^#/, ""));
+  const token = fragment.get("gofer-token") || "";
+  if (token) {
+    fragment.delete("gofer-token");
+    const remaining = fragment.toString();
+    window.history?.replaceState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${window.location.search}${remaining ? `#${remaining}` : ""}`,
+    );
   }
-  window.__goferApiTokenPromise = fetchImpl(apiUrl("/session"))
-    .then(async (response) => {
-      if (!response.ok) return "";
-      const payload = await response.json();
-      const token = typeof payload.apiToken === "string" ? payload.apiToken : "";
+  return token;
+}
+
+export async function ensureGoferApiToken(_fetchImpl, { refresh = false } = {}) {
+  if (window.__goferApiTokenPromise) return window.__goferApiTokenPromise;
+  if (!refresh && currentApiToken()) return currentApiToken();
+  window.__goferApiTokenPromise = Promise.resolve()
+    .then(async () => {
+      const session = await window.goferDesktop?.apiSession?.();
+      const token = typeof session?.apiToken === "string" ? session.apiToken : launchCapability();
       if (token) {
-        window.goferApiToken = token;
+        window.__goferSessionToken = token;
+        if (typeof session?.apiBaseUrl === "string") window.__goferSessionBaseUrl = session.apiBaseUrl;
       }
       return token;
     })
@@ -68,21 +109,8 @@ function isGoferApiRequest(input) {
   );
 }
 
-function shouldBootstrapGoferApiAuth(input, init = {}) {
-  if (window.goferApiToken || !isGoferApiRequest(input)) return false;
-  const value = typeof input === "string" ? input : input?.url;
-  const target = new URL(value, window.location?.href || "http://127.0.0.1/");
-  if (target.pathname.endsWith("/session") || target.pathname.includes("/webhooks/")) {
-    return false;
-  }
-  return stateChangingMethod(input, init);
-}
-
-function stateChangingMethod(input, init = {}) {
-  const method =
-    init.method ||
-    (typeof Request !== "undefined" && input instanceof Request ? input.method : "GET");
-  return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
+function shouldBootstrapGoferApiAuth(input) {
+  return isGoferApiRequest(input) && (Boolean(window.goferDesktop?.apiSession) || !currentApiToken());
 }
 
 function normalizeApiBaseUrl(baseUrl) {

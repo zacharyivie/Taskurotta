@@ -1,8 +1,14 @@
+import { createConversationCache } from "../lib/conversationCache.js";
+import { loadConversationMessages, saveConversationMessages, removeConversationMessages } from "../lib/conversationStorage.js";
+import { createConversationArchiveScheduler } from "../lib/conversationArchive.js";
+import { startPolling, shareInFlight } from "../lib/refresh.js";
+import { createRecentProjectValidator, startWorkspacePolling } from "../lib/projectRefresh.js";
+import { equalJson } from "../lib/jsonValue.js";
 import { defaultPermissionMode } from "../lib/providerPermissions.js";
 import { generateConventionalCommit } from "../lib/commit-message.js";
 import RemResources, { DEFAULT_REM_RESOURCES, remResourceError } from "../components/RemResources.jsx";
 import RemAvatar from "../components/RemAvatar.jsx";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -42,6 +48,7 @@ import CodeFileExplorer from "../components/CodeFileExplorer.jsx";
 import CodeWorkspace, {
   applyCodeFilesystemChange,
   resolveMarkdownFileLinkTarget,
+  markdownFileLinkTarget,
 } from "../components/CodeWorkspace.jsx";
 import MarkdownContent from "../components/MarkdownContent.jsx";
 import ChatComposer, { MessageAttachments } from "../components/ChatComposer.jsx";
@@ -248,14 +255,16 @@ export async function withProjectOpenTimeout(operation, timeoutMs = 30000) {
   }
 }
 
-export async function discoverProjectWorkflows(projectRoot) {
+export async function discoverProjectWorkflows(projectRoot, { signal } = {}) {
   const normalizedRoot = String(projectRoot ?? "").trim();
   if (!normalizedRoot) return [];
 
   await window.goferDesktop?.workspace?.trustProjectRoot?.(normalizedRoot);
+  signal?.throwIfAborted();
   const projectGrantId =
     window.goferDesktop?.workspace?.pathGrantForApi?.(normalizedRoot) ?? "";
   const response = await fetch(apiUrl("/projects/open"), {
+    signal,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -399,7 +408,12 @@ export default function App() {
   const previewCodePathRef = useRef("");
   const codeNavigationSequenceRef = useRef(0);
   const pendingProjectFileRef = useRef(null);
+  const workflowLoadRequestRef = useRef(0);
   const projectOpenRequestRef = useRef(0);
+  const projectOpenAbortRef = useRef(null);
+  const recentProjectValidatorRef = useRef(null);
+  if (!recentProjectValidatorRef.current) recentProjectValidatorRef.current = createRecentProjectValidator();
+  useEffect(() => () => projectOpenAbortRef.current?.abort(), []);
   const openProjectFolderRef = useRef(null);
   const openFileRef = useRef(null);
   const chordPendingRef = useRef(null);
@@ -567,30 +581,32 @@ export default function App() {
 
   useEffect(() => {
     const getPathInfo = window.goferDesktop?.workspace?.getPathInfo;
-    if (!getPathInfo || !recentProjectRoots.length) return undefined;
+    const roots = [...new Set([...recentProjectRoots, activeProjectRoot].filter(Boolean))];
+    if (!getPathInfo || !roots.length) return undefined;
     let cancelled = false;
-    void Promise.all(recentProjectRoots.map(async (projectRoot) => {
-      const selectedProjectRoot = lastWorktreeByProject[projectRoot] || projectRoot;
-      try {
-        await window.goferDesktop?.workspace?.trustProjectRoot?.(selectedProjectRoot);
-        const info = await getPathInfo(selectedProjectRoot);
-        if (!info?.isDirectory) return null;
-        const worktreePayload = await window.goferDesktop?.workspace?.gitWorktrees?.(
-          selectedProjectRoot,
-        );
-        return {
-          mainProjectRoot: mainWorktreeRoot(worktreePayload, projectRoot),
-          selectedProjectRoot,
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return /does not exist|no such file|not a directory/i.test(message)
-          ? null
-          : { mainProjectRoot: projectRoot, selectedProjectRoot: projectRoot };
-      }
-    })).then((projects) => {
+    const stop = startPolling(() => Promise.all(roots.map((projectRoot) =>
+      recentProjectValidatorRef.current.validate(
+        projectRoot,
+        lastWorktreeByProject[projectRoot] || projectRoot,
+        window.goferDesktop.workspace,
+        mainWorktreeRoot,
+      ),
+    )).then((projects) => {
       if (cancelled) return;
-      const existingProjects = projects.filter(Boolean);
+      const existingProjects = projects.filter((project, index) => project && recentProjectRoots.includes(roots[index]));
+      const missingRoots = roots.flatMap((root, index) => {
+        const selected = lastWorktreeByProject[root] || root;
+        return !projects[index] || projects[index].selectedProjectRoot !== selected ? [selected] : [];
+      });
+      if (missingRoots.length) {
+        setWorkflows((current) => current.filter((workflow) => !missingRoots.includes(workflow.projectRoot)));
+        if (missingRoots.includes(activeProjectRoot)) {
+          const replacementIndex = roots.findIndex((root) => lastWorktreeByProject[root] === activeProjectRoot);
+          const replacement = projects[replacementIndex]?.selectedProjectRoot || "";
+          setActiveProjectRoot(replacement === activeProjectRoot ? "" : replacement);
+          setActiveWorkflowId(undefined);
+        }
+      }
       const nextRoots = mergeRecentProjects(
         [],
         existingProjects.map((project) => project.mainProjectRoot),
@@ -599,20 +615,23 @@ export default function App() {
         project.mainProjectRoot,
         project.selectedProjectRoot,
       ]));
-      setLastWorktreeByProject((current) => Object.entries(selections).every(
-        ([mainRoot, selectedRoot]) => current[mainRoot] === selectedRoot,
-      ) ? current : { ...current, ...selections });
+      setLastWorktreeByProject((current) => (
+        Object.keys(current).length === Object.keys(selections).length
+          && Object.entries(selections).every(([root, selected]) => current[root] === selected)
+          ? current : selections
+      ));
       setRecentProjectRoots((current) => (
         current.length === nextRoots.length
           && current.every((root, index) => root === nextRoots[index])
           ? current
           : nextRoots
       ));
-    });
+    }), { immediate: true });
     return () => {
       cancelled = true;
+      stop();
     };
-  }, [lastWorktreeByProject, recentProjectRoots]);
+  }, [activeProjectRoot, lastWorktreeByProject, recentProjectRoots]);
 
   useEffect(() => {
     function runShortcutAction(action) {
@@ -704,7 +723,8 @@ export default function App() {
       if (request?.url) openIntegratedBrowserRef.current?.(request.url, { newTab: true });
     });
     const unsubscribeOpenFile = window.goferBrowser?.onOpenFile?.((request) => {
-      if (request?.path) void openLinkedCodeFileRef.current?.(request.path);
+      const target = request?.href ? markdownFileLinkTarget("", request.href) : request;
+      if (target?.path) void openLinkedCodeFileRef.current?.(target.path, { ...target, preview: true });
     });
     const unsubscribeTerminalEditor = window.goferTerminal?.onOpenEditor?.((request) => {
       if (!request?.path || !request?.requestId) return;
@@ -865,7 +885,8 @@ export default function App() {
   async function openLinkedCodeFile(path, options = {}) {
     if (!path) return;
     try {
-      await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
+      const selected = await window.goferDesktop?.workspace?.grantUserPath?.(path);
+      path = selected?.path || path;
       const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
       if (info && !info.isFile) throw new Error(`The link does not point to a file: ${path}`);
       openCodeFile(info?.path || path, options);
@@ -880,26 +901,7 @@ export default function App() {
   openLinkedCodeFileRef.current = openLinkedCodeFile;
 
   async function openRecentCodeFile(path) {
-    if (!path) return;
-    try {
-      await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
-      const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
-      if (info && !info.isFile) throw new Error(`The recent path is not a file: ${path}`);
-      const selectedPath = info?.path || path;
-      if (activeWorkflow?.projectRoot) {
-        openCodeFile(selectedPath);
-        return;
-      }
-      const resolved = await window.goferDesktop?.workspace?.resolveProjectFile?.(selectedPath);
-      const projectRoot = resolved?.directory ?? "";
-      if (!projectRoot) throw new Error("Could not determine the recent file's project folder.");
-      await openProjectAtPath(projectRoot, { focusPath: selectedPath });
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to open recent file",
-      });
-    }
+    await openLinkedCodeFile(path, { preview: false });
   }
 
   async function openAssistantFile(path, projectRoot) {
@@ -1051,9 +1053,13 @@ export default function App() {
   async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
     const requestId = projectOpenRequestRef.current + 1;
     projectOpenRequestRef.current = requestId;
+    projectOpenAbortRef.current?.abort();
+    const controller = new AbortController();
+    projectOpenAbortRef.current = controller;
     setOpeningProjectRoot(projectRoot);
     try {
-      const discoveredPayloads = await withProjectOpenTimeout(discoverProjectWorkflows(projectRoot));
+      const discoveredPayloads = await withProjectOpenTimeout(discoverProjectWorkflows(projectRoot, { signal: controller.signal }));
+      if (projectOpenRequestRef.current !== requestId) return null;
       let mainProjectRoot = projectRoot;
       try {
         const worktreePayload = await withProjectOpenTimeout(Promise.resolve(window.goferDesktop?.workspace?.gitWorktrees?.(projectRoot)), 3000);
@@ -1065,6 +1071,7 @@ export default function App() {
       const discovered = discoveredPayloads.map((workflow) =>
         summarizeWorkflow(workflow, dataDir));
       if (rememberProject) {
+        recentProjectValidatorRef.current.remember(mainProjectRoot, projectRoot);
         setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
         setLastWorktreeByProject((current) => ({ ...current, [mainProjectRoot]: projectRoot }));
       }
@@ -1108,6 +1115,7 @@ export default function App() {
       if (projectOpenRequestRef.current !== requestId) return null;
       throw error;
     } finally {
+      controller.abort();
       if (projectOpenRequestRef.current === requestId) setOpeningProjectRoot("");
     }
   }
@@ -1207,7 +1215,7 @@ export default function App() {
 
   function handleCodeFilesystemChange(change) {
     applyCodeFilesystemChange(change);
-    void loadWorkflows({ silent: true });
+    void loadWorkflows({ discoverProject: true, silent: true });
     if (!change?.path) return;
     if (change.kind === "rename" && change.sourcePath) {
       setCodeOpenPaths((current) => current.map((path) =>
@@ -1383,15 +1391,17 @@ export default function App() {
     if (!silent) {
       setLoadState({ loading: true, error: "" });
     }
+    const requestId = ++workflowLoadRequestRef.current;
     try {
       if (discoverProject && projectRoot) {
-        await discoverProjectWorkflows(projectRoot);
+        await shareInFlight(`discover-project:${projectRoot}`, () => discoverProjectWorkflows(projectRoot));
       }
-      const response = await fetch(apiUrl("/workflows"));
-      if (!response.ok) {
-        throw new Error(`Workflow API returned ${response.status}`);
-      }
-      const payload = await response.json();
+      const payload = await shareInFlight("workflow-list", async () => {
+        const response = await fetch(apiUrl("/workflows"));
+        if (!response.ok) throw new Error(`Workflow API returned ${response.status}`);
+        return response.json();
+      });
+      if (requestId !== workflowLoadRequestRef.current) return;
       const payloadDataDir = payload.dataDir ?? "";
       setPromptAgentIds(payload.promptAgentIds ?? []);
       const listedWorkflows = payload.workflows ?? [];
@@ -1419,7 +1429,7 @@ export default function App() {
             }, refreshedWorkflows)
           : refreshedWorkflows;
 
-        return silent && JSON.stringify(current) === JSON.stringify(mergedWorkflows)
+        return silent && equalJson(current, mergedWorkflows)
           ? current
           : mergedWorkflows;
       });
@@ -1436,6 +1446,7 @@ export default function App() {
       });
       setLoadState({ loading: false, error: "" });
     } catch (error) {
+      if (requestId !== workflowLoadRequestRef.current) return;
       if (!silent) {
         setLoadState({
           loading: false,
@@ -1516,18 +1527,15 @@ export default function App() {
   }, [loadDoctor, loadQueue]);
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      const projectRoot = activeProjectRoot || activeWorkflow?.projectRoot || "";
-      loadWorkflows({
-        discoverProject: Boolean(projectRoot),
-        projectRoot,
-        silent: true,
-      });
-      loadDoctor({ silent: true });
-      loadQueue({ silent: true });
-    }, 2000);
-
-    return () => window.clearInterval(intervalId);
+    const projectRoot = activeProjectRoot || activeWorkflow?.projectRoot || "";
+    return startWorkspacePolling({
+      refreshLive: () => Promise.allSettled([
+        loadWorkflows({ silent: true }),
+        loadQueue({ silent: true }),
+      ]),
+      discover: () => loadWorkflows({ discoverProject: Boolean(projectRoot), projectRoot, silent: true }),
+      doctor: () => loadDoctor({ silent: true }),
+    });
   }, [activeProjectRoot, activeWorkflow?.projectRoot, loadDoctor, loadQueue, loadWorkflows]);
 
   const loadRetentionSettingsForWorkflow = useCallback(async (workflowId) => {
@@ -1674,6 +1682,7 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
       if (requestId !== logRequestRef.current) return;
+      const revision = response.headers?.get("ETag") || "";
       const nextText = payload.log?.logText ?? "";
       const nextPath = payload.log?.logPath ?? null;
       const nextNodeOutputs = payload.log?.nodeOutputs ?? null;
@@ -1684,10 +1693,12 @@ export default function App() {
         if (
           current.text === nextText &&
           current.path === nextPath &&
-          JSON.stringify(current.nodeOutputs ?? null) === JSON.stringify(nextNodeOutputs) &&
-          JSON.stringify(current.usageSummary ?? null) === JSON.stringify(nextUsageSummary) &&
-          JSON.stringify(current.runEvents ?? []) === JSON.stringify(nextRunEvents) &&
-          JSON.stringify(current.runNodes ?? {}) === JSON.stringify(nextRunNodes) &&
+          (revision ? current.revision === revision : (
+            equalJson(current.nodeOutputs ?? null, nextNodeOutputs) &&
+            equalJson(current.usageSummary ?? null, nextUsageSummary) &&
+            equalJson(current.runEvents ?? [], nextRunEvents) &&
+            equalJson(current.runNodes ?? {}, nextRunNodes)
+          )) &&
           current.error === "" &&
           current.loading === false
         ) {
@@ -1696,6 +1707,7 @@ export default function App() {
         return {
           loading: false,
           error: "",
+          revision,
           text: nextText,
           path: nextPath,
           nodeOutputs: nextNodeOutputs,
@@ -1731,7 +1743,7 @@ export default function App() {
       }
       setLogState((current) => {
         const nextRuns = payload.runs ?? [];
-        if (silent && JSON.stringify(current.runs) === JSON.stringify(nextRuns)) {
+        if (silent && equalJson(current.runs, nextRuns)) {
           return current;
         }
         return { ...current, runs: nextRuns };
@@ -1867,17 +1879,13 @@ export default function App() {
       return undefined;
     }
 
-    const intervalId = window.setInterval(() => {
-      if (logState.selectedRunId) {
-        loadRunLog(activeWorkflow.id, logState.selectedRunId, { silent: true });
-      } else {
-        loadLatestLog(activeWorkflow.id, { silent: true });
-      }
-      loadRunLogs(activeWorkflow.id, { silent: true });
-      loadApprovals(activeWorkflow.id, { silent: true });
-    }, 2000);
-
-    return () => window.clearInterval(intervalId);
+    return startPolling(() => Promise.allSettled([
+      logState.selectedRunId
+        ? loadRunLog(activeWorkflow.id, logState.selectedRunId, { silent: true })
+        : loadLatestLog(activeWorkflow.id, { silent: true }),
+      loadRunLogs(activeWorkflow.id, { silent: true }),
+      loadApprovals(activeWorkflow.id, { silent: true }),
+    ]));
   }, [
     activeWorkflow?.id,
     loadApprovals,
@@ -5497,6 +5505,27 @@ export function ChatPane({
   const [threads, setThreads] = useState(loadChatThreads);
   const [activeThreadId, setActiveThreadId] = useState(null);
   const [messagesByThread, setMessagesByThread] = useState({});
+  const conversationCacheRef = useRef(null);
+  const chatStorageErrorsRef = useRef({});
+  if (!conversationCacheRef.current) conversationCacheRef.current = createConversationCache({
+    load: (id) => loadChatMessages(chatStorageKeyFor(id)),
+    save: (id, history) => {
+      try {
+        saveConversationMessages(chatStorageKeyFor(id), history);
+        delete chatStorageErrorsRef.current[id];
+      } catch (error) {
+        const message = `Conversation could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+        chatStorageErrorsRef.current[id] = message;
+        setChatStateByThread((current) => ({ ...current, [id]: { ...current[id], error: message } }));
+        return false;
+      }
+      setThreads((current) => bumpChatThread(current, id));
+      archiveThreadFromStorage(id, history);
+      return true;
+    },
+    changed: setMessagesByThread,
+  });
+  useEffect(() => { persistChatThreads(threads); }, [threads]);
   const [chatStateByThread, setChatStateByThread] = useState({});
   const [chatAnnouncementByThread, setChatAnnouncementByThread] = useState({});
   const [backgroundChatAnnouncement, setBackgroundChatAnnouncement] = useState("");
@@ -5530,7 +5559,7 @@ export function ChatPane({
   const messages = useMemo(
     () =>
       activeThreadId
-        ? messagesByThread[activeThreadId] ?? loadChatMessages(chatStorageKeyFor(activeThreadId))
+        ? messagesByThread[activeThreadId] ?? []
         : [],
     [activeThreadId, messagesByThread],
   );
@@ -5550,13 +5579,9 @@ export function ChatPane({
     () => messages.findLast((message) => message.role === "user")?.id ?? null,
     [messages],
   );
-  const liveTurnLayoutKey = liveTurn?.changes
-    ? `${liveTurn.id}\u0000${JSON.stringify(liveTurn.changes.files ?? [])}`
-    : liveTurn?.id ?? "";
-  const conversationTextKey = useMemo(
-    () => `${messages.map((message) => `${message.id}\u0000${message.body ?? ""}`).join("\u0001")}\u0002${liveTurnLayoutKey}`,
-    [liveTurnLayoutKey, messages],
-  );
+  // Immutable references are layout revisions; do not copy entire bodies into a key.
+  const conversationTextKey = useMemo(() => ({ messages, changes: liveTurn?.changes, id: liveTurn?.id }),
+    [messages, liveTurn?.changes, liveTurn?.id]);
 
   useEffect(() => {
     activeThreadIdRef.current = activeThreadId;
@@ -5614,14 +5639,8 @@ export function ChatPane({
       return;
     }
 
-    setMessagesByThread((current) =>
-      current[activeThreadId]
-        ? current
-        : {
-            ...current,
-            [activeThreadId]: loadChatMessages(chatStorageKeyFor(activeThreadId)),
-          },
-    );
+    conversationCacheRef.current.get(activeThreadId);
+    conversationCacheRef.current.activate([activeThreadId, ...Object.keys(chatAbortControllersRef.current)]);
     setDraft("");
     setAttachments([]);
     setAttachmentError("");
@@ -5631,6 +5650,13 @@ export function ChatPane({
     setConversationMenuOpen(false);
     setScopeMenuOpen(false);
   }, [activeThreadId]);
+
+  useEffect(() => {
+    conversationCacheRef.current.activate([
+      activeThreadId,
+      ...Object.keys(chatStateByThread).filter((id) => chatStateByThread[id]?.sending),
+    ]);
+  }, [activeThreadId, chatStateByThread]);
 
   function addAttachments(files) {
     const result = readChatAttachments(files, attachments);
@@ -5675,9 +5701,11 @@ export function ChatPane({
     addAttachments(textFile ? [...files, textFile] : files);
   }
 
-  function openScopedMarkdownLink(href) {
-    onOpenMarkdownLink?.(href, scopedProjectRoot);
-  }
+  const openMarkdownLinkRef = useRef(onOpenMarkdownLink);
+  openMarkdownLinkRef.current = onOpenMarkdownLink;
+  const openScopedMarkdownLink = useCallback((href) => {
+    openMarkdownLinkRef.current?.(href, scopedProjectRoot);
+  }, [scopedProjectRoot]);
 
   function openScopedFile(path) {
     onOpenFile?.(path, scopedProjectRoot);
@@ -5869,16 +5897,17 @@ export function ChatPane({
           buffer += decoder.decode(value, { stream: !done });
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            const event = parseChatStreamEvent(line);
-            if (!event) continue;
+          conversationCacheRef.current.batch(() => {
+            for (const line of lines) {
+              const event = parseChatStreamEvent(line);
+              if (!event) continue;
 
-            if (event.type === "thought") {
-              const thought = String(event.text ?? "").trim();
-              if (!thought) continue;
-              appendAssistantMessage(thought, "thought", {
-                groupId: thoughtGroupId,
-                trace: event.trace && typeof event.trace === "object" ? event.trace : undefined,
+              if (event.type === "thought") {
+                const thought = String(event.text ?? "").trim();
+                if (!thought) continue;
+                appendAssistantMessage(thought, "thought", {
+                  groupId: thoughtGroupId,
+                  trace: event.trace && typeof event.trace === "object" ? event.trace : undefined,
               });
             } else if (event.type === "compaction") {
               const compactedMessages = Array.isArray(event.messages)
@@ -5920,6 +5949,7 @@ export function ChatPane({
               throw new Error(event.error || "Rem failed");
             }
           }
+          });
         }
         if (done) break;
       }
@@ -5959,7 +5989,7 @@ export function ChatPane({
         ...current,
         [targetThreadId]: {
           sending: false,
-          error: "",
+          error: chatStorageErrorsRef.current[targetThreadId] || "",
           hasNewResponse: activeThreadIdRef.current !== targetThreadId,
         },
       }));
@@ -5983,7 +6013,7 @@ export function ChatPane({
         }
         setChatStateByThread((current) => ({
           ...current,
-          [targetThreadId]: { sending: false, error: "", hasNewResponse: false },
+          [targetThreadId]: { sending: false, error: chatStorageErrorsRef.current[targetThreadId] || "", hasNewResponse: false },
         }));
         setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
         setChatAnnouncementByThread((current) => ({
@@ -6059,21 +6089,16 @@ export function ChatPane({
 
   function updateThreadMessages(threadId, nextValue) {
     if (deletedChatThreadIdsRef.current.has(threadId)) return;
-    setThreads((current) => {
-      const next = bumpChatThread(current, threadId);
-      persistChatThreads(next);
-      return next;
-    });
-    setMessagesByThread((current) => {
-      const currentMessages =
-        current[threadId] ?? loadChatMessages(chatStorageKeyFor(threadId));
-      const nextMessages =
-        typeof nextValue === "function" ? nextValue(currentMessages) : nextValue;
-      window.localStorage.setItem(chatStorageKeyFor(threadId), JSON.stringify(nextMessages));
-      archiveThreadFromStorage(threadId, nextMessages);
-      return { ...current, [threadId]: nextMessages };
-    });
+    conversationCacheRef.current.update(threadId, nextValue);
   }
+
+  const messageActionsRef = useRef(null);
+  messageActionsRef.current = { editUserMessage, toggleAssistantChanges, activeThreadId };
+  const editMessageAction = useCallback((id, body) => messageActionsRef.current.editUserMessage(id, body), []);
+  const undoMessageAction = useCallback((message) => {
+    const actions = messageActionsRef.current;
+    return actions.toggleAssistantChanges(actions.activeThreadId, message.id, message.changes?.id, Boolean(message.changes?.undone));
+  }, []);
 
   function editUserMessage(messageId, body) {
     if (!activeThreadId || chatState.sending) return;
@@ -6174,7 +6199,6 @@ export function ChatPane({
       const nextThreads = threads.map((candidate) =>
         candidate.id === threadId ? scopedThread : candidate,
       );
-      persistChatThreads(nextThreads);
       setThreads(nextThreads);
     }
     if (thread) {
@@ -6217,7 +6241,6 @@ export function ChatPane({
             )
           : thread,
       );
-      persistChatThreads(nextThreads);
       return nextThreads;
     });
     setHomeProjectRoot(root);
@@ -6234,7 +6257,6 @@ export function ChatPane({
     if (!activeThreadId) return;
     setThreads((current) => {
       const next = current.map((thread) => thread.id === activeThreadId ? { ...thread, ...patch } : thread);
-      persistChatThreads(next);
       return next;
     });
   }
@@ -6257,7 +6279,6 @@ export function ChatPane({
             }
           : thread,
       );
-      persistChatThreads(nextThreads);
       return nextThreads;
     });
   }
@@ -6267,7 +6288,7 @@ export function ChatPane({
     chatAbortControllersRef.current[threadId]?.abort();
     delete chatAbortControllersRef.current[threadId];
     const nextThreads = threads.filter((thread) => thread.id !== threadId);
-    const archived = await archiveThreadFromStorage(threadId, loadChatMessages(chatStorageKeyFor(threadId)), true);
+    const archived = await archiveThreadFromStorage(threadId, conversationCacheRef.current.get(threadId), true);
     if (!archived) {
       deletedChatThreadIdsRef.current.delete(threadId);
       setChatStateByThread((current) => ({ ...current, [threadId]: { sending: false, error: "The archive could not be saved. Reconnect the archive folder, or stop archiving in Settings > Memory before deleting this thread." } }));
@@ -6276,12 +6297,9 @@ export function ChatPane({
     deleteStoredChatThread(threadId);
     persistChatThreads(nextThreads);
     setThreads(nextThreads);
-    window.localStorage.removeItem(chatStorageKeyFor(threadId));
-    setMessagesByThread((current) => {
-      const next = { ...current };
-      delete next[threadId];
-      return next;
-    });
+    removeConversationMessages(chatStorageKeyFor(threadId));
+    conversationCacheRef.current.remove(threadId);
+    delete chatStorageErrorsRef.current[threadId];
     setChatStateByThread((current) => {
       const next = { ...current };
       delete next[threadId];
@@ -6516,6 +6534,7 @@ export function ChatPane({
                   key={item.id}
                   expanded={expandedThoughtGroups[item.id] !== false}
                   onOpenLink={openScopedMarkdownLink}
+                  sourcePath={assistantMarkdownSourcePath(scopedProjectRoot)}
                   onOpenFile={openScopedFile}
                   thoughts={item.thoughts}
                   onToggle={() =>
@@ -6530,14 +6549,10 @@ export function ChatPane({
                   key={item.message.id}
                   canEdit={!chatState.sending && item.message.id === latestUserMessageId}
                   message={item.message}
-                  onEdit={editUserMessage}
+                  onEdit={editMessageAction}
                   onOpenLink={openScopedMarkdownLink}
-                  onUndoChanges={() => toggleAssistantChanges(
-                    activeThreadId,
-                    item.message.id,
-                    item.message.changes?.id,
-                    Boolean(item.message.changes?.undone),
-                  )}
+                  sourcePath={assistantMarkdownSourcePath(scopedProjectRoot)}
+                  onUndoChanges={undoMessageAction}
                 />
               ),
             )}
@@ -6685,7 +6700,7 @@ export function scrollConversationToBottom(element) {
   element.scrollTop = element.scrollHeight;
 }
 
-function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUndoChanges }) {
+const ChatMessageBubble = memo(function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUndoChanges, sourcePath }) {
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState(message.body);
@@ -6694,7 +6709,7 @@ function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUnd
   useEffect(() => () => window.clearTimeout(copyResetTimerRef.current), []);
 
   if (message.kind === "turn-summary") {
-    return <TurnSummaryCard message={message} onUndo={onUndoChanges} />;
+    return <TurnSummaryCard message={message} onUndo={() => onUndoChanges(message)} />;
   }
   const isSystem = message.role === "system" || message.kind === "system";
   const isUser = message.role === "user";
@@ -6805,7 +6820,7 @@ function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUnd
               </div>
             ) : message.body ? (
               <>
-                <MarkdownMessage inverse={isUser} onOpenLink={onOpenLink} value={message.body} />
+                <MarkdownMessage inverse={isUser} sourcePath={sourcePath} onOpenLink={onOpenLink} value={message.body} />
                 {!isUser ? (
                   <div className="mt-1 flex justify-end border-t border-line/70 pt-1">
                     <button
@@ -6827,7 +6842,7 @@ function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUnd
       </div>
     </div>
   );
-}
+});
 
 function TurnSummaryCard({ message, onUndo }) {
   const [reviewing, setReviewing] = useState(false);
@@ -7011,18 +7026,19 @@ export function formatAssistantTurnTiming(completedAt, durationMs) {
   return `${completed} · Ran for ${duration}`;
 }
 
-export function MarkdownMessage({ compact = false, inverse = false, onOpenLink, value }) {
+export function MarkdownMessage({ compact = false, inverse = false, onOpenLink, sourcePath, value }) {
   return (
     <MarkdownContent
       compact={compact}
       inverse={inverse}
       value={value}
       onOpenRelativeLink={onOpenLink}
+      sourcePath={sourcePath}
     />
   );
 }
 
-function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) {
+function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, sourcePath, thoughts }) {
   const trace = buildThoughtTrace(thoughts);
   const count = trace.length;
 
@@ -7086,7 +7102,7 @@ function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) 
                   ) : null}
                   {entry.kind === "summary" && entry.body ? (
                     <div className="text-xs leading-5 text-slate-600 dark:text-[#b9b9b9]">
-                      <MarkdownMessage compact onOpenLink={onOpenLink} value={entry.body} />
+                      <MarkdownMessage compact sourcePath={sourcePath} onOpenLink={onOpenLink} value={entry.body} />
                     </div>
                   ) : null}
                 </div>
@@ -7357,7 +7373,7 @@ export function persistChatThreads(threads) {
     const encoded = JSON.stringify(thread);
     if (window.localStorage.getItem(key) !== encoded) {
       window.localStorage.setItem(key, encoded);
-      archiveThreadFromStorage(thread.id, loadChatMessages(chatStorageKeyFor(thread.id)));
+      archiveThreadFromStorage(thread.id, () => loadChatMessages(chatStorageKeyFor(thread.id)));
     }
     index.set(thread.id, { id: thread.id, updatedAt: thread.updatedAt });
   }
@@ -7387,26 +7403,22 @@ function formatThreadDate(value) {
   });
 }
 
-function defaultChatMessages() {
-  return [];
-}
-
 function reportArchiveError(error) {
   window.dispatchEvent?.(new CustomEvent("gofer:archive-error", { detail: error?.message || String(error) }));
 }
+const scheduleConversationArchive = createConversationArchiveScheduler({ reportError: reportArchiveError });
 function archiveThreadFromStorage(threadId, messages, deleted = false) {
   const bridge = window.goferDesktop?.rem;
   if (!bridge?.archive) return Promise.resolve(true);
-  try {
-    const thread = JSON.parse(window.localStorage.getItem(chatThreadMetadataKey(threadId)) || "null") || { id: threadId };
-    return bridge.archive(thread, messages, deleted).then((result) => {
-      if (result?.warnings?.length) reportArchiveError(new Error(result.warnings.join("; ")));
-      return true;
-    }).catch((error) => { reportArchiveError(error); return false; });
-  } catch (error) { reportArchiveError(error); return Promise.resolve(false); }
+  const storage = window.localStorage;
+  return scheduleConversationArchive(threadId, () => {
+    const thread = JSON.parse(storage.getItem(chatThreadMetadataKey(threadId)) || "null") || { id: threadId };
+    return bridge.archive(thread, typeof messages === "function" ? messages() : messages, deleted);
+  }, { deleted });
 }
+
 async function archiveAllConversations() {
-  for (const thread of chatThreadIndex()) await archiveThreadFromStorage(thread.id, loadChatMessages(chatStorageKeyFor(thread.id)));
+  for (const thread of chatThreadIndex()) await archiveThreadFromStorage(thread.id, () => loadChatMessages(chatStorageKeyFor(thread.id)));
 }
 
 export function chatStorageKeyFor(threadId) {
@@ -7414,18 +7426,7 @@ export function chatStorageKeyFor(threadId) {
 }
 
 function loadChatMessages(storageKey) {
-  try {
-    const storedMessages = JSON.parse(window.localStorage.getItem(storageKey) || "null");
-    if (
-      Array.isArray(storedMessages) &&
-      storedMessages.every((message) => message?.role && typeof message.body === "string")
-    ) {
-      return storedMessages;
-    }
-  } catch {
-    return defaultChatMessages();
-  }
-  return defaultChatMessages();
+  return loadConversationMessages(storageKey);
 }
 
 export function buildChatItems(messages) {

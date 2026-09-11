@@ -1,4 +1,4 @@
-/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, MouseEvent, process, self, setTimeout, window */
+/* global localStorage, Storage, Response, ReadableStream, HTMLTextAreaElement, Event, TextEncoder, __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, MouseEvent, process, self, setTimeout, window */
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -66,6 +66,14 @@ async function run() {
     await cleanup(0);
     return;
   }
+  if (process.env.GOFER_CHAT_ONLY === "1") {
+    await exerciseConversationEfficiency();
+    clearTimeout(timeout);
+    assert.deepEqual(rendererErrors, [], "Renderer must not log errors");
+    console.log("Browser conversation efficiency regressions passed.");
+    await cleanup(0);
+    return;
+  }
   if (process.env.GOFER_REM_ONLY === "1") {
     await exerciseRemAvatar();
     clearTimeout(timeout);
@@ -79,11 +87,83 @@ async function run() {
   await exerciseMonacoEditor();
   await exercisePackagedMonacoWorker(baseUrl);
   await exerciseSourceControl();
+  await exerciseConversationEfficiency();
 
   clearTimeout(timeout);
   assert.deepEqual(rendererErrors, [], "Renderer must not log errors");
   console.log("Browser studio accessibility smoke test passed.");
   await cleanup(0);
+}
+
+async function exerciseConversationEfficiency() {
+  await evaluate(() => {
+    const threads = Array.from({ length: 8 }, (_, i) => ({ id: `efficiency-${i}`, title: `Efficiency thread ${i}`, updatedAt: new Date().toISOString(), projectRoot: "/workspace", provider: "codex", model: "gpt-5.6-sol" }));
+    localStorage.setItem("gofer-flow-chat-threads", JSON.stringify(threads.map(({ id, updatedAt }) => ({ id, updatedAt }))));
+    for (const thread of threads) {
+      localStorage.setItem(`gofer-flow-chat-thread-meta:${thread.id}`, JSON.stringify(thread));
+      localStorage.setItem(`gofer-flow-chat-thread:${thread.id}`, JSON.stringify([{ id: `${thread.id}-initial`, role: "assistant", body: `History for ${thread.title}` }]));
+    }
+  });
+  await windowRef.reload();
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-assistant-home]"))));
+  await evaluate(() => {
+    window.__conversationReads = {};
+    window.__conversationWrites = {};
+    const read = Storage.prototype.getItem;
+    const write = Storage.prototype.setItem;
+    Storage.prototype.getItem = function (key) {
+      if (key.startsWith("gofer-flow-chat-thread:")) window.__conversationReads[key] = (window.__conversationReads[key] || 0) + 1;
+      return read.call(this, key);
+    };
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith("gofer-flow-chat-thread:")) window.__conversationWrites[key] = (window.__conversationWrites[key] || 0) + 1;
+      return write.call(this, key, value);
+    };
+    const fetch = window.fetch;
+    window.fetch = (...args) => String(args[0]).includes("/chat/stream")
+      ? Promise.resolve(new Response(new ReadableStream({ start(controller) { window.__conversationStream = controller; } })))
+      : fetch(...args);
+  });
+  async function open(index) {
+    await evaluate((index) => [...document.querySelectorAll("[data-assistant-home] button")].find((button) => button.textContent.includes(`Efficiency thread ${index}`)).click(), index);
+    await waitFor(() => evaluate((index) => document.querySelector("[data-chat-pane]").textContent.includes(`History for Efficiency thread ${index}`), index));
+  }
+  async function back() {
+    await evaluate(() => document.querySelector("button[title='Back to recent threads']").click());
+    await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-assistant-home]"))));
+  }
+  for (let i = 0; i < 8; i++) { await open(i); await back(); }
+  assert.equal(await evaluate(() => window.__conversationReads["gofer-flow-chat-thread:efficiency-0"]), 1, "Initial visit parses history once");
+  await open(0);
+  assert.equal(await evaluate(() => window.__conversationReads["gofer-flow-chat-thread:efficiency-0"]), 2, "Evicted history reloads on return");
+  await evaluate(() => {
+    const textarea = document.querySelector("[data-chat-composer] textarea");
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(textarea, "Test batched thought stream");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await waitFor(() => evaluate(() => !document.querySelector("button[title='Send message']").disabled));
+  await evaluate(() => document.querySelector("button[title='Send message']").click());
+  await waitFor(() => evaluate(() => Boolean(window.__conversationStream)));
+  await evaluate(() => {
+    window.__conversationWrites = {};
+    window.__conversationStream.enqueue(new TextEncoder().encode(Array.from({ length: 100 }, (_, i) => JSON.stringify({ type: "thought", text: `Thought ${i}` })).join("\n") + "\n"));
+  });
+  await waitFor(() => evaluate(() => window.__conversationWrites["gofer-flow-chat-thread:efficiency-0"] === 1));
+  await back();
+  await open(1);
+  await evaluate(() => {
+    window.__conversationStream.enqueue(new TextEncoder().encode(JSON.stringify({ type: "final", message: { body: "Background response complete" } }) + "\n"));
+    window.__conversationStream.close();
+  });
+  await waitFor(() => evaluate(() => window.__conversationWrites["gofer-flow-chat-thread:efficiency-0"] === 2));
+  await back();
+  assert.equal(await evaluate(() => [...document.querySelectorAll("[data-assistant-home] button")].find((button) => button.textContent.includes("Efficiency thread 0")).textContent.includes("Completed")), true);
+  await open(0);
+  assert.equal(await evaluate(() => document.querySelector("[data-chat-pane]").textContent.includes("Background response complete")), true);
+  const history = await evaluate(() => JSON.parse(localStorage.getItem("gofer-flow-chat-thread:efficiency-0")));
+  assert.equal(history.filter((message) => message.kind === "thought").length, 100);
+  assert.equal(history.at(-1).body, "Background response complete");
+  console.log("Conversation fixture: 8 thread visits; one load per first visit; 100 thoughts in one chunk -> one history write; background completion and unread preserved.");
 }
 
 async function exerciseRemAvatar() {
@@ -966,10 +1046,10 @@ function json(response, payload) {
   response.end(JSON.stringify(payload));
 }
 
-async function evaluate(callback) {
+async function evaluate(callback, argument) {
   const result = await windowRef.webContents.executeJavaScript(`(() => {
     try {
-      return { value: (${callback.toString()})() };
+      return { value: (${callback.toString()})(${JSON.stringify(argument) ?? "undefined"}) };
     } catch (error) {
       return { error: String(error?.stack || error) };
     }
@@ -1060,7 +1140,7 @@ async function exerciseSourceControl() {
     const screenshot = await windowRef.webContents.capturePage();
     fs.writeFileSync(`/tmp/taskurotta-source-control-${dark ? "dark" : "light"}.png`, screenshot.toPNG());
   }
-  await evaluate(() => document.querySelector("#scm-tab-worktrees").click());
+  await evaluate(() => document.querySelector("#scm-tab-branches").click());
   for (const dark of [false, true]) {
     windowRef.webContents.sendInputEvent({ type: "mouseMove", x: 10, y: 10 });
     await wait(50);

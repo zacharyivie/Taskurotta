@@ -58,7 +58,7 @@ export default function GitIntegrationControls({ rootPath, sourceControl, worktr
   const unavailable = busy || disabled;
   const previewLabel = preview?.action?.startsWith("rebase") ? "Rebase" : (integrationOperations.find(([value]) => value === (preview?.value?.strategy || "merge"))?.[1] || "Merge");
   return <div className="space-y-4 text-xs">
-    {source ? <section ref={integrationRef} aria-label="Integrate worktree" className="mt-3 space-y-3 border-t border-line pt-3">
+    {source ? <section ref={integrationRef} aria-label="Integrate branch" className="mt-3 space-y-3 border-t border-line pt-3">
       <div className="flex items-center justify-between gap-2"><strong className="min-w-0 break-all">Integrate {source}</strong><button type="button" className={button} disabled={unavailable} onClick={() => onSourceChange("")}>Close</button></div>
       <label className="block">Operation<select aria-label="Integration operation" className="mt-1 w-full rounded border border-line bg-canvas p-2" value={kind} disabled={unavailable} onChange={event => { setKind(event.target.value); setPreview(null); }}>{integrationOperations.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       <label className="block">Target branch<select aria-label="Target branch" className="mt-1 w-full rounded border border-line bg-canvas p-2" value={target} disabled={unavailable} onChange={event => { setTarget(event.target.value); setPreview(null); }}><option value="">Choose a branch</option>{sourceControl.branches?.filter(b => b !== source).map(b => <option key={b} value={b}>{b}</option>)}</select></label>
@@ -80,7 +80,7 @@ export default function GitIntegrationControls({ rootPath, sourceControl, worktr
         const stash = preview.action === "stash-preview";
         if (window.confirm(stash ? "Apply this stash? The saved stash will be kept. Conflicts will pause for resolution." : `${previewLabel} ${preview.value.source} ${preview.action.startsWith("rebase") ? "onto" : "into"} ${preview.value.target}? Conflicts will pause for resolution.`)) void run(stash ? "stash-apply-selected" : preview.action.replace("preview", "branch"), { ...preview.value, sourceHash: preview.sourceHash, targetHash: preview.targetHash });
       }}>{preview.action === "stash-preview" ? "Apply stash" : `${previewLabel} branch`}</button><button type="button" className={button} disabled={unavailable} onClick={() => setPreview(null)}>Close preview</button></div>
-      {preview.action === "stash-preview" ? <p className="text-muted">Applying keeps the stash as a backup.</p> : <p className="text-muted">{preview.value.strategy === "squash" ? "Review and commit the staged squash result before removing the source worktree." : "After a successful merge, use Remove worktree to close the source worktree. Its branch is kept."}</p>}
+      {preview.action === "stash-preview" ? <p className="text-muted">Applying keeps the stash as a backup.</p> : <p className="text-muted">{preview.value.strategy === "squash" ? "Review and commit the staged squash result before removing the source worktree." : "After a successful merge, you can delete the source branch when you no longer need it. Remove its worktree first if it has one."}</p>}
     </section> : null}
   </div>;
 }

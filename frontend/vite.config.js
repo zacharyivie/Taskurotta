@@ -8,7 +8,14 @@ export default defineConfig({
   build: {
     chunkSizeWarningLimit: 3100,
   },
-  plugins: [react()],
+  plugins: [react(), {
+    name: "development-studio-csp",
+    apply: "serve",
+    transformIndexHtml(html) {
+      return html.replace("script-src 'self';", "script-src 'self' 'unsafe-inline';")
+        .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*");
+    },
+  }],
   server: {
     proxy: {
       "/api": {

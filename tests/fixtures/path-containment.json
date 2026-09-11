@@ -1,0 +1,174 @@
+{
+  "cases": [
+    {
+      "name": "existing child",
+      "root": "inside",
+      "candidate": "inside/file.txt",
+      "files": [
+        "inside/file.txt"
+      ],
+      "allowed": true
+    },
+    {
+      "name": "missing child",
+      "root": "inside",
+      "candidate": "inside/new/file.txt",
+      "allowed": true
+    },
+    {
+      "name": "sibling prefix",
+      "root": "inside",
+      "candidate": "inside-other/file.txt",
+      "allowed": false
+    },
+    {
+      "name": "parent traversal",
+      "root": "inside",
+      "candidate": "inside/new/../../outside/file.txt",
+      "allowed": false
+    },
+    {
+      "name": "existing outside link",
+      "root": "inside",
+      "candidate": "inside/link.txt",
+      "files": [
+        "outside/file.txt"
+      ],
+      "links": [
+        {
+          "path": "inside/link.txt",
+          "target": "outside/file.txt"
+        }
+      ],
+      "allowed": false
+    },
+    {
+      "name": "dangling outside link",
+      "root": "inside",
+      "candidate": "inside/link.txt",
+      "links": [
+        {
+          "path": "inside/link.txt",
+          "target": "outside/missing.txt"
+        }
+      ],
+      "allowed": false
+    },
+    {
+      "name": "existing parent link",
+      "root": "inside",
+      "candidate": "inside/link/new.txt",
+      "directories": [
+        "outside"
+      ],
+      "links": [
+        {
+          "path": "inside/link",
+          "target": "outside"
+        }
+      ],
+      "allowed": false
+    },
+    {
+      "name": "broken parent link",
+      "root": "inside",
+      "candidate": "inside/link/new.txt",
+      "links": [
+        {
+          "path": "inside/link",
+          "target": "outside/missing"
+        }
+      ],
+      "allowed": false
+    },
+    {
+      "name": "inside link",
+      "root": "inside",
+      "candidate": "inside/link.txt",
+      "files": [
+        "inside/file.txt"
+      ],
+      "links": [
+        {
+          "path": "inside/link.txt",
+          "target": "inside/file.txt"
+        }
+      ],
+      "allowed": true
+    },
+    {
+      "name": "symlink loop",
+      "root": "inside",
+      "candidate": "inside/link.txt",
+      "links": [
+        {
+          "path": "inside/link.txt",
+          "target": "inside/link.txt"
+        }
+      ],
+      "allowed": false
+    }
+  ],
+  "lexicalCases": [
+    {
+      "platform": "linux",
+      "root": "/projects/app",
+      "candidate": "/projects/app/src/file",
+      "allowed": true
+    },
+    {
+      "platform": "linux",
+      "root": "/projects/app",
+      "candidate": "/projects/application/file",
+      "allowed": false
+    },
+    {
+      "platform": "linux",
+      "root": "/projects/app",
+      "candidate": "/projects/app/../secret",
+      "allowed": false
+    },
+    {
+      "platform": "linux",
+      "root": "/",
+      "candidate": "/projects/app",
+      "allowed": true
+    },
+    {
+      "platform": "win32",
+      "root": "C:\\Projects\\App",
+      "candidate": "c:/projects/app/src/file",
+      "allowed": true
+    },
+    {
+      "platform": "win32",
+      "root": "C:\\Projects\\App",
+      "candidate": "C:\\Projects\\Application\\file",
+      "allowed": false
+    },
+    {
+      "platform": "win32",
+      "root": "C:\\Projects\\App",
+      "candidate": "C:\\Projects\\App\\..\\secret",
+      "allowed": false
+    },
+    {
+      "platform": "win32",
+      "root": "C:\\Projects\\App",
+      "candidate": "D:\\Projects\\App\\file",
+      "allowed": false
+    },
+    {
+      "platform": "win32",
+      "root": "\\\\server\\share\\App",
+      "candidate": "\\\\SERVER\\SHARE\\app\\file",
+      "allowed": true
+    },
+    {
+      "platform": "win32",
+      "root": "\\\\server\\share\\App",
+      "candidate": "\\\\server\\other\\App\\file",
+      "allowed": false
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import tomli_w
 from gofer.core.operations import SubflowOperation
 from gofer.core.resources import ResourceLimits, bundle_resource_limits_from_env
 from gofer.core.workflow import AgenticWorkflow, WebhookTriggerConfig, validate_workflow_id
+from gofer.utils.atomic_output import atomic_binary_output
 
 BUNDLE_FORMAT_VERSION = 1
 MANIFEST_PATH = "manifest.json"
@@ -203,20 +204,22 @@ def export_workflow_bundle(
         external_requirements=[item.to_dict() for item in external],
         notes=notes,
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(MANIFEST_PATH, json.dumps(manifest.to_dict(), indent=2) + "\n")
-        archive.writestr(WORKFLOW_PATH, tomli_w.dumps(sanitized))
-        for item in included:
-            if item.source.is_dir():
-                for file_path in sorted(path for path in item.source.rglob("*") if path.is_file()):
-                    rel = file_path.relative_to(item.source).as_posix()
-                    archive.writestr(
-                        _safe_archive_join(item.archive_path, rel),
-                        file_path.read_bytes(),
-                    )
-            else:
-                archive.write(item.source, item.archive_path)
+    with atomic_binary_output(output_path) as output:
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(MANIFEST_PATH, json.dumps(manifest.to_dict(), indent=2) + "\n")
+            archive.writestr(WORKFLOW_PATH, tomli_w.dumps(sanitized))
+            for item in included:
+                if item.source.is_dir():
+                    for file_path in sorted(
+                        path for path in item.source.rglob("*") if path.is_file()
+                    ):
+                        rel = file_path.relative_to(item.source).as_posix()
+                        archive.writestr(
+                            _safe_archive_join(item.archive_path, rel),
+                            file_path.read_bytes(),
+                        )
+                else:
+                    archive.write(item.source, item.archive_path)
     return manifest
 
 

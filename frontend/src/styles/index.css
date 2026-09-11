@@ -652,6 +652,7 @@ select:focus-visible,
   width: 112px;
   height: 112px;
   margin-inline: auto;
+  background: transparent;
   overflow: hidden;
   border-radius: 12px;
   isolation: isolate;
@@ -665,6 +666,7 @@ select:focus-visible,
   user-select: none;
   pointer-events: none;
 }
+.rem-avatar-filter { position: absolute; }
 .rem-avatar-eyelid {
   clip-path: inset(28% 33% 63% 57%);
   opacity: 0;
@@ -676,10 +678,11 @@ select:focus-visible,
 .rem-avatar[data-animated="true"][data-blinking="true"] .rem-avatar-eyelid { transition-duration: 55ms; }
 .rem-avatar[data-blinking="true"] .rem-avatar-eyelid { opacity: 1; }
 .rem-avatar-sleep { opacity: 0; }
-.rem-avatar[data-motion="true"] .rem-avatar-seated,
+.rem-avatar[data-motion="true"][data-pose="sleeping"] .rem-avatar-seated,
 .rem-avatar[data-motion="true"] .rem-avatar-sleep {
   transition: opacity 500ms cubic-bezier(0.45, 0, 0.55, 1);
 }
+.rem-avatar[data-pose="waving"] .rem-avatar-seated { opacity: 0; }
 .rem-avatar[data-pose="sleeping"] .rem-avatar-seated { opacity: 0; }
 .rem-avatar[data-pose="sleeping"] .rem-avatar-sleep { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {

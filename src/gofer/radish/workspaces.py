@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import stat
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +16,11 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
 from gofer.radish.contracts import canonical_json_bytes
+from gofer.utils.atomic_output import (
+    atomic_binary_output,
+    mkdir_without_links,
+    remove_tree_without_links,
+)
 from gofer.utils.paths import get_data_dir
 
 REGISTRY_VERSION = 1
@@ -110,7 +114,7 @@ def create_registered_workflow(
     try:
         from gofer.radish.artifacts import compile_radish_file
 
-        workflow_root.mkdir(parents=True, exist_ok=False)
+        mkdir_without_links(workflow_root, exclusive=True)
         workspace_created = True
         entrypoint = workflow_root / WORKFLOW_ENTRYPOINT
         _write_text_atomic(entrypoint, _initial_source(workflow_name))
@@ -134,7 +138,10 @@ def create_registered_workflow(
         _write_registry(registry_root, document)
     except Exception:
         if workspace_created:
-            shutil.rmtree(workflow_root, ignore_errors=True)
+            try:
+                remove_tree_without_links(workflow_root)
+            except OSError:
+                pass
         raise
     return registered
 
@@ -166,11 +173,31 @@ def install_registered_workflow(
         project_root,
     )
     workflow_root = project_root / WORKSPACE_DIRECTORY / workflow_id
-    workflow_root.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_without_links(workflow_root.parent)
     installed = False
     try:
-        shutil.move(str(staged_root), str(workflow_root))
+        mkdir_without_links(workflow_root, exclusive=True)
         installed = True
+        # Copy only validated regular files. Each destination is independently
+        # opened below no-follow parents, including directories created mid-copy.
+        for directory, folders, files in os.walk(staged_root, followlinks=False):
+            relative = Path(directory).relative_to(staged_root)
+            for folder in folders:
+                if (Path(directory) / folder).is_symlink():
+                    raise RadishWorkspaceError("Imported workflow contains a directory link")
+                mkdir_without_links(workflow_root / relative / folder)
+            for filename in files:
+                source = Path(directory) / filename
+                if source.is_symlink() or not source.is_file():
+                    raise RadishWorkspaceError("Imported workflow contains a non-regular file")
+                with (
+                    source.open("rb") as input_file,
+                    atomic_binary_output(workflow_root / relative / filename) as output,
+                ):
+                    shutil.copyfileobj(input_file, output, 1024 * 1024)
+                    if os.name != "nt":
+                        os.fchmod(output.fileno(), source.stat().st_mode & 0o777)
+        shutil.rmtree(staged_root)
         entrypoint = workflow_root / WORKFLOW_ENTRYPOINT
         if not (workflow_root / WORKFLOW_METADATA).is_file():
             _write_json_atomic(workflow_root / WORKFLOW_METADATA, _initial_metadata())
@@ -193,7 +220,10 @@ def install_registered_workflow(
         return registered
     except Exception:
         if installed:
-            shutil.rmtree(workflow_root, ignore_errors=True)
+            try:
+                remove_tree_without_links(workflow_root)
+            except OSError:
+                pass
         raise
 
 
@@ -208,17 +238,21 @@ def discover_registered_workflows(
         raise RadishWorkspaceError(f"Project folder does not exist: {project_root}")
 
     workspace_root = project_root / WORKSPACE_DIRECTORY
+    if workspace_root.is_symlink():
+        raise RadishWorkspaceError("The workflow workspace must not be a symbolic link")
     candidates: dict[Path, list[Path]] = {}
     for directory, child_directories, files in os.walk(workspace_root):
         child_directories[:] = sorted(
             child
             for child in child_directories
-            if child not in DISCOVERY_IGNORED_DIRECTORIES and not child.startswith(".")
+            if child not in DISCOVERY_IGNORED_DIRECTORIES
+            and not child.startswith(".")
+            and not (Path(directory) / child).is_symlink()
         )
         radish_files = sorted(
             Path(directory, filename).resolve()
             for filename in files
-            if filename.lower().endswith(".rad")
+            if filename.lower().endswith(".rad") and not Path(directory, filename).is_symlink()
         )
         if radish_files:
             candidates[Path(directory).resolve()] = radish_files
@@ -333,7 +367,7 @@ def delete_registered_workflow(
             f"Refusing to delete workflow outside {workspace_root}: {workflow.workflow_root}"
         )
     if workflow.workflow_root.exists():
-        shutil.rmtree(workflow.workflow_root, onerror=_remove_readonly_file)
+        remove_tree_without_links(workflow.workflow_root, onerror=_remove_readonly_file)
     document["workflows"].pop(index)
     _write_registry(registry_root, document)
     return workflow
@@ -527,11 +561,8 @@ def _write_text_atomic(path: Path, content: str) -> None:
 
 
 def _write_bytes_atomic(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_bytes(content)
-        os.replace(temporary, path)
+        with atomic_binary_output(path) as output:
+            output.write(content)
     except OSError as exc:
-        temporary.unlink(missing_ok=True)
         raise RadishWorkspaceError(f"Could not write {path}: {exc}") from exc

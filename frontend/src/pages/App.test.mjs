@@ -3700,6 +3700,53 @@ test("Open File opens a selected file when the project is already loaded and no 
   await dom.unmount();
 });
 
+test("rapid project opens skip obsolete worktree reads and keep the latest selection", async () => {
+  const roots = ["/project-a", "/project-b", "/project-c"];
+  const pending = new Map(roots.map(root => [root, createDeferred()]));
+  const gitCalls = [];
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([])),
+    (url, options) => url === "/api/projects/open" ? {
+      ok: true,
+      status: 200,
+      // Deliberately ignore abort to also exercise the generation guard.
+      json: () => pending.get(JSON.parse(options.body).projectRoot).promise,
+    } : null,
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock, {
+    storage: { "gofer.recentProjects": JSON.stringify(roots) },
+    desktop: { workspace: {
+      trustProjectRoot: async () => {},
+      gitWorktrees: async root => {
+        gitCalls.push(root);
+        return { worktrees: [{ path: root }] };
+      },
+    } },
+  });
+  try {
+    await dom.flush();
+    for (const root of roots) {
+      await dom.click(dom.byText("File"));
+      await dom.click(dom.ancestor(dom.byText("Recent Projects"), "BUTTON"));
+      await dom.click(dom.ancestor(dom.byText(root.slice(1)), "BUTTON"));
+    }
+    const opens = fetchMock.calls.filter(call => call.url === "/api/projects/open");
+    assert.equal(opens.length, 3);
+    assert.equal(opens[0].options.signal.aborted, true);
+    assert.equal(opens[1].options.signal.aborted, true);
+    pending.get(roots[2]).resolve({ workflows: [] });
+    await dom.flush();
+    pending.get(roots[0]).resolve({ workflows: [] });
+    pending.get(roots[1]).resolve({ workflows: [] });
+    await dom.flush();
+    assert.deepEqual(gitCalls, [roots[2]]);
+    assert.equal(appModule.loadStudioSession().projectRoot, roots[2]);
+  } finally {
+    for (const deferred of pending.values()) deferred.resolve({ workflows: [] });
+    await dom.unmount();
+  }
+});
+
 test("project workflow discovery registers Radish files before a workflow refresh", async () => {
   const trusted = [];
   const workflow = {
@@ -4785,7 +4832,7 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
     dom.fetchCalls.some(
       (call) => call.url === "/api/projects/open" && call.options.method === "POST",
     ),
-    true,
+    false,
   );
 
   await dom.click(dom.byTitle("Validate workflow"));
@@ -7401,7 +7448,7 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     },
   });
   assert.deepEqual(worktreeCalls[1], [
-    "-C", existingWorktreePath, "worktree", "prune", "--expire", "now",
+    "-C", existingWorktreePath, "worktree", "list", "--porcelain",
   ]);
   assert.deepEqual(listedWorktrees.worktrees, [{
     bare: false,
@@ -7513,7 +7560,7 @@ test("source control requires explicit confirmation to discard worktree changes 
     } } },
   );
   await dom.click(dom.byLabel("Source control"));
-  await dom.click(dom.byText("Worktrees"));
+  await dom.click(dom.byText("Branches"));
   await dom.click(dom.byLabel("Remove feature worktree"));
   assert.match(dom.text(), /The branch will be kept/);
   assert.deepEqual(calls, []);
@@ -7581,7 +7628,7 @@ test("source control keeps the Worktrees tab selected when switching worktrees",
     } } },
   );
   await dom.click(dom.byLabel("Source control"));
-  await dom.click(dom.byText("Worktrees"));
+  await dom.click(dom.byText("Branches"));
   const worktreeButton = (root) => dom.allByTitle(root).find((node) => node.tagName === "BUTTON");
   delayStatus = true;
   for (const root of [roots[1], roots[0]]) {
@@ -7660,7 +7707,7 @@ test("commit history refreshes in the background and rows expand on click", asyn
   assert.equal(historyCalls, 1);
   assert.doesNotMatch(dom.text(), /\b1 commits\b/);
 
-  await dom.click(dom.byText("Worktrees"));
+  await dom.click(dom.byText("Branches"));
   const activeWorktree = dom.ancestor(dom.byText("main"), "BUTTON");
   assert.equal(activeWorktree.getAttribute("aria-current"), "page");
   assert.doesNotMatch(dom.text(), /old-feature|missing · Missing/);
@@ -7826,7 +7873,6 @@ test("Electron integrated browser uses locked-down webview guests", () => {
   assert.match(source, /edit-local-html/);
   assert.match(source, /closeBrowserSession/);
   assert.match(source, /gofer:browser-open-file/);
-  assert.match(source, /isMarkdownFilePath/);
   assert.match(source, /event\.senderFrame !== contents\.mainFrame/);
   assert.match(source, /gofer:browser-navigation/);
   assert.match(source, /contents\.navigationHistory\.goBack\(\)/);
@@ -7868,9 +7914,10 @@ test("open editors refresh Git baselines after external branch changes", () => {
     path.join(repoRoot, "frontend/src/components/CodeWorkspace.jsx"),
     "utf8",
   );
-  assert.match(source, /setInterval\(refresh, 2000\)/);
-  assert.match(source, /addEventListener\("focus", refresh\)/);
-  assert.match(source, /addEventListener\("visibilitychange", refresh\)/);
+  assert.match(source, /startPolling\(refreshGitBaseline\)/);
+  const polling = fs.readFileSync(path.join(repoRoot, "frontend/src/lib/refresh.js"), "utf8");
+  assert.match(polling, /addEventListener\("focus", wake\)/);
+  assert.match(polling, /addEventListener\("visibilitychange", wake\)/);
 });
 
 test("recent project selection always rediscovers the selected folder", () => {
@@ -8851,7 +8898,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   const exposed = runPreload({
     argv: ["electron", "preload", "--gofer-api-base-url=http://localhost:9000"],
     invoke(channel, payload) {
-      if (channel === "gofer:grant-path") {
+      if (["gofer:grant-path", "gofer:grant-dropped-path"].includes(channel)) {
         return { grantId: `grant-${payload.targetPath}`, path: payload.targetPath };
       }
       return { channel, payload };
@@ -8860,6 +8907,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
 
   assert.equal(exposed.goferApiBaseUrl, "http://localhost:9000");
   assert.deepEqual(Object.keys(exposed.goferDesktop).sort(), [
+    "apiSession",
     "appearance",
     "dataDirectory",
     "developer",
@@ -8886,6 +8934,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "gitStatus",
     "gitSwitchBranch",
     "gitWorktrees",
+    "grantUserPath",
     "listDirectory",
     "openPath",
     "pathGrantForApi",
@@ -9088,7 +9137,7 @@ test("Electron preload refreshes an existing project grant with the backend", as
     argv: ["electron", "preload"],
     invoke(channel, payload) {
       calls.push({ channel, payload });
-      if (channel === "gofer:grant-path") {
+      if (["gofer:grant-path", "gofer:grant-dropped-path"].includes(channel)) {
         return { grantId: "grant-project", path: payload.targetPath };
       }
       return { channel, payload };
@@ -9154,7 +9203,7 @@ test("Electron preload rejects unsafe remote API base URLs", () => {
   assert.equal(exposed.goferApiBaseUrl, "http://127.0.0.1:8765");
 });
 
-function runBrowserPreload() {
+function runBrowserPreload(location = "https://example.com/start") {
   const listeners = new Map();
   const sent = [];
   const source = fs.readFileSync(
@@ -9179,7 +9228,7 @@ function runBrowserPreload() {
       addEventListener(type, listener) {
         listeners.set(type, listener);
       },
-      location: { href: "https://example.com/start" },
+      location: { href: location },
     },
   };
 
@@ -10330,7 +10379,8 @@ test("archive continues when old attachments are missing and rejects symlink des
     const snapshot = JSON.parse(fs.readFileSync(path.join(root, "threads", `${result.id}.json`), "utf8"));
     assert.equal(snapshot.messages[0].body, "Historic text");
     assert.match(snapshot.messages[0].attachments[0].archiveError, /gone.txt/);
-    fs.symlinkSync(path.join(root, "must-not-create"), path.join(root, "index.json.tmp"));
+    fs.unlinkSync(path.join(root, "index.json"));
+    fs.symlinkSync(path.join(root, "must-not-create"), path.join(root, "index.json"));
     assert.throws(() => archiveConversation(root, { id: "t" }, []), /symbolic links/);
     assert.equal(fs.existsSync(path.join(root, "must-not-create")), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -10780,7 +10830,7 @@ test("source control orders groups, omits tab counts, and scopes bulk actions", 
     await dom.click(dom.byLabel("Source control"));
     await dom.flush();
     assert.ok(dom.text().indexOf("Staged · 1") < dom.text().indexOf("Unstaged · 2"));
-    for (const label of ["Changes", "History", "Worktrees"]) {
+    for (const label of ["Changes", "History", "Branches"]) {
       assert.equal(dom.byText(label).textContent, label);
     }
     assert.ok(dom.byLabel("Discard unstaged changes to first.txt"));
@@ -11259,7 +11309,7 @@ test("source control exposes conflicts and locks parent controls during integrat
   assert.equal(reactProps(dom.byLabel("Stage code.py")).disabled, false);
   await dom.click(dom.byTitle("code.py")); assert.deepEqual(opened[0], ["/repo/code.py", { diff: true, gitGroup: "unstaged" }]);
   assert.equal(reactProps(dom.byText("Continue merge")).disabled, true);
-  await dom.click(dom.byText("Worktrees")); await dom.click(dom.byLabel("Integrate feature worktree"));
+  await dom.click(dom.byText("Branches")); await dom.click(dom.byLabel("Integrate feature worktree"));
   await dom.change(dom.byLabel("Target branch"), "main"); await dom.click(dom.byText("Preview merge"));
   assert.equal(reactProps(dom.byLabel("Remove feature worktree")).disabled, true);
   await React.act(async () => { finishPreview({ diff: "+new", conflicts: ["code.py"], notice: "1 file will conflict." }); });
@@ -11297,7 +11347,7 @@ test("worktree context menus list operations and defer target selection without 
     window.innerWidth = 1024;
     window.innerHeight = 768;
     await dom.click(dom.byLabel("Source control")); await dom.flush();
-    await dom.click(dom.byText("Worktrees"));
+    await dom.click(dom.byText("Branches"));
     const icon = dom.byLabel("Integrate feature worktree");
     assert.equal(textOf(icon), "");
     const row = icon.parentNode;
@@ -11428,7 +11478,7 @@ test("commit history menu requests resets and prepopulates a worktree at the sel
     await dom.flush();
     assert.deepEqual(calls.at(-1), { action: "branch-commit", value: { hash, branch: "history-branch" } });
     await open(); await dom.click(allElements(document.body).find(el => el.getAttribute("data-operation") === "worktree-commit"));
-    assert.equal(dom.byText("Worktrees").getAttribute("aria-selected"), "true");
+    assert.equal(dom.byText("Branches").getAttribute("aria-selected"), "true");
     assert.match(dom.text(), /Starting at aaaaaaaa/);
   } finally { window.confirm = confirm; await dom.unmount(); }
 });
@@ -11522,6 +11572,7 @@ test("Electron folder registration reports failures without leaking credentials 
   const handle = { path: "/outside/brain", grantId: "private-grant" };
   let response;
   const sandbox = {
+    getIpcSecurity: () => ({ isUserGrant: () => false }),
     activeApiBaseUrl: "http://127.0.0.1:1234",
     desktopGrantSecret: "private-secret",
     activeUiApiToken: "private-token",
@@ -11606,4 +11657,370 @@ test("Rem stops before sending chat when folder renewal fails and allows retry",
   assert.equal(fetchMock.calls.filter(call => call.url === "/api/chat/stream").length, 1);
   assert.match(dom.text(), /Recovered reply/);
   await dom.unmount();
+});
+
+test('workspace keeps dirty tabs when closing is cancelled or the editor cannot save', async () => {
+  const filePath = '/repo/unsaved.png';
+  const closed = [], discarded = [];
+  function DirtyWorkspace() {
+    const [openPaths, setOpenPaths] = React.useState([filePath]);
+    return React.createElement(codeWorkspaceModule.default, {
+      active: true,
+      activePath: filePath,
+      openPaths,
+      radishDirty: true,
+      settings: { ...settingsModule.DEFAULT_APP_SETTINGS, general: { ...settingsModule.DEFAULT_APP_SETTINGS.general, autosave: false } },
+      workflow: { projectRoot: '/repo', sourcePath: filePath },
+      onClosePaths: paths => {
+        closed.push(...paths);
+        setOpenPaths(current => current.filter(path => !paths.includes(path)));
+      },
+      onRadishDiscard: () => discarded.push(filePath),
+    });
+  }
+  // The editor is unavailable in this harness, so Save returns null. The
+  // workspace must retain the dirty document on this unsuccessful result.
+  const dom = await mountReact(React.createElement(DirtyWorkspace), createFetchMock([]));
+  try {
+    await dom.click(dom.byLabel('Close unsaved.png'));
+    await dom.click(dom.ancestor(dom.byText('Cancel'), 'BUTTON'));
+    assert.deepEqual(closed, []);
+    assert.ok(dom.byLabel('Unsaved changes'));
+    await dom.click(dom.byLabel('Close unsaved.png'));
+    await dom.click(allElements(dom.container).find(node => node.tagName === 'BUTTON' && directText(node).trim() === 'Save'));
+    await dom.flush();
+    assert.match(dom.text(), /couldn't save every file/);
+    assert.deepEqual(closed, []);
+    assert.deepEqual(discarded, []);
+    assert.ok(dom.byLabel('Unsaved changes'));
+    await dom.click(dom.ancestor(dom.byText('Discard changes'), 'BUTTON'));
+    await dom.flush();
+    assert.deepEqual(closed, [filePath]);
+    assert.deepEqual(discarded, [filePath]);
+    assert.equal(allElements(dom.container).some(node => node.getAttribute?.('aria-label') === 'Close unsaved.png'), false);
+  } finally { await dom.unmount(); }
+});
+
+
+test("recent projects drop deleted folders and reset missing worktree selections on focus", async () => {
+  const directories = new Set(["/main", "/feature", "/deleted"]);
+  const dom = await mountReact(React.createElement(appModule.default), createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([])),
+    jsonResponse("/api/projects/open", { workflows: [] }, { method: "POST" }),
+  ]), {
+    storage: {
+      "taskurotta.studioSession.v1": JSON.stringify({ projectRoot: "/feature", view: "code" }),
+      "gofer.recentProjects": JSON.stringify(["/main", "/deleted"]),
+      "gofer.lastWorktreeByProject": JSON.stringify({ "/main": "/feature", "/deleted": "/deleted" }),
+    },
+    desktop: { workspace: {
+      trustProjectRoot: async root => {
+        if (!directories.has(root)) throw new Error(`Path does not exist: ${root}`);
+      },
+      getPathInfo: async root => ({ isDirectory: directories.has(root) }),
+      gitWorktrees: async root => ({ worktrees: [{ path: root === "/feature" ? "/main" : root }] }),
+    } },
+  });
+  try {
+    await dom.flush();
+    directories.delete("/feature");
+    directories.delete("/deleted");
+    await dom.dispatchWindow("focus");
+    await dom.flush();
+    assert.deepEqual(JSON.parse(window.localStorage.getItem("gofer.recentProjects")), ["/main"]);
+    assert.deepEqual(JSON.parse(window.localStorage.getItem("gofer.lastWorktreeByProject")), { "/main": "/main" });
+    await dom.click(dom.byText("File"));
+    await dom.click(dom.ancestor(dom.byText("Recent Projects"), "BUTTON"));
+    assert.ok(dom.byText("main"));
+    assert.throws(() => dom.byText("deleted"));
+    assert.doesNotMatch(dom.text(), /Path does not exist/);
+    assert.equal(appModule.loadStudioSession().projectRoot, "/main");
+    directories.delete("/main");
+    await dom.dispatchWindow("focus");
+    await dom.flush();
+    assert.equal(appModule.loadStudioSession().projectRoot, "");
+    assert.deepEqual(JSON.parse(window.localStorage.getItem("gofer.recentProjects")), []);
+  } finally { await dom.unmount(); }
+});
+
+
+test("Electron preload clears stale grants when renewal reports a missing folder", async () => {
+  let missing = false;
+  const exposed = runPreload({ argv: ["electron", "preload"], invoke(_channel, payload) {
+    return missing ? { missing: true } : { path: payload.targetPath, grantId: "fixture-grant" };
+  } });
+  const workspace = exposed.goferDesktop.workspace;
+  await workspace.trustProjectRoot("/project");
+  assert.equal(workspace.pathGrantForApi("/project"), "fixture-grant");
+  missing = true;
+  await assert.rejects(workspace.trustProjectRoot("/project"), /Path does not exist/);
+  assert.equal(workspace.pathGrantForApi("/project"), "");
+});
+
+test("worktree list removes externally deleted entries on focus", async () => {
+  let items = [{ path: "/main", branch: "main", main: true }, { path: "/feature", branch: "feature" }];
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, {
+    workflow: { projectRoot: "/main" }, onOpenFile() {},
+  }), createFetchMock([]), { desktop: { workspace: {
+    listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => ({ active: true, entries: [], branch: "main" }),
+    gitHistory: async () => ({ active: true, commits: [] }),
+    gitWorktrees: async () => ({ active: true, worktrees: items }),
+  } } });
+  try {
+    await dom.click(dom.byLabel("Source control"));
+    await dom.click(dom.byText("Branches"));
+    assert.ok(dom.byLabel("Remove feature worktree"));
+    items = items.slice(0, 1);
+    await dom.dispatchWindow("focus");
+    await dom.flush();
+    assert.throws(() => dom.byLabel("Remove feature worktree"));
+  } finally { await dom.unmount(); }
+});
+
+
+test("relative chat file links show resolved hover paths and preserve line targets", async () => {
+  const opened = [];
+  const sourcePath = appModule.assistantMarkdownSourcePath("/repo/project");
+  const dom = await mountReact(React.createElement(appModule.MarkdownMessage, {
+    sourcePath,
+    value: "[Source](README.md:12:3) [Guide](../notes/guide%20one.md) [Web](//example.com/docs)",
+    onOpenLink: (href) => opened.push(codeWorkspaceModule.markdownFileLinkTarget(sourcePath, href)),
+  }), createFetchMock([]));
+  const source = dom.ancestor(dom.byText("Source"), "A");
+  const guide = dom.ancestor(dom.byText("Guide"), "A");
+  assert.equal(source.getAttribute("href"), "README.md:12:3");
+  assert.equal(source.getAttribute("title"), "/repo/project/README.md:12:3");
+  assert.equal(guide.getAttribute("title"), "/repo/notes/guide one.md");
+  await dom.click(source);
+  await dom.click(guide);
+  assert.deepEqual(opened, [
+    { path: "/repo/project/README.md", lineNumber: 12, column: 3 },
+    { path: "/repo/notes/guide one.md", lineNumber: null, column: 1 },
+  ]);
+  assert.equal(markdownContentModule.markdownUrlTransform("javascript:123", "href"), "");
+  assert.equal(codeWorkspaceModule.resolveMarkdownLinkPath(sourcePath, "//example.com/docs"), "");
+  await dom.unmount();
+});
+
+test("Markdown preview links show paths relative to the document directory", async () => {
+  const dom = await mountReact(React.createElement(codeWorkspaceModule.MarkdownPreview, {
+    path: "/repo/docs/guide.md",
+    content: "[Readme](../README.md)",
+  }), createFetchMock([]));
+  assert.equal(dom.ancestor(dom.byText("Readme"), "A").getAttribute("title"), "/repo/README.md");
+  await dom.unmount();
+});
+
+test("HTML previews open resolved local links on ordinary clicks", () => {
+  const { dispatch, sent } = runBrowserPreload("file:///repo/report.html");
+  for (const href of ["file:///repo/docs/guide.md", "file:///repo/reports/next.html", "file:///repo/src/app.py"]) {
+    const anchor = { tagName: "A", href, hasAttribute: () => false };
+    const event = browserPageEvent({ composedPath: () => [anchor], type: "click" });
+    dispatch("click", event);
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(sent.at(-1).payload.url, href);
+  }
+  const event = browserPageEvent({
+    composedPath: () => [{ tagName: "A", href: "file:///repo/report.html#heading", hasAttribute: () => false }],
+    type: "click",
+  });
+  dispatch("click", event);
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(sent.length, 3);
+});
+
+
+test("HTML file links use the studio path checks across folders and preserve locations", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  const body = source.slice(source.indexOf("function openBrowserLink("), source.indexOf("function showBrowserContextMenu("));
+  const sent = [];
+  let currentUrl = "file:///repo/report.html";
+  const sandbox = {
+    URL,
+    isAllowedBrowserNavigation: () => false,
+    browserSessionContents: () => ({ getURL: () => currentUrl }),
+  };
+  vm.runInNewContext(body, sandbox);
+  const session = { grantId: "test-grant", owner: { isDestroyed: () => false, send: (...args) => sent.push(args) } };
+  for (const href of ["file:///repo/guide.md", "file:///outside/next.html", "file:///outside/app.py:12:3"]) {
+    sandbox.openBrowserLink(session, href);
+    assert.deepEqual(toPlainObject(sent.at(-1)), ["gofer:browser-open-file", { href }]);
+  }
+  assert.deepEqual(codeWorkspaceModule.markdownFileLinkTarget("", sent.at(-1)[1].href), {
+    path: "/outside/app.py", lineNumber: 12, column: 3,
+  });
+  currentUrl = "https://example.com";
+  sandbox.openBrowserLink(session, "file:///outside/private.md");
+  currentUrl = "file:///repo/report.html";
+  sandbox.openBrowserLink({ ...session, grantId: "" }, "file:///outside/private.md");
+  sandbox.openBrowserLink(session, "invalid URL");
+  assert.equal(sent.length, 3);
+});
+
+
+test("Rem and Markdown previews open absolute paths and file URLs with spaces", async () => {
+  const content = "[Absolute](</outside/My Notes/guide.md:8>) [File](file:///outside/My%20Notes/report.html)";
+  for (const chat of [true, false]) {
+    const opened = [];
+    const props = chat
+      ? { value: content, sourcePath: "/repo/chat.md", onOpenLink: href => opened.push(href) }
+      : { content, path: "/repo/guide.md", onOpenRelativeLink: href => opened.push(href) };
+    const dom = await mountReact(React.createElement(
+      chat ? appModule.MarkdownMessage : codeWorkspaceModule.MarkdownPreview, props,
+    ), createFetchMock([]));
+    try {
+      for (const label of ["Absolute", "File"]) await dom.click(dom.ancestor(dom.byText(label), "A"));
+      assert.deepEqual(opened.map(href => codeWorkspaceModule.markdownFileLinkTarget("/repo/guide.md", href)), [
+        { path: "/outside/My Notes/guide.md", lineNumber: 8, column: 1 },
+        { path: "/outside/My Notes/report.html", lineNumber: null, column: 1 },
+      ]);
+      assert.equal(dom.ancestor(dom.byText("File"), "A").getAttribute("title"), "/outside/My Notes/report.html");
+    } finally { await dom.unmount(); }
+  }
+});
+
+
+test("Electron preload caches user navigation grants for local file reads", async () => {
+  const calls = [];
+  const exposed = runPreload({
+    argv: ["electron", "preload"],
+    invoke(channel, payload) {
+      calls.push({ channel, payload });
+      if (channel === "gofer:grant-user-path") return { path: "/outside/note.md", grantId: "desktop-only" };
+      return { channel, payload };
+    },
+  });
+  const selected = await exposed.goferDesktop.workspace.grantUserPath("/outside/shortcut.md");
+  assert.deepEqual(toPlainObject(selected), { path: "/outside/note.md" });
+  await exposed.goferDesktop.textFiles.read(selected.path);
+  assert.equal(calls[1].channel, "gofer:read-text-file");
+  assert.equal(calls[1].payload.grantId, "desktop-only");
+  assert.equal(calls.some(call => call.channel === "gofer:grant-path"), false);
+});
+
+test("Rem and Markdown website links open HTTP, HTTPS, and scheme-relative URLs", async () => {
+  const content = "[Secure](https://example.com/docs?q=one#two) [HTTP](http://example.com/) [Relative scheme](//example.com/docs)";
+  for (const chat of [true, false]) {
+    const localLinks = [];
+    const opened = [];
+    const props = chat
+      ? { value: content, sourcePath: "/repo/chat.md", onOpenLink: href => localLinks.push(href) }
+      : { content, path: "/repo/guide.md", onOpenRelativeLink: href => localLinks.push(href) };
+    const dom = await mountReact(React.createElement(
+      chat ? appModule.MarkdownMessage : codeWorkspaceModule.MarkdownPreview, props,
+    ), createFetchMock([]));
+    window.open = (...args) => opened.push(args);
+    try {
+      for (const label of ["Secure", "HTTP", "Relative scheme"]) {
+        const link = dom.ancestor(dom.byText(label), "A");
+        assert.match(link.getAttribute("href"), /^https?:\/\//);
+        await dom.click(link);
+      }
+      assert.deepEqual(opened, [
+        ["https://example.com/docs?q=one#two", "_blank", "noopener,noreferrer"],
+        ["http://example.com/", "_blank", "noopener,noreferrer"],
+        ["https://example.com/docs", "_blank", "noopener,noreferrer"],
+      ]);
+      assert.deepEqual(localLinks, []);
+    } finally { await dom.unmount(); }
+  }
+});
+
+test("local HTML website clicks hand off to browser tabs for ordinary and modified clicks", () => {
+  const { dispatch, sent } = runBrowserPreload("file:///repo/report.html");
+  for (const href of ["https://example.com/docs?q=one#two", "http://example.com/", "//example.com/docs"]) {
+    for (const ctrlKey of [false, true]) {
+      const anchor = {
+        tagName: "A", href: href.startsWith("//") ? `file:${href}` : href,
+        getAttribute: () => href, hasAttribute: () => false,
+      };
+      const event = browserPageEvent({ ctrlKey, composedPath: () => [anchor] });
+      dispatch("click", event);
+      assert.equal(event.defaultPrevented, true);
+      assert.deepEqual(toPlainObject(sent.at(-1)), {
+        channel: "gofer:browser-link-clicked",
+        payload: { url: href.startsWith("//") ? `https:${href}` : href },
+      });
+    }
+  }
+});
+
+test("local HTML popup and click handoffs open websites without carrying file grants", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  const body = source.slice(source.indexOf("function configureBrowserSession("), source.indexOf("function showBrowserContextMenu("));
+  const sent = [];
+  let popup;
+  const contents = {
+    on() {}, getURL: () => "file:///repo/report.html",
+    setWindowOpenHandler: handler => { popup = handler; },
+  };
+  const sandbox = { URL, browserSessionContents: () => contents };
+  vm.runInNewContext(body, sandbox);
+  const session = {
+    contents, grantId: "local-file-grant",
+    owner: { isDestroyed: () => false, send: (...args) => sent.push(args) },
+  };
+  sandbox.configureBrowserSession(session);
+  for (const url of ["https://example.com/docs", "http://example.com/"]) {
+    sandbox.openBrowserLink(session, url);
+    assert.deepEqual(toPlainObject(sent.at(-1)), ["gofer:browser-open-tab", { url }]);
+    assert.equal(popup({ url }).action, "deny");
+    assert.deepEqual(toPlainObject(sent.at(-1)), ["gofer:browser-open-tab", { url }]);
+  }
+  for (const url of ["javascript:alert(1)", "data:text/html,hello", "about:blank"]) {
+    sandbox.openBrowserLink(session, url);
+    assert.equal(popup({ url }).action, "deny");
+  }
+  assert.equal(sent.length, 4);
+});
+
+test("Branches lists inactive branches without checkout and offers deletion and worktree picking", async () => {
+  const calls = [], selected = [];
+  let picker = null;
+  let snapshot = { active: true, root: '/repo', branch: 'main', branches: ['main', 'occupied', 'feature'], entries: [] };
+  const workspace = {
+    trustProjectRoot: async () => {}, listDirectory: async () => ({ entries: [] }),
+    gitStatus: async () => snapshot, gitHistory: async () => ({ commits: [] }),
+    gitWorktrees: async () => ({ active: true, worktrees: [{ path: '/repo', branch: 'main' }, { path: '/occupied', branch: 'occupied' }] }),
+    gitSwitchBranch: async () => { throw new Error('Branch rows must not switch'); },
+    selectPath: async options => { calls.push(['picker', options]); return picker; },
+    addWorktree: async options => { calls.push(['worktree', options]); return { createdPath: options.targetPath, worktrees: [{ path: '/repo', branch: 'main' }, { path: options.targetPath, branch: options.branch }] }; },
+    gitRepoAction: async (_root, action, value) => {
+      if (action === 'stash-list') return { stashes: [] };
+      calls.push([action, value]);
+      if (action === 'branch-delete') snapshot = { ...snapshot, branches: ['main', 'occupied'] };
+      return snapshot;
+    },
+  };
+  const dom = await mountReact(React.createElement(codeFileExplorerModule.default, { workflow: { projectRoot: '/repo' }, onSelectProject: path => selected.push(path) }), createFetchMock([]), { desktop: { workspace } });
+  const oldConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    await dom.click(dom.byLabel('Source control')); await dom.flush(); await dom.click(dom.byText('Branches'));
+    const row = dom.byLabel('Branch feature');
+    await dom.click(row);
+    assert.deepEqual(selected, []); assert.deepEqual(calls, []);
+    assert.equal(reactProps(dom.byLabel('Delete branch main')).disabled, true);
+    assert.equal(reactProps(dom.byLabel('Delete branch occupied')).disabled, true);
+    await dom.pointer(row, 'onContextMenu', { clientX: 100, clientY: 100 });
+    const menu = () => allElements(document.body).find(el => el.getAttribute('role') === 'menu');
+    assert.equal(allElements(menu()).filter(el => el.tagName === 'BUTTON').length, 7);
+    await dom.click(allElements(menu()).find(el => el.getAttribute('data-operation') === 'rebase'));
+    assert.equal(reactProps(dom.byLabel('Integration operation')).value, 'rebase');
+    assert.deepEqual(calls, []);
+    await dom.click(dom.byLabel('Actions for branch feature'));
+    await dom.click(allElements(menu()).find(el => el.getAttribute('data-operation') === 'worktree-branch'));
+    assert.equal(calls.length, 1); assert.deepEqual(selected, []);
+    picker = '/new-worktree';
+    await dom.click(dom.byLabel('Actions for branch feature'));
+    await dom.click(allElements(menu()).find(el => el.getAttribute('data-operation') === 'worktree-branch'));
+    assert.deepEqual(calls.at(-1), ['worktree', { projectRoot: '/repo', branch: 'feature', createBranch: false, targetPath: '/new-worktree' }]);
+    assert.deepEqual(selected, ['/new-worktree']);
+    // Refresh restores the fixture's worktrees, then delete the unused branch.
+    await dom.click(dom.byLabel('Refresh source control')); await dom.flush();
+    await dom.click(dom.byLabel('Delete branch feature'));
+    assert.deepEqual(calls.at(-1), ['branch-delete', 'feature']);
+    assert.equal(allElements(dom.container).some(el => el.getAttribute('aria-label') === 'Branch feature'), false);
+  } finally { window.confirm = oldConfirm; await dom.unmount(); }
 });

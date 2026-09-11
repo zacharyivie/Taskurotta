@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import seated from "../assets/rem-options/indigo-android-open.png";
 import closed from "../assets/rem-options/indigo-android.png";
 import waving from "../assets/rem-options/indigo-android-wave.png";
 import sleeping from "../assets/rem-options/indigo-android-sleep.png";
 
 export default function RemAvatar({ visible = true, animated = true, reducedMotion = "system" }) {
+  const backgroundFilterId = `rem-background-${useId()}`;
+  const spriteStyle = { filter: `url(#${backgroundFilterId})` };
   const root = useRef(null);
   const [loaded, setLoaded] = useState({});
   const [inView, setInView] = useState(true);
@@ -68,11 +70,22 @@ export default function RemAvatar({ visible = true, animated = true, reducedMoti
 
   return (
     <div ref={root} aria-hidden="true" className="rem-avatar" data-motion={motion} data-animated={Boolean(playing)} data-pose={pose === "sleeping" ? pose : playing ? pose : "seated"} data-blinking={Boolean(playing && blinking)}>
-      <img alt="" className="rem-avatar-seated" draggable={false} height={112} width={112} src={seated} onLoad={() => setLoaded((value) => ({ ...value, seated: true }))} />
+      {/* Key out the sprites' near-black backdrop before compositing each pose.
+          Character outlines are brighter than this narrow alpha ramp. Keeping
+          the original sprites preserves registration of the eyelid overlay. */}
+      <svg width="0" height="0" className="rem-avatar-filter" focusable="false">
+        <defs>
+          <filter id={backgroundFilterId} colorInterpolationFilters="sRGB" x="0" y="0" width="100%" height="100%">
+            <feColorMatrix in="SourceGraphic" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  10.625 10.625 10.625 0 -3.75" result="foreground" />
+            <feComposite in="SourceGraphic" in2="foreground" operator="in" />
+          </filter>
+        </defs>
+      </svg>
+      <img alt="" style={spriteStyle} className="rem-avatar-seated" draggable={false} height={112} width={112} src={seated} onLoad={() => setLoaded((value) => ({ ...value, seated: true }))} />
       {/* Only the eyelid changes during a blink, keeping the body pixel-still. */}
-      <img alt="" className="rem-avatar-eyelid" draggable={false} height={112} width={112} src={closed} onLoad={() => setLoaded((value) => ({ ...value, closed: true }))} />
-      <img alt="" className="rem-avatar-wave" draggable={false} height={112} width={112} src={waving} onLoad={() => setLoaded((value) => ({ ...value, waving: true }))} />
-      <img alt="" className="rem-avatar-sleep" draggable={false} height={112} width={112} src={sleeping} />
+      <img alt="" style={spriteStyle} className="rem-avatar-eyelid" draggable={false} height={112} width={112} src={closed} onLoad={() => setLoaded((value) => ({ ...value, closed: true }))} />
+      <img alt="" style={spriteStyle} className="rem-avatar-wave" draggable={false} height={112} width={112} src={waving} onLoad={() => setLoaded((value) => ({ ...value, waving: true }))} />
+      <img alt="" style={spriteStyle} className="rem-avatar-sleep" draggable={false} height={112} width={112} src={sleeping} />
     </div>
   );
 }

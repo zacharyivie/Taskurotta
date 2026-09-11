@@ -4,8 +4,88 @@ const path = require("node:path");
 
 const GIT_OUTPUT_LIMIT = 16 * 1024 * 1024;
 
+const repositoryLocations = new Map();
+const statusReads = new Map();
+const worktreeReads = new WeakMap();
+const metadataCaches = new WeakMap();
+const METADATA_MAX_AGE_MS = 15000;
+
+function runnerMap(collection, runner) {
+  if (!collection.has(runner)) collection.set(runner, new Map());
+  return collection.get(runner);
+}
+
+function isGitRead(args) {
+  const offset = args[0] === "-C" ? 2 : 0;
+  const [command, subcommand] = args.slice(offset);
+  return ["status", "rev-parse", "for-each-ref", "rev-list", "show", "diff", "log", "check-ref-format"].includes(command)
+    || (command === "branch" && subcommand === "--show-current")
+    || (command === "remote" && !subcommand)
+    || (command === "stash" && subcommand === "list")
+    || (command === "worktree" && subcommand === "list");
+}
+
+async function readSlowMetadata(projectRoot, branch, runner, options) {
+  const cache = runnerMap(metadataCaches, runner);
+  const key = path.resolve(projectRoot);
+  const now = (options.now || Date.now)();
+  const existing = cache.get(key);
+  if (!options.forceMetadata && existing?.generation === gitReadGeneration
+      && existing.branch === branch && now - existing.at < METADATA_MAX_AGE_MS) return existing.pending;
+  const generation = gitReadGeneration;
+  const pending = (async () => {
+    let branches = [], remotes = [], stashCount = 0;
+    try { branches = String(await runner(["-C", projectRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"])).trim().split("\n").filter(Boolean); } catch { /* Unborn repository. */ }
+    try { remotes = String(await runner(["-C", projectRoot, "remote"])).trim().split("\n").filter(Boolean); } catch { /* Optional remote metadata. */ }
+    try { stashCount = String(await runner(["-C", projectRoot, "stash", "list", "--format=%gd"])).trim().split("\n").filter(Boolean).length; } catch { /* Unborn repository. */ }
+    return { branches, remotes, stashCount };
+  })();
+  cache.delete(key);
+  cache.set(key, { branch, generation, at: now, pending });
+  if (cache.size > 64) cache.delete(cache.keys().next().value);
+  return pending;
+}
+let gitReadGeneration = 0;
+
+async function repositoryLocation(projectRoot, runner) {
+  if (runner !== runGit) return { root: String(await runner(["-C", projectRoot, "rev-parse", "--show-toplevel"])).trim() };
+  let root = path.resolve(projectRoot);
+  while (true) {
+    const marker = path.join(root, ".git");
+    try {
+      const info = await fs.promises.stat(marker);
+      const revision = `${info.dev}:${info.ino}:${info.isFile() ? `${info.mtimeMs}:${info.size}` : "directory"}`;
+      const existing = repositoryLocations.get(marker);
+      if (existing?.revision === revision) return existing;
+      const gitDir = String(await runner(["-C", projectRoot, "rev-parse", "--absolute-git-dir"])).trim();
+      const repositoryRoot = String(await runner(["-C", projectRoot, "rev-parse", "--show-toplevel"])).trim();
+      const location = { root: repositoryRoot, gitDir, revision };
+      repositoryLocations.set(marker, location);
+      if (repositoryLocations.size > 64) repositoryLocations.delete(repositoryLocations.keys().next().value);
+      return location;
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+    }
+    const parent = path.dirname(root);
+    if (parent === root) throw new Error("Not a Git repository");
+    root = parent;
+  }
+}
+
+function readPorcelain(projectRoot, runner) {
+  const read = () => runner(["-C", projectRoot, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."]);
+  if (runner !== runGit) return read();
+  const key = `${gitReadGeneration}:${projectRoot}`;
+  if (statusReads.has(key)) return statusReads.get(key);
+  const pending = read().finally(() => statusReads.delete(key));
+  statusReads.set(key, pending);
+  return pending;
+}
+
 function runGit(args, options = {}) {
   const execFileImpl = options.execFileImpl || execFile;
+  const mutates = !isGitRead(args);
+  if (mutates) gitReadGeneration += 1;
   return new Promise((resolve, reject) => {
     execFileImpl(
       "git",
@@ -19,6 +99,7 @@ function runGit(args, options = {}) {
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
       },
       (error, stdout) => {
+        if (mutates) gitReadGeneration += 1;
         if (error) {
           reject(error);
           return;
@@ -62,18 +143,8 @@ function parseGitStatus(output = "") {
 async function readGitStatus(projectRoot, options = {}) {
   const runner = options.runGit || runGit;
   try {
-    const root = String(await runner(["-C", projectRoot, "rev-parse", "--show-toplevel"]))
-      .trim();
-    const output = await runner([
-      "-C",
-      projectRoot,
-      "status",
-      "--porcelain=v1",
-      "-z",
-      "--untracked-files=all",
-      "--",
-      ".",
-    ]);
+    const { root, gitDir } = await repositoryLocation(projectRoot, runner);
+    const output = await readPorcelain(projectRoot, runner);
     const projectPrefix = path.relative(root, projectRoot).replaceAll("\\", "/");
     const entries = parseGitStatus(output).flatMap((entry) => {
       if (!projectPrefix) return [entry];
@@ -83,23 +154,18 @@ async function readGitStatus(projectRoot, options = {}) {
         : [];
     });
     let branch = "";
-    let branches = [];
     let ahead = null;
     let behind = null;
     try {
       branch = String(await runner(["-C", projectRoot, "branch", "--show-current"])).trim();
-      branches = String(await runner(["-C", projectRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"])).trim().split("\n").filter(Boolean);
       const counts = String(await runner(["-C", projectRoot, "rev-list", "--left-right", "--count", "HEAD...@{upstream}"])).trim().split(/\s+/).map(Number);
       if (counts.length === 2 && counts.every(Number.isFinite)) [ahead, behind] = counts;
     } catch { /* Unborn branches and branches without an upstream have no counts. */ }
-    let remotes = [];
-    let stashCount = 0;
-    try { remotes = String(await runner(["-C", projectRoot, "remote"])).trim().split("\n").filter(Boolean); } catch { /* Optional remote metadata. */ }
-    try { stashCount = String(await runner(["-C", projectRoot, "stash", "list", "--format=%gd"])).trim().split("\n").filter(Boolean).length; } catch { /* Unborn repository. */ }
+    const { branches, remotes, stashCount } = await readSlowMetadata(projectRoot, branch, runner, options);
     let operation;
     for (const [marker, kind] of [["rebase-merge", "rebase"], ["rebase-apply", "rebase"], ["MERGE_HEAD", "merge"]]) {
       try {
-        const markerPath = String(await runner(["-C", projectRoot, "rev-parse", "--git-path", marker])).trim();
+        const markerPath = gitDir ? path.join(gitDir, marker) : String(await runner(["-C", projectRoot, "rev-parse", "--git-path", marker])).trim();
         if (markerPath && fs.existsSync(path.resolve(projectRoot, markerPath))) { operation = kind; break; }
       } catch { /* Optional operation metadata. */ }
     }
@@ -113,7 +179,7 @@ async function readGitStatus(projectRoot, options = {}) {
 async function changeGitFile(projectRoot, relativePath, action, options = {}) {
   const runner = options.runGit || runGit;
   if (!["stage", "unstage", "revert", "revert-staged"].includes(action)) throw new Error("Unknown Git action.");
-  const snapshot = await readGitStatus(projectRoot, options);
+  const snapshot = await readGitStatus(projectRoot, { ...options, forceMetadata: true });
   const entry = snapshot.entries.find((item) => item.path === relativePath);
   if (!entry) throw new Error("This change is no longer present. Refresh source control.");
   const paths = [entry.path, ...(entry.originalPath && action !== "revert" ? [entry.originalPath] : [])];
@@ -154,7 +220,7 @@ async function changeGitFile(projectRoot, relativePath, action, options = {}) {
 
 async function switchGitBranch(projectRoot, branch, options = {}) {
   const runner = options.runGit || runGit;
-  const snapshot = await readGitStatus(projectRoot, options);
+  const snapshot = await readGitStatus(projectRoot, { ...options, forceMetadata: true });
   if (!snapshot.branches?.includes(branch) || branch.startsWith("-")) throw new Error("Choose an existing local branch.");
   try {
     await runner(["-C", projectRoot, "switch", "--no-guess", branch]);
@@ -188,7 +254,7 @@ async function gitRepositoryAction(projectRoot, action, value = "", options = {}
   } else if (["reset-soft", "reset-hard", "detach-commit", "branch-commit"].includes(action)) {
     if (!value || !/^[0-9a-f]{40,64}$/.test(value.hash)) throw new Error("Choose a valid commit.");
     await git("rev-parse", "--verify", `${value.hash}^{commit}`);
-    const snapshot = await readGitStatus(projectRoot, options);
+    const snapshot = await readGitStatus(projectRoot, { ...options, forceMetadata: true });
     if (snapshot.operation || snapshot.entries.some(entry => entry.status === "!")) throw new Error("Finish or abort the current operation first.");
     if (action.startsWith("reset-")) await git("reset", action === "reset-soft" ? "--soft" : "--hard", value.hash);
     else if (action === "detach-commit") await git("switch", "--detach", value.hash);
@@ -197,6 +263,13 @@ async function gitRepositoryAction(projectRoot, action, value = "", options = {}
       await git("check-ref-format", "--branch", value.branch);
       await git("switch", "-c", value.branch, value.hash);
     }
+  } else if (action === "branch-delete") {
+    if (typeof value !== "string" || !value || value.startsWith("-")) throw new Error("Choose an existing local branch.");
+    await git("check-ref-format", "--branch", value);
+    await git("show-ref", "--verify", `refs/heads/${value}`);
+    // Git also refuses branches checked out in any worktree and unmerged branches.
+    await git("branch", "--delete", "--", value);
+    return readGitStatus(projectRoot, { ...options, forceMetadata: true });
   } else if (action === "commit") {
     if (typeof value !== "string" || !value.trim() || value.length > 72000) throw new Error("Enter a commit message.");
     const repositoryRoot = String(await git("rev-parse", "--show-toplevel")).trim();
@@ -209,13 +282,13 @@ async function gitRepositoryAction(projectRoot, action, value = "", options = {}
   } else if (action === "push") {
     await git("push");
   } else if (action === "publish") {
-    const snapshot = await readGitStatus(projectRoot, options);
+    const snapshot = await readGitStatus(projectRoot, { ...options, forceMetadata: true });
     if (!snapshot.branch) throw new Error("Switch to a branch before publishing.");
     const remotes = String(await git("remote")).trim().split("\n").filter(Boolean);
     if (!remotes.includes(value)) throw new Error("Choose an existing remote.");
     await git("push", "--set-upstream", value, snapshot.branch);
   } else if (action === "stash-switch") {
-    const snapshot = await readGitStatus(projectRoot, options);
+    const snapshot = await readGitStatus(projectRoot, { ...options, forceMetadata: true });
     if (!snapshot.branches?.includes(value) || value.startsWith("-")) throw new Error("Choose an existing local branch.");
     // Leave the stash intact even if switching fails. Never pop onto another branch automatically.
     await git("stash", "push", "--include-untracked", "-m", `Taskurotta: before switching from ${snapshot.branch} to ${value}`);
@@ -298,13 +371,23 @@ function parseGitWorktrees(output = "") {
 async function readGitWorktrees(projectRoot, options = {}) {
   const runner = options.runGit || runGit;
   try {
-    const root = String(await runner(["-C", projectRoot, "rev-parse", "--show-toplevel"])).trim();
-    try {
-      await runner(["-C", root, "worktree", "prune", "--expire", "now"]);
-    } catch {
-      // Listing remains useful when Git metadata is read-only.
+    const { root, gitDir } = await repositoryLocation(projectRoot, runner);
+    let repository = root;
+    if (gitDir) {
+      let commonDir = "";
+      try { commonDir = (await fs.promises.readFile(path.join(gitDir, "commondir"), "utf8")).trim(); } catch { /* Main worktree. */ }
+      repository = commonDir ? path.resolve(gitDir, commonDir) : gitDir;
     }
-    const output = await runner(["-C", projectRoot, "worktree", "list", "--porcelain"]);
+    // Share only pending reads. Every later listing sees externally changed worktrees.
+    const reads = runnerMap(worktreeReads, runner);
+    const key = `${gitReadGeneration}:${repository}`;
+    let pending = reads.get(key);
+    if (!pending) {
+      pending = Promise.resolve().then(() => runner(["-C", root, "worktree", "list", "--porcelain"]))
+        .finally(() => { if (reads.get(key) === pending) reads.delete(key); });
+      reads.set(key, pending);
+    }
+    const output = await pending;
     return {
       active: true,
       root,
@@ -328,12 +411,15 @@ async function addGitWorktree(projectRoot, targetPath, branch, options = {}) {
   args.push(targetPath);
   if (options.startPoint) args.push(options.startPoint);
   if (options.createBranch !== true && branch) args.push(branch);
+  gitReadGeneration += 1;
   await runner(args);
+  gitReadGeneration += 1;
   return readGitWorktrees(projectRoot, options);
 }
 
 async function removeGitWorktree(projectRoot, targetPath, options = {}) {
   const runner = options.runGit || runGit;
+  gitReadGeneration += 1;
   if (fs.existsSync(targetPath)) {
     const args = ["-C", projectRoot, "worktree", "remove"];
     if (options.force === true) args.push("--force");
@@ -348,6 +434,7 @@ async function removeGitWorktree(projectRoot, targetPath, options = {}) {
   } else {
     await runner(["-C", projectRoot, "worktree", "prune", "--expire", "now"]);
   }
+  gitReadGeneration += 1;
   return readGitWorktrees(projectRoot, options);
 }
 
@@ -372,11 +459,11 @@ async function readGitFileBaseline(targetPath, options = {}) {
   let directory = path.dirname(targetPath);
   while (!fs.existsSync(directory) && path.dirname(directory) !== directory) directory = path.dirname(directory);
   try {
-    const root = String(await runner(["-C", directory, "rev-parse", "--show-toplevel"])).trim();
+    const { root } = await repositoryLocation(directory, runner);
     const relativePath = path.relative(root, targetPath).replaceAll("\\", "/");
     if (!relativePath || relativePath.startsWith("../")) return { changed: false, content: "", hunks: [], tracked: false };
     const git = (...args) => runner(["-C", root, ...args]);
-    const status = parseGitStatus(await git("status", "--porcelain=v1", "-z", "--untracked-files=all"));
+    const status = parseGitStatus(await readPorcelain(root, runner));
     const entry = status.find((item) => item.path === relativePath);
     const group = options.group;
     const original = entry?.status === "!" ? `:2:${relativePath}` : group === "unstaged" ? `:${relativePath}` : `HEAD:${entry?.originalPath || relativePath}`;

@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from importlib.util import find_spec
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
@@ -28,6 +30,7 @@ hiddenimports += collect_submodules("pydantic")
 hiddenimports += collect_submodules("pydantic_settings")
 hiddenimports += collect_submodules("sqlalchemy")
 hiddenimports += collect_submodules("typer")
+hiddenimports += collect_submodules("watchdog.observers")
 if find_spec("vosk") is not None:
     hiddenimports += collect_submodules("vosk")
 
@@ -67,6 +70,6 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity=os.environ.get("GOFER_CODESIGN_IDENTITY"),
     entitlements_file=None,
 )

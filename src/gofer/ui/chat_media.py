@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -15,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
+
+from gofer.utils.atomic_output import open_binary_input
 
 CHAT_ATTACHMENT_MAX_COUNT = 5
 CHAT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -26,6 +31,34 @@ CHAT_TRANSCRIPTION_SESSION_TTL_SECONDS = 15 * 60
 VOSK_MODEL_NAME = "vosk-model-en-us-0.22-lgraph"
 VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
 VOSK_MODEL_DOWNLOAD_MAX_BYTES = 160 * 1024 * 1024
+# Pinned from the fixed upstream HTTPS archive on 2026-09-10. Review both the
+# archive and member digests when intentionally changing the model version.
+VOSK_MODEL_SHA256 = "d9838b4aaa82a75c4a17f5aca300eaca129aaab2a7cbf951bafbb500eb9c4334"
+VOSK_MODEL_MAX_ENTRIES = 128
+VOSK_MODEL_MAX_FILE_BYTES = 96 * 1024 * 1024
+VOSK_MODEL_MAX_EXPANDED_BYTES = 320 * 1024 * 1024
+VOSK_MODEL_MAX_COMPRESSION_RATIO = 100
+VOSK_MODEL_FILES = {
+    "ivector/splice.conf": "9f0c5f7c82d18eaf25d8bce470efa9f7741f88411fe428774bc0a9bb69a24756",
+    "ivector/global_cmvn.stats": "3d7d721fa592c21136597955fd550b1f84568d32e4de7adc35d3b9a033e65afe",
+    "ivector/final.mat": "29f411865e71494ff1ff03965b3a5812b5c38d3bcdff3e62aa80462978234f4f",
+    "ivector/online_cmvn.conf": "a2f3571754b64297cb7efb2e7ca3df61995c5a45fcbb97188f90613552bb2dfe",
+    "ivector/final.dubm": "76309d6d4f4612de0e6e2c1e836811becaa9a0adc0e0bfff53a90371488a413d",
+    "ivector/final.ie": "ed35fa2f46d8853370f89480a53d3e0184ceaab9afef7f112b43cdda492e5326",
+    "am/final.mdl": "c8586dfa7f571b8b01bac8217ef96493690c65aa512b72e6ce5acde39c262afe",
+    "am/tree": "cc3f3ecb42b3e4513575e7c43c922eb1cf48657f46414350cdb48c165b51be2b",
+    "graph/phones/word_boundary.int": (
+        "9f63870f605d47e29a050117d255c4fc2cb1551d903883c0040aa16219856165"
+    ),
+    "graph/disambig_tid.int": "efbeb98e263f08d2de5477158854bd9e307a35600db4c58a935ccbaf4432e345",
+    "graph/words.txt": "2714049587071344be482fa0e6b7b33792020ba689f422f9895dde5bedbd667b",
+    "graph/Gr.fst": "0edf01f3582de257e89415cd508c21790bb6f0e820e743d87adcafd2bcbd9545",
+    "graph/HCLr.fst": "96981cf4a3d5fe9e8f4a5205b681fadec0e85221972c929192b121a9f7e7c175",
+    "graph/phones.txt": "6d01b4f94c7a161fc41a5573ace33f72d0c01b7b6e99cc7d14ffe9526d4fe4ca",
+    "conf/model.conf": "f867cc746ce8633b747f723a8b78ea36a6e5db291e8c37bfefc5fb155420b10c",
+    "conf/mfcc.conf": "df62f0c23a628b6a2c2e030d43b72ca992fcbe9f2d6d768946579ae25898570f",
+    "README": "722534312e1a64c449a02aa487b231f018c234ea238f19cfe921fcfe19278df4",
+}
 _SAFE_PART = re.compile(r"[^A-Za-z0-9_.-]+")
 _vosk_model: Any | None = None
 _vosk_model_path: Path | None = None
@@ -253,29 +286,84 @@ def _load_vosk_model(data_dir: Path) -> Any:
         return _vosk_model
 
 
+def _valid_vosk_model(model_path: Path) -> bool:
+    if model_path.is_symlink() or not model_path.is_dir():
+        return False
+    expected = set(VOSK_MODEL_FILES)
+    allowed_directories = {
+        parent.as_posix()
+        for name in expected
+        for parent in Path(name).parents
+        if parent != Path(".")
+    }
+    found: set[str] = set()
+    try:
+        for directory, folders, files in os.walk(model_path, followlinks=False):
+            for name in folders:
+                folder = Path(directory) / name
+                if (
+                    folder.is_symlink()
+                    or folder.relative_to(model_path).as_posix() not in allowed_directories
+                ):
+                    return False
+            for name in files:
+                file = Path(directory) / name
+                relative = file.relative_to(model_path).as_posix()
+                if relative not in expected or file.is_symlink():
+                    return False
+                found.add(relative)
+        if found != expected:
+            return False
+        for relative, expected_digest in VOSK_MODEL_FILES.items():
+            digest = hashlib.sha256()
+            total = 0
+            with open_binary_input(model_path / relative) as source:
+                while chunk := source.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > VOSK_MODEL_MAX_FILE_BYTES:
+                        return False
+                    digest.update(chunk)
+            if digest.hexdigest() != expected_digest:
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def _ensure_vosk_model(model_path: Path) -> None:
-    if (model_path / "am" / "final.mdl").is_file():
+    if _valid_vosk_model(model_path):
         return
     model_root = model_path.parent
     model_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    archive_path = model_root / f"{VOSK_MODEL_NAME}.zip.part"
     try:
-        request = Request(VOSK_MODEL_URL, headers={"User-Agent": "Taskurotta local speech/1"})
-        with urlopen(request, timeout=60) as response, archive_path.open("wb") as target:
-            _copy_limited(response, target, VOSK_MODEL_DOWNLOAD_MAX_BYTES)
-        with zipfile.ZipFile(archive_path) as archive:
-            _safe_extract_zip(archive, model_root)
+        # A private staging directory prevents partial downloads or extraction
+        # failures from becoming a model that the native loader can consume.
+        with tempfile.TemporaryDirectory(prefix=".vosk-", dir=model_root) as staging:
+            stage = Path(staging)
+            archive_path = stage / "model.zip"
+            request = Request(VOSK_MODEL_URL, headers={"User-Agent": "Taskurotta local speech/1"})
+            with urlopen(request, timeout=60) as response, archive_path.open("xb") as target:
+                _copy_limited(response, target, VOSK_MODEL_DOWNLOAD_MAX_BYTES)
+            with archive_path.open("rb") as downloaded:
+                digest = hashlib.file_digest(downloaded, "sha256").hexdigest()
+            if digest != VOSK_MODEL_SHA256:
+                raise ChatMediaError("The local speech model checksum does not match.")
+            with zipfile.ZipFile(archive_path) as archive:
+                _safe_extract_zip(archive, stage)
+            extracted = stage / VOSK_MODEL_NAME
+            if not _valid_vosk_model(extracted):
+                raise ChatMediaError("The downloaded local speech model is incomplete.")
+            if model_path.is_symlink():
+                raise ChatMediaError("The local speech model path must not be a link.")
+            if model_path.exists():
+                shutil.rmtree(model_path)
+            extracted.replace(model_path)
     except ChatMediaError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise ChatMediaError(
             "The local speech model could not be installed. Check the connection and try again."
         ) from exc
-    finally:
-        archive_path.unlink(missing_ok=True)
-    if not (model_path / "am" / "final.mdl").is_file():
-        shutil.rmtree(model_path, ignore_errors=True)
-        raise ChatMediaError("The downloaded local speech model is incomplete.")
 
 
 def _copy_limited(source: Any, target: Any, limit: int) -> None:
@@ -284,19 +372,49 @@ def _copy_limited(source: Any, target: Any, limit: int) -> None:
         total += len(chunk)
         if total > limit:
             limit_mib = limit // (1024 * 1024)
-            raise ChatMediaError(
-                f"The local speech model download exceeded {limit_mib} MiB."
-            )
+            raise ChatMediaError(f"The local speech model download exceeded {limit_mib} MiB.")
         target.write(chunk)
 
 
 def _safe_extract_zip(archive: zipfile.ZipFile, target: Path) -> None:
     target_root = target.resolve()
-    for member in archive.infolist():
-        destination = (target / member.filename).resolve()
-        if destination != target_root and not destination.is_relative_to(target_root):
+    members = archive.infolist()
+    if len(members) > VOSK_MODEL_MAX_ENTRIES:
+        raise ChatMediaError("The local speech model archive has too many entries.")
+    total = 0
+    seen: set[str] = set()
+    for member in members:
+        name = member.filename
+        destination = (target / name).resolve()
+        kind = stat.S_IFMT(member.external_attr >> 16)
+        if (
+            "\\" in name
+            or ":" in name
+            or name.startswith("/")
+            or ".." in Path(name).parts
+            or destination == target_root
+            or not destination.is_relative_to(target_root)
+            or kind not in {0, stat.S_IFREG, stat.S_IFDIR}
+            or name in seen
+        ):
             raise ChatMediaError("The local speech model archive contains an unsafe path.")
-    archive.extractall(target)
+        seen.add(name)
+        total += member.file_size
+        if (
+            member.file_size > VOSK_MODEL_MAX_FILE_BYTES
+            or total > VOSK_MODEL_MAX_EXPANDED_BYTES
+            or member.file_size > max(1, member.compress_size) * VOSK_MODEL_MAX_COMPRESSION_RATIO
+        ):
+            raise ChatMediaError("The local speech model archive exceeds extraction limits.")
+    for member in members:
+        destination = target / member.filename
+        if member.is_dir():
+            destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with archive.open(member) as source, destination.open("xb") as output:
+            os.chmod(destination, 0o600)
+            _copy_limited(source, output, min(member.file_size, VOSK_MODEL_MAX_FILE_BYTES))
 
 
 def _vosk_result_text(value: str) -> str:

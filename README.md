@@ -64,6 +64,18 @@ npm install
 npm run dev
 ```
 
+For browser development, set `GOFER_UI_API_TOKEN` to a fresh random secret in the
+backend shell before starting the server. Open the frontend with the same secret
+in `http://127.0.0.1:5173/#gofer-token=<secret>`. The frontend consumes the fragment
+and removes it from browser history. The API never supplies an unauthenticated
+session token. Desktop startup supplies the capability through private IPC and
+requires no pairing step.
+
+UI requests allow 30 seconds to finish sending headers or a body, with a
+15-second socket idle timeout. Up to 32 handlers and 8 expensive requests run at
+once. Async UI jobs have a 24-hour deadline; set `GOFER_UI_JOB_TIMEOUT_SECONDS` on
+the backend process to adjust it. These limits do not alter CLI workflow runs.
+
 ## Desktop App
 
 Linux and macOS desktop packages are built from the Electron app in

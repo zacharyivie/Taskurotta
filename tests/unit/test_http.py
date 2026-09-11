@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import socket
 from types import SimpleNamespace
 from typing import Any
@@ -40,7 +41,7 @@ def _install_recording_connection(
             return SimpleNamespace(
                 status=status,
                 headers=SimpleNamespace(items=lambda: headers),
-                read=lambda: body,
+                read1=io.BytesIO(body).read1,
             )
 
         def close(self) -> None:

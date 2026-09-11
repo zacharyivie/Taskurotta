@@ -115,18 +115,14 @@ async function replaceProject(root, options = {}) {
   for (const file of files) {
     try {
       if (await fs.realpath(file.path) !== file.path) throw new Error("File path changed.");
-      const handle = await fs.open(file.path, require("node:fs").constants.O_RDWR | (require("node:fs").constants.O_NOFOLLOW || 0));
-      try {
-        const stat = await handle.stat();
-        if (!stat.isFile() || stat.nlink > 1 || digest(await handle.readFile()) !== file.hash) throw new Error("File changed or has hard links. Refresh the results.");
-        const content = Buffer.from(file.content);
-        let offset = 0;
-        while (offset < content.length) {
-          const { bytesWritten } = await handle.write(content, offset, content.length - offset, offset);
-          offset += bytesWritten;
-        }
-        await handle.truncate(content.length);
-      } finally { await handle.close(); }
+      await require("./safe-files.cjs").writeFile(file.path, file.content, {
+        expectedHash: file.hash,
+        digest,
+        authorize: (target) => {
+          const relative = path.relative(root, target);
+          if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("File is outside the project.");
+        },
+      });
       count += file.matches.length;
       changed.push(file.path);
     } catch (error) { return { count, changed, error: `${file.relativePath}: ${error.message}` }; }

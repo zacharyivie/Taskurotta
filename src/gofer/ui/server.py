@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import html
 import json
@@ -9,12 +10,13 @@ import os
 import secrets
 import shutil
 import signal
+import socket
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +32,7 @@ from gofer.core.usage import summarize_node_outputs
 from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
 from gofer.radish.editor import RadishEditorError, RadishRevisionConflict
+from gofer.radish.workspaces import list_registered_workflows
 from gofer.ui.api import (
     ProviderProfileError,
     RunnerQueueError,
@@ -124,6 +127,12 @@ from gofer.utils.paths import get_data_dir
 log = get_logger(__name__)
 CONTINUOUS_RUN_POLL_SECONDS = 1.0
 PATH_GRANT_TTL_SECONDS = 15 * 60
+UI_MAX_HANDLERS = 32
+UI_MAX_EXPENSIVE_REQUESTS = 8
+UI_READ_TIMEOUT_SECONDS = 15.0
+UI_REQUEST_READ_DEADLINE_SECONDS = 30.0
+UI_JOB_DEADLINE_SECONDS = 24 * 60 * 60
+COMMIT_MESSAGE_MAX_BODY_BYTES = 2 * 1024 * 1024
 DEFAULT_DEV_FRONTEND_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 
 
@@ -235,6 +244,10 @@ class DesktopPathGrantStore:
         if not grant_id:
             return False
         canonical_target = _canonical_path_for_containment(target)
+        return self.covers_canonical(canonical_target, grant_id)
+
+    def covers_canonical(self, canonical_target: Path, grant_id: str) -> bool:
+        """Check the already resolved target that the caller will use for I/O."""
         with self._lock:
             self._prune_locked()
             grant = self._grants.get(grant_id)
@@ -264,9 +277,28 @@ class GoferUiServer(ThreadingHTTPServer):
         self.resource_limits = resource_limits or bundle_resource_limits_from_env()
         self.api_token = api_token or os.environ.get("GOFER_UI_API_TOKEN") or _new_ui_api_token()
         self.emit_ready_token = os.environ.get("GOFER_UI_EMIT_READY_TOKEN") == "1"
-        self.allowed_origins = allowed_origins or _default_allowed_origins()
+        self.allowed_origins = (
+            _default_allowed_origins() if allowed_origins is None else set(allowed_origins)
+        )
+        self._handler_slots = threading.BoundedSemaphore(UI_MAX_HANDLERS)
+        self._expensive_slots = threading.BoundedSemaphore(UI_MAX_EXPENSIVE_REQUESTS)
+        self.request_job_timeout = max(
+            1.0, float(os.environ.get("GOFER_UI_JOB_TIMEOUT_SECONDS", UI_JOB_DEADLINE_SECONDS))
+        )
+        self._schedule_lock = threading.Lock()
+        self._schedule_signature: tuple[tuple[str, int, int], ...] | None = None
         self.path_grant_secret = os.environ.get("GOFER_DESKTOP_GRANT_SECRET", "")
         self.path_grants = DesktopPathGrantStore()
+        # Snapshot startup trust. Re-reading a renderer-writable registry during
+        # grant renewal would let a renderer launder an arbitrary new root.
+        self.trusted_project_roots = tuple(
+            sorted(
+                {
+                    str(workflow.project_root.resolve())
+                    for workflow in list_registered_workflows(registry_dir=data_dir)
+                }
+            )
+        )
         self.gofer_cli_path = ensure_local_gofer_cli(data_dir)
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
         self.watcher = WorkflowWatcher(resource_limits=self.resource_limits)
@@ -275,9 +307,41 @@ class GoferUiServer(ThreadingHTTPServer):
         self._continuous_stop = threading.Event()
         self._continuous_thread: threading.Thread | None = None
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Reject before ThreadingMixIn allocates a thread. The accept loop never waits.
+        if not self._handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        request.settimeout(UI_READ_TIMEOUT_SECONDS)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
+
     def sync_schedules(self) -> None:
-        sync_workflow_schedules(self.data_dir, self.scheduler)
-        sync_workflow_watchers(self.data_dir, self.watcher)
+        # Mutations reconcile immediately; the monitor also notices external edits.
+        # Polling GETs never rewrite scheduler jobs or restart filesystem watchers.
+        with self._schedule_lock:
+            signature = []
+            for path in sorted(self.data_dir.glob("*.toml")):
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                signature.append((str(path), info.st_mtime_ns, info.st_size))
+            current = tuple(signature)
+            if current == self._schedule_signature:
+                return
+            sync_workflow_schedules(self.data_dir, self.scheduler)
+            sync_workflow_watchers(self.data_dir, self.watcher)
+            self._schedule_signature = current
 
     def start_continuous_monitor(self) -> None:
         if self._continuous_thread and self._continuous_thread.is_alive():
@@ -298,6 +362,7 @@ class GoferUiServer(ThreadingHTTPServer):
     def _continuous_monitor_loop(self) -> None:
         while not self._continuous_stop.is_set():
             try:
+                self.sync_schedules()
                 self.ensure_continuous_runs()
             except Exception:  # noqa: BLE001
                 log.exception("Continuous workflow monitor failed")
@@ -372,23 +437,110 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
     def handle(self) -> None:
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError):
             # Browsers cancel stale requests during navigation. The response may
             # finish after the client has already closed its socket.
             return
 
+    def handle_one_request(self) -> None:
+        with self._read_deadline():
+            super().handle_one_request()
+
+    @contextmanager
+    def _read_deadline(self) -> Iterator[None]:
+        connection = getattr(self, "connection", None)
+        timer = None
+        if connection is not None:
+
+            def expire() -> None:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            timer = threading.Timer(UI_REQUEST_READ_DEADLINE_SECONDS, expire)
+            timer.daemon = True
+            timer.start()
+            self._read_timer = timer
+        try:
+            yield
+        finally:
+            if timer is not None:
+                timer.cancel()
+
     def do_GET(self) -> None:
-        parsed = urlparse(self.path)
+        self._dispatch_request("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch_request("POST")
+
+    def do_PUT(self) -> None:
+        self._dispatch_request("PUT")
+
+    def do_DELETE(self) -> None:
+        self._dispatch_request("DELETE")
+
+    def do_OPTIONS(self) -> None:
+        self._dispatch_request("OPTIONS")
+
+    def _dispatch_request(self, method: str) -> None:
+        # Header parsing has completed. Body reads get their own absolute deadline.
+        timer = getattr(self, "_read_timer", None)
+        if timer is not None:
+            timer.cancel()
+        try:
+            parsed = urlparse(self.path)
+        except ValueError:
+            self._send_json({"error": "Invalid request path"}, status=400)
+            return
+        self._request_method = method
+        if not self._allow_host():
+            self._send_json({"error": "Host is not allowed"}, status=403)
+            return
         if not self._allow_origin(parsed.path):
             self._send_json({"error": "Origin is not allowed"}, status=403)
             return
+        if not self._authorize_ui_request(method, parsed.path):
+            return
+        headers = self.headers
+        if headers.get("Transfer-Encoding") or len(headers.get_all("Content-Length", [])) > 1:
+            self.close_connection = True
+            self._send_json({"error": "Ambiguous request body framing"}, status=400)
+            return
+        slots = getattr(self.server, "_expensive_slots", None)
+        expensive = method == "POST" and (
+            parsed.path.startswith("/api/chat")
+            or parsed.path.endswith(("/run", "/resume", "/trigger", "/replay"))
+        )
+        acquired = False
+        if expensive and slots is not None:
+            acquired = slots.acquire(blocking=False)
+            if not acquired:
+                self._send_json({"error": "Too many active requests; retry shortly"}, status=503)
+                return
+        try:
+            getattr(self, f"_dispatch_{method}")()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except TimeoutError:
+            self._send_json({"error": "Request exceeded its execution deadline"}, status=408)
+        finally:
+            if acquired and slots is not None:
+                slots.release()
+
+    def _dispatch_GET(self) -> None:
+        parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json(
-                {
-                    "ok": True,
-                    "dataDir": str(self._default_data_dir()),
-                }
-            )
+            self._send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/desktop/trusted-roots":
+            secret = getattr(self.server, "path_grant_secret", "")
+            supplied = self.headers.get("X-Gofer-Desktop-Grant-Secret", "")
+            if not secret or not hmac.compare_digest(secret, supplied):
+                self._send_json({"error": "Desktop authentication required"}, status=403)
+                return
+            self._send_json({"roots": list(getattr(self.server, "trusted_project_roots", ()))})
             return
 
         if parsed.path == "/api/session":
@@ -442,7 +594,6 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
-            self._sync_schedules()
             payload = list_workflow_payloads(self._request_data_dir(query))
             self._send_json(payload)
             return
@@ -666,13 +817,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not found"}, status=404)
 
-    def do_POST(self) -> None:
+    def _dispatch_POST(self) -> None:
         parsed = urlparse(self.path)
-        if not self._allow_origin(parsed.path):
-            self._send_json({"error": "Origin is not allowed"}, status=403)
-            return
-        if not self._authorize_ui_request("POST", parsed.path):
-            return
         if parsed.path == "/api/projects/open":
             query = parse_qs(parsed.query)
             try:
@@ -899,7 +1045,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     Path(str(body.get("outputPath", ""))),
                     self._request_data_dir(query),
                 )
-                self._assert_bundle_path_allowed(
+                output_path = self._assert_bundle_path_allowed(
                     output_path,
                     body.get("grantId"),
                     must_exist=False,
@@ -1141,8 +1287,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             from gofer.ui.commit_message import generate_commit_message
 
             try:
-                body = self._read_json(limit=128 * 1024 * 1024)
-                result = asyncio.run(
+                body = self._read_json(limit=COMMIT_MESSAGE_MAX_BODY_BYTES)
+                result = self._run_async(
                     generate_commit_message(
                         provider=str(body.get("provider", "codex")),
                         model=str(body.get("model", "cli-default")),
@@ -1165,7 +1311,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_stream_headers()
-            asyncio.run(
+            self._run_async(
                 self._stream_chat_response(
                     body=body,
                     data_dir=self._request_data_dir(query),
@@ -1178,7 +1324,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json()
                 self._validate_second_brain(body)
-                response = asyncio.run(
+                response = self._run_async(
                     run_workflow_chat(
                         provider=str(body.get("provider", "codex")),
                         model=str(body.get("model", "cli-default")),
@@ -1261,7 +1407,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 trigger_context = body.get("triggerContext")
                 if trigger_context is not None and not isinstance(trigger_context, dict):
                     raise WorkflowRunError("triggerContext must be an object")
-                payload = asyncio.run(
+                payload = self._run_async(
                     resume_workflow_payload(
                         workflow_id,
                         self._request_data_dir(query),
@@ -1406,7 +1552,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     Path(str(body.get("outputPath", ""))),
                     self._request_data_dir(query),
                 )
-                self._assert_bundle_path_allowed(
+                output_path = self._assert_bundle_path_allowed(
                     output_path,
                     body.get("grantId"),
                     must_exist=False,
@@ -1515,7 +1661,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 if inputs is not None and not isinstance(inputs, dict):
                     raise WorkflowRunError("inputs must be an object")
                 if parameters is None and inputs is None:
-                    result = asyncio.run(
+                    result = self._run_async(
                         run_workflow_payload(
                             workflow_id,
                             self._request_data_dir(query),
@@ -1524,7 +1670,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                         )
                     )
                 else:
-                    result = asyncio.run(
+                    result = self._run_async(
                         run_workflow_payload(
                             workflow_id,
                             self._request_data_dir(query),
@@ -1555,7 +1701,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 run_id = str(body.get("runId") or "")
                 if not run_id:
                     raise WorkflowTriggerError("runId is required")
-                payload = asyncio.run(
+                payload = self._run_async(
                     replay_workflow_trigger_payload(
                         workflow_id,
                         run_id,
@@ -1582,7 +1728,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
-                payload = asyncio.run(
+                payload = self._run_async(
                     trigger_workflow_payload(
                         workflow_id,
                         trigger_id,
@@ -1629,13 +1775,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not found"}, status=404)
 
-    def do_PUT(self) -> None:
+    def _dispatch_PUT(self) -> None:
         parsed = urlparse(self.path)
-        if not self._allow_origin(parsed.path):
-            self._send_json({"error": "Origin is not allowed"}, status=403)
-            return
-        if not self._authorize_ui_request("PUT", parsed.path):
-            return
         if parsed.path.startswith("/api/workflows/"):
             workflow_id = parsed.path.removeprefix("/api/workflows/")
             query = parse_qs(parsed.query)
@@ -1655,13 +1796,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not found"}, status=404)
 
-    def do_DELETE(self) -> None:
+    def _dispatch_DELETE(self) -> None:
         parsed = urlparse(self.path)
-        if not self._allow_origin(parsed.path):
-            self._send_json({"error": "Origin is not allowed"}, status=403)
-            return
-        if not self._authorize_ui_request("DELETE", parsed.path):
-            return
         if parsed.path == "/api/chat":
             query = parse_qs(parsed.query)
             try:
@@ -1740,22 +1876,9 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not found"}, status=404)
 
-    def do_OPTIONS(self) -> None:
-        parsed = urlparse(self.path)
-        if not self._allow_origin(parsed.path):
-            self.send_response(403)
-            self.end_headers()
-            return
+    def _dispatch_OPTIONS(self) -> None:
         self.send_response(204)
-        origin = self._cors_origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-Gofer-Desktop-Grant-Secret, "
-            "X-Gofer-UI-Token, X-Gofer-Webhook-Token",
-        )
+        self._send_common_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
@@ -1771,6 +1894,21 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         server = self.server
         if isinstance(server, GoferUiServer):
             server.ensure_continuous_runs()
+
+    def _run_async(self, operation: Coroutine[Any, Any, Any]) -> Any:
+        async def bounded() -> Any:
+            timeout = getattr(self.server, "request_job_timeout", UI_JOB_DEADLINE_SECONDS)
+            return await asyncio.wait_for(operation, timeout=timeout)
+
+        try:
+            return asyncio.run(bounded())
+        except TimeoutError:
+            if getattr(self, "_stream_started", False):
+                self._write_stream_event(
+                    {"type": "error", "error": "Request exceeded its execution deadline"}
+                )
+                return None
+            raise
 
     async def _stream_chat_response(self, body: dict[str, Any], data_dir: Path) -> None:
         cancel_event = threading.Event()
@@ -1843,7 +1981,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         grant_id: object,
         *,
         must_exist: bool,
-    ) -> None:
+    ) -> Path:
         server = self.server
         grants = (
             server.path_grants if isinstance(server, GoferUiServer) else DesktopPathGrantStore()
@@ -1852,15 +1990,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         try:
             canonical_target = _canonical_path_for_containment(target_path)
             canonical_data_dir = _canonical_path_for_containment(data_dir)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise WorkflowBundleError(str(exc)) from exc
         if must_exist and not target_path.exists():
             raise WorkflowBundleError(f"Bundle path does not exist: {target_path}")
         if _is_path_inside(canonical_target, canonical_data_dir):
-            return
+            return canonical_target
         grant_value = str(grant_id or "").strip()
-        if grants.covers(target_path, grant_value):
-            return
+        if grants.covers_canonical(canonical_target, grant_value):
+            return canonical_target
         raise WorkflowBundleError("Bundle path is outside the approved Taskurotta desktop roots")
 
     def _register_desktop_path_grant(self, body: dict[str, Any]) -> dict[str, str]:
@@ -1868,7 +2006,9 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(server, GoferUiServer):
             raise ValueError("Desktop path grants are unavailable")
         secret = server.path_grant_secret
-        if not secret or self.headers.get("X-Gofer-Desktop-Grant-Secret") != secret:
+        if not secret or not hmac.compare_digest(
+            self.headers.get("X-Gofer-Desktop-Grant-Secret", ""), secret
+        ):
             raise ValueError("Desktop path grant registration is unauthorized")
         target_path = str(body.get("path") or "").strip()
         grant_id = str(body.get("grantId") or "").strip()
@@ -1899,7 +2039,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 "",
                 0,
             )
-        raw_body = self.rfile.read(content_length)
+        with self._read_deadline():
+            raw_body = self.rfile.read(content_length)
         if len(raw_body) != content_length:
             raise json.JSONDecodeError("Incomplete request body", "", 0)
         payload = json.loads(raw_body.decode("utf-8") or "{}")
@@ -1912,15 +2053,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        origin = self._cors_origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-Gofer-Desktop-Grant-Secret, "
-            "X-Gofer-UI-Token, X-Gofer-Webhook-Token",
-        )
+        if getattr(self, "_request_method", "") == "GET" and "/logs" in self.path:
+            self.send_header("ETag", '"' + hashlib.sha256(body).hexdigest() + '"')
+            self.send_header("Access-Control-Expose-Headers", "ETag")
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1936,34 +2072,61 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        origin = self._cors_origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def _send_stream_headers(self) -> None:
+        self._stream_started = True
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        origin = self._cors_origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-Gofer-UI-Token",
-        )
+        self._send_common_headers()
         self.end_headers()
 
     def _write_stream_event(self, event: dict[str, Any]) -> None:
         self.wfile.write(json.dumps(event).encode("utf-8") + b"\n")
         self.wfile.flush()
 
+    def _send_common_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Vary", "Origin")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Gofer-Desktop-Grant-Secret, "
+            "X-Gofer-UI-Token, X-Gofer-Webhook-Token",
+        )
+
+    def _allow_host(self) -> bool:
+        values = self.headers.get_all("Host", [])
+        if len(values) != 1:
+            return False
+        try:
+            parsed = urlparse("http://" + values[0])
+            address = self.server.server_address
+            if not isinstance(address, tuple) or len(address) < 2:
+                return False
+            host, port = address[:2]
+            allowed_hosts = {str(host).lower()}
+            if host in {"127.0.0.1", "::1", "0.0.0.0", "::"}:
+                allowed_hosts.update({"localhost", "127.0.0.1", "::1"})
+            return (
+                parsed.hostname in allowed_hosts
+                and (parsed.port or 80) == int(port)
+                and not parsed.username
+                and not parsed.password
+                and not parsed.path
+                and not parsed.query
+                and not parsed.fragment
+            )
+        except ValueError:
+            return False
+
     def _allow_origin(self, path: str) -> bool:
-        if not path.startswith("/api/"):
-            return True
         origin = getattr(self, "headers", {}).get("Origin")
         if not origin:
             return True
@@ -1972,41 +2135,60 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
     def _cors_origin(self) -> str | None:
         origin_value = getattr(self, "headers", {}).get("Origin")
         origin = str(origin_value) if origin_value else None
-        if origin and self._is_allowed_origin(origin):
-            return origin
-        return None
+        return origin if origin and self._is_allowed_origin(origin) else None
 
     def _is_allowed_origin(self, origin: str) -> bool:
+        # file:// desktop documents have an opaque origin. Only a credentialed
+        # desktop request or its token-header preflight can use that origin.
+        if origin == "null":
+            if self._has_ui_api_token():
+                return True
+            requested = {
+                value.strip().lower()
+                for value in self.headers.get("Access-Control-Request-Headers", "").split(",")
+            }
+            return (
+                getattr(self, "_request_method", "") == "OPTIONS"
+                and self.headers.get("Access-Control-Request-Method")
+                in {"GET", "POST", "PUT", "DELETE"}
+                and bool(requested & {"authorization", "x-gofer-ui-token"})
+            )
         server = self.server
         allowed = server.allowed_origins if isinstance(server, GoferUiServer) else set()
         if origin in allowed:
             return True
         try:
             parsed_origin = urlparse(origin)
+            if (
+                parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.username
+                or parsed_origin.password
+                or parsed_origin.path
+                or parsed_origin.query
+                or parsed_origin.fragment
+            ):
+                return False
+            address = self.server.server_address
+            if not isinstance(address, tuple) or len(address) < 2:
+                return False
+            host, port = address[:2]
+            if parsed_origin.hostname not in {host, "localhost"}:
+                return False
+            origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+            return origin_port == int(port)
         except ValueError:
             return False
-        if parsed_origin.scheme not in {"http", "https"}:
-            return False
-        server_address = self.server.server_address
-        if not isinstance(server_address, tuple) or len(server_address) < 2:
-            return False
-        host, port = server_address[:2]
-        if parsed_origin.hostname not in {host, "localhost"}:
-            return False
-        expected_port = int(port)
-        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
-        return origin_port == expected_port
 
-    def _authorize_ui_request(self, method: str, path: str) -> bool:
-        if not _requires_ui_api_auth(method, path):
-            return True
-        server = self.server
-        expected = getattr(server, "api_token", "") if isinstance(server, GoferUiServer) else ""
+    def _has_ui_api_token(self) -> bool:
+        expected = getattr(self.server, "api_token", "")
         supplied = getattr(self, "headers", {}).get("X-Gofer-UI-Token")
         authorization = getattr(self, "headers", {}).get("Authorization", "")
         if supplied is None and authorization.startswith("Bearer "):
             supplied = authorization.removeprefix("Bearer ").strip()
-        if expected and supplied and hmac.compare_digest(supplied, expected):
+        return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+
+    def _authorize_ui_request(self, method: str, path: str) -> bool:
+        if not _requires_ui_api_auth(method, path) or self._has_ui_api_token():
             return True
         self._send_json({"error": "UI API authentication required"}, status=401)
         return False
@@ -2196,34 +2378,36 @@ def _default_allowed_origins() -> set[str]:
         parsed = urlparse(value)
         if parsed.scheme and parsed.netloc:
             origins.add(f"{parsed.scheme}://{parsed.netloc}")
-    origins.add("null")
     return origins
 
 
 def _requires_ui_api_auth(method: str, path: str) -> bool:
-    if method not in {"POST", "PUT", "DELETE"} or not path.startswith("/api/"):
+    if method == "OPTIONS" or (method == "GET" and path == "/api/health"):
         return False
-    if "/webhooks/" in path and (path.endswith("/trigger") or path.endswith("/replay")):
-        return False
+    # Webhooks have a workflow-specific token verified by trigger/replay handlers.
+    if method == "POST" and path.startswith("/api/workflows/"):
+        parts = path.removeprefix("/api/workflows/").split("/")
+        if len(parts) == 4 and parts[1] == "webhooks" and parts[3] in {"trigger", "replay"}:
+            return False
     return True
 
 
 def _canonical_path_for_containment(target_path: Path) -> Path:
     path = target_path.expanduser()
-    if path.exists():
+    if path.exists() or path.is_symlink():
         return path.resolve(strict=True)
 
     missing_parts: list[str] = []
     current = path
-    while not current.exists() and current != current.parent:
+    while not current.exists() and not current.is_symlink() and current != current.parent:
         missing_parts.insert(0, current.name)
         current = current.parent
 
-    if current.exists():
+    if current.exists() or current.is_symlink():
         parent = current.resolve(strict=True)
     else:
         parent = current.resolve(strict=False)
-    return parent.joinpath(*missing_parts)
+    return Path(os.path.normpath(parent.joinpath(*missing_parts)))
 
 
 def _resolve_ui_bundle_path(target_path: Path, data_dir: Path) -> Path:

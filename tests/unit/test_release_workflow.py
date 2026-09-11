@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _parse_scalar(value: str) -> Any:
-    value = value.strip()
+    value = value.split(" # ", 1)[0].strip()
     if value == "":
         return ""
     if value in {"true", "false"}:
@@ -167,7 +167,8 @@ def test_main_and_tag_entries_call_the_same_release_build() -> None:
     assert dry_run["uses"] == "./.github/workflows/release-build.yml"
     assert dry_run["with"] == {"checkout_ref": "${{ github.sha }}"}
     assert tagged_release["uses"] == "./.github/workflows/release-build.yml"
-    assert tagged_release["with"] == {"checkout_ref": "${{ github.ref }}"}
+    assert tagged_release["with"] == {"checkout_ref": "${{ github.ref }}", "signed_release": True}
+    assert tagged_release["secrets"] == "inherit"
 
 
 def test_only_tag_entry_can_publish() -> None:
@@ -180,7 +181,11 @@ def test_only_tag_entry_can_publish() -> None:
 
     publish_job = _job(tagged_release, "publish")
     assert publish_job["needs"] == "release-build"
-    assert publish_job["permissions"] == {"contents": "write"}
+    assert publish_job["permissions"] == {
+        "contents": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
 
 
 def test_release_workflow_matrix_matches_supported_platforms() -> None:
@@ -212,6 +217,7 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
                 "frontend/release/*.exe.blockmap\n"
                 "frontend/release/latest.yml\n"
                 "frontend/release/checksums-windows.txt\n"
+                "frontend/release/signatures-windows.json\n"
             ),
         },
         "macos": {
@@ -227,6 +233,7 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
                 "frontend/release/latest-mac.yml\n"
                 "frontend/release/gof-macos-*\n"
                 "frontend/release/checksums-macos.txt\n"
+                "frontend/release/notarization-macos-*.json\n"
             ),
         },
     }
@@ -276,6 +283,7 @@ def test_release_workflow_uploads_expected_artifacts_and_checksums() -> None:
         "frontend/release/*.exe.blockmap",
         "frontend/release/latest.yml",
         "frontend/release/checksums-windows.txt",
+        "frontend/release/signatures-windows.json",
     ]
     assert _artifact_globs(matrix["macos"]) == [
         "frontend/release/*.dmg",
@@ -285,6 +293,7 @@ def test_release_workflow_uploads_expected_artifacts_and_checksums() -> None:
         "frontend/release/latest-mac.yml",
         "frontend/release/gof-macos-*",
         "frontend/release/checksums-macos.txt",
+        "frontend/release/notarization-macos-*.json",
     ]
 
     for platform, step_name in (
@@ -309,7 +318,7 @@ def test_release_workflow_publication_and_artifact_upload_contract() -> None:
 
     assert build_job["needs"] == "validate"
     workflow_upload = build_steps["Upload workflow artifacts"]
-    assert workflow_upload["uses"] == "actions/upload-artifact@v4"
+    assert re.fullmatch(r"actions/upload-artifact@[0-9a-f]{40}", workflow_upload["uses"])
     assert workflow_upload["with"] == {
         "name": "${{ matrix.artifact-name }}",
         "path": "${{ matrix.artifact-glob }}",
@@ -324,14 +333,14 @@ def test_release_workflow_publication_and_artifact_upload_contract() -> None:
     assert publish_job["runs-on"] == "ubuntu-24.04"
     publish_steps = _steps_by_name(publish_job)
     download = publish_steps["Download packaged artifacts"]
-    assert download["uses"] == "actions/download-artifact@v4"
+    assert re.fullmatch(r"actions/download-artifact@[0-9a-f]{40}", download["uses"])
     assert download["with"] == {
         "pattern": "gofer-flow-*",
         "path": "release-artifacts",
         "merge-multiple": True,
     }
     release_upload = publish_steps["Upload GitHub release artifacts"]
-    assert release_upload["uses"] == "softprops/action-gh-release@v2"
+    assert re.fullmatch(r"softprops/action-gh-release@[0-9a-f]{40}", release_upload["uses"])
     assert release_upload["with"] == {
         "files": "release-artifacts/*",
         "fail_on_unmatched_files": True,
@@ -361,3 +370,74 @@ def test_release_validation_gates_packages_and_checks_tag_versions() -> None:
     assert "Lint frontend source" not in build_steps
     assert "Test frontend" not in build_steps
     assert "Browser-test workflow studio" not in build_steps
+
+
+def test_release_security_gates_are_mandatory_and_publish_provenance() -> None:
+    workflow = _release_workflow()
+    validation = _steps_by_name(_job(workflow, "validate"))
+    expected = {
+        "Install locked Python dependencies": (
+            "uv sync --locked --extra dev --extra xlsx --group dev"
+        ),
+        "Lint Python": "uv run --locked ruff check src tests",
+        "Type-check Python": "uv run --locked mypy src tests",
+        "Test Python": "uv run --locked pytest",
+        "Audit all locked Python platform dependencies": (
+            "uv run --locked python scripts/audit-dependencies.py"
+        ),
+    }
+    for name, command in expected.items():
+        assert validation[name]["run"] == command
+        assert "continue-on-error" not in validation[name]
+        assert "if" not in validation[name]
+    npm_audit = validation["Audit frontend and shipped Electron dependencies"]
+    assert "npm audit --include=peer --audit-level=low --json" in npm_audit["run"]
+    assert "--omit=dev" not in npm_audit["run"]
+    assert "continue-on-error" not in npm_audit
+    evidence = validation["Save dependency audit evidence"]
+    assert evidence["if"] == "always()"
+    assert evidence["with"]["name"] == "gofer-flow-audit-evidence"
+    build = _steps_by_name(_build_job(workflow))
+    assert "--locked" in build["Install Python dependencies"]["run"]
+    filesystem_tests = build["Test platform filesystem security"]
+    assert "test_native_filesystem_security.py" in filesystem_tests["run"]
+    native_tests = build["Test native terminal and Electron security on packaged runtime version"]
+    assert native_tests["run"] == "npm run test:platform"
+    assert "if" not in native_tests
+    assert "continue-on-error" not in native_tests
+    names = list(build)
+    assert names.index("Build Electron packages") < names.index(native_tests["name"])
+    assert names.index(native_tests["name"]) < names.index("Upload workflow artifacts")
+    assert "--config.forceCodeSigning=true" in build["Build Electron packages"]["run"]
+    for name in (
+        "Require Windows signing credentials",
+        "Prepare macOS signing keychain",
+        "Sign Windows backend before packaging",
+        "Verify Windows release signatures",
+        "Verify macOS signatures and notarization",
+    ):
+        assert "inputs.signed_release" in build[name]["if"]
+        assert "continue-on-error" not in build[name]
+    assert "env" not in build["Install frontend dependencies"]
+    assert "env" not in _build_job(workflow)
+    publish = _steps_by_name(_job(_entry_workflow("release.yml"), "publish"))
+    provenance = publish["Attest all desktop, CLI, checksum and audit artifacts"]
+    assert re.fullmatch(r"actions/attest-build-provenance@[0-9a-f]{40}", provenance["uses"])
+    assert provenance["with"]["subject-path"] == "release-artifacts/*"
+
+
+def test_all_external_workflow_actions_are_immutable_and_have_update_configuration() -> None:
+    for workflow in (REPO_ROOT / ".github/workflows").glob("*.yml"):
+        for action in re.findall(r"uses: ([^\s#]+)", workflow.read_text()):
+            if not action.startswith("./"):
+                assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", action), action
+    updates = (REPO_ROOT / ".github/dependabot.yml").read_text()
+    assert "package-ecosystem: github-actions" in updates
+
+
+def test_validation_and_platform_builds_checkout_the_same_event_commit() -> None:
+    workflow = _release_workflow()
+    for job_name in ("validate", "build"):
+        checkout = _steps_by_name(_job(workflow, job_name))["Check out repository"]
+        assert checkout["with"]["ref"] == "${{ github.sha }}"
+        assert "checkout_ref" not in checkout["with"]["ref"]

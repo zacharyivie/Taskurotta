@@ -179,3 +179,27 @@ def test_discovery_removes_previous_project_registrations_outside_taskurotta(
     persisted = json.loads(registry_path.read_text(encoding="utf-8"))
     assert [item["id"] for item in persisted["workflows"]] == ["other", "kept"]
     assert (stray_root / "workflow.rad").read_text(encoding="utf-8") == source
+
+
+@pytest.mark.parametrize("action", ["create", "install", "discover"])
+def test_workspace_operations_reject_linked_workspace_roots(tmp_path: Path, action: str) -> None:
+    from gofer.radish.workspaces import install_registered_workflow
+
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project / ".taskurotta").symlink_to(outside, target_is_directory=True)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "workflow.rad").write_text("Radish: 1\n\nWorkflow:\n  name: test\n")
+    with pytest.raises((OSError, RadishWorkspaceError)):
+        if action == "create":
+            create_registered_workflow(project, "test", registry_dir=tmp_path / "data")
+        elif action == "install":
+            install_registered_workflow(
+                project, stage, "test", "test", registry_dir=tmp_path / "data"
+            )
+        else:
+            discover_registered_workflows(project, registry_dir=tmp_path / "data")
+    assert list(outside.iterdir()) == []

@@ -15,6 +15,7 @@ const {
   dialog,
   ipcMain,
   shell,
+  session,
   webContents,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
@@ -40,12 +41,17 @@ const {
 } = require("./browser-utils.cjs");
 const { searchProject, replaceProject } = require("./project-search.cjs");
 const { createAppLog } = require("./app-log.cjs");
-const { archiveConversation } = require("./conversation-archive.cjs");
+const { createArchiveQueue } = require("./archive-queue.cjs");
+const conversationArchives = createArchiveQueue();
+let archivesDrained = false;
 const REPORT_THEMES = ["auto", "light", "dark", "sepia", "vaporwave", "steam", "carbon", "botanical", "blueprint", "arcade", "sakura", "deep-sea", "solarpunk", "noir", "candy-lab", "cosmic"];
 let applicationLog;
 const { registerIpcHandlers } = require("./ipc-handlers.cjs");
 const { inspectPath } = require("./path-info.cjs");
+const safeFiles = require("./safe-files.cjs");
+const { installPermissionPolicy, isStudioDocument, studioCsp } = require("./studio-policy.cjs");
 const { createIpcSecurity, isSafeExternalUrl } = require("./security.cjs");
+const { createTrustedProjectStore } = require("./trusted-projects.cjs");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const distIndexPath = path.join(__dirname, "..", "dist", "index.html");
@@ -92,6 +98,7 @@ let mainWindow;
 let backendErrorWindow;
 let ipcSecurity;
 let backendErrorIpcSecurity;
+let legacyProjectMigrationToken = "";
 const terminalSessions = new Map();
 const browserSessions = new Map();
 const terminalEditorRequests = new Map();
@@ -116,6 +123,10 @@ if (!singleInstanceLock) {
 }
 
 function createWindow(apiBaseUrl, apiToken = "") {
+  legacyProjectMigrationToken = "";
+  try {
+    if (!trustedProjectStore().read().legacyRecentProjectsMigrated) legacyProjectMigrationToken = crypto.randomUUID();
+  } catch { writeBackendLog("TRUSTED_PROJECT_REGISTRY_UNAVAILABLE\n"); }
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 960,
@@ -134,10 +145,29 @@ function createWindow(apiBaseUrl, apiToken = "") {
         `--gofer-api-base-url=${apiBaseUrl}`,
         `--gofer-api-token=${apiToken}`,
         `--gofer-browser-preload=${pathToFileURL(browserPreloadPath)}`,
+        ...(legacyProjectMigrationToken ? [`--gofer-legacy-project-migration=${legacyProjectMigrationToken}`] : []),
       ],
     },
   });
   const terminalOwnerId = mainWindow.webContents.id;
+  const studioOptions = { indexPath: distIndexPath, devServerUrl: VITE_DEV_SERVER_URL, isProduction };
+  installPermissionPolicy(session.fromPartition("persist:taskurotta-browser"), mainWindow.webContents.session,
+    () => mainWindow?.webContents, studioOptions);
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (!isStudioDocument(url, studioOptions)) event.preventDefault();
+  });
+  mainWindow.webContents.on("will-redirect", (event, url) => {
+    if (!isStudioDocument(url, studioOptions)) event.preventDefault();
+  });
+  // Apply CSP to the studio document only; isolated local reports keep their CSS.
+  mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = { ...details.responseHeaders };
+    if (details.webContentsId === mainWindow?.webContents.id && details.resourceType === "mainFrame"
+      && isStudioDocument(details.url, studioOptions)) {
+      responseHeaders["Content-Security-Policy"] = [studioCsp({ ...studioOptions, apiBaseUrl })];
+    }
+    callback({ responseHeaders });
+  });
 
   mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
     if (
@@ -482,10 +512,10 @@ app.whenReady().then(async () => {
   process.on("uncaughtExceptionMonitor", (error) => applicationLog.write("error", "desktop", error.stack || error.message));
   process.on("unhandledRejection", (error) => applicationLog.write("error", "desktop", error?.stack || error));
   app.on("web-contents-created", (_event, contents) => {
-    contents.on("console-message", (_event, details, message) => {
+    contents.on("console-message", (details) => {
       if (contents !== mainWindow?.webContents && contents !== backendErrorWindow?.webContents) return;
-      const level = typeof details === "object" ? details.level : details;
-      if ([2, 3, "warning", "error"].includes(level)) applicationLog.write(level === 3 || level === "error" ? "error" : "warn", "renderer", typeof details === "object" ? details.message : message);
+      const { level, message } = details;
+      if (["warning", "error"].includes(level)) applicationLog.write(level === "error" ? "error" : "warn", "renderer", message);
     });
   });
   app.on("render-process-gone", (_event, _contents, details) => applicationLog.write("error", "renderer", JSON.stringify(details)));
@@ -528,7 +558,12 @@ app.on("second-instance", () => {
   mainWindow.focus();
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
+  if (!archivesDrained) {
+    event.preventDefault();
+    void conversationArchives.close().finally(() => { archivesDrained = true; app.quit(); });
+    return;
+  }
   isQuitting = true;
   closeAllBrowsers();
   closeTerminalEditorServer();
@@ -543,6 +578,7 @@ app.on("window-all-closed", () => {
 });
 
 function setupIpcHandlers() {
+  ipcMain.on("gofer:migrate-legacy-projects", migrateLegacyProjects);
   ipcSecurity = createIpcSecurity({
     appRoots: [path.dirname(distIndexPath)],
     devServerUrl: VITE_DEV_SERVER_URL,
@@ -550,6 +586,8 @@ function setupIpcHandlers() {
     getMainWebContents: () =>
       mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     isProduction,
+    trustedRoots: readTrustedRoots(),
+    persistTrustedRoot,
   });
   backendErrorIpcSecurity = createIpcSecurity({
     appRoots: [path.dirname(backendErrorHtmlPath)],
@@ -589,7 +627,10 @@ function setupIpcHandlers() {
     gitWorktreeAdd,
     gitWorktreeRemove,
     grantPath,
+    grantDroppedPath,
+    grantUserPath,
     getUpdateState,
+    apiSession: () => ({ apiBaseUrl: activeApiBaseUrl, apiToken: activeUiApiToken }),
     installDownloadedUpdate,
     listDirectory,
     searchProject: (_event, options = {}) => searchProject(resolveExactPath(options.projectRoot, { grantId: options.grantId, mustExist: true }), options),
@@ -882,6 +923,10 @@ function configureBrowserSession(session) {
     });
   }
   contents.setWindowOpenHandler(({ url }) => {
+    if (session.grantId && /^file:/i.test(contents.getURL())) {
+      openBrowserLink(session, url);
+      return { action: "deny" };
+    }
     if (isAllowedBrowserNavigation(session, url)) {
       session.error = "";
       void contents.loadURL(url).catch((error) => {
@@ -895,23 +940,18 @@ function configureBrowserSession(session) {
 }
 
 function openBrowserLink(session, value) {
-  if (!isAllowedBrowserNavigation(session, value) || session.owner.isDestroyed()) return;
-  const url = new URL(value);
-  if (url.protocol === "file:" && isMarkdownFilePath(url.pathname)) {
-    const targetPath = resolveExactPath(fileURLToPath(url), {
-      grantId: session.grantId,
-      mustExist: true,
-    });
-    if (!fs.statSync(targetPath).isFile()) return;
-    session.owner.send("gofer:browser-open-file", { path: targetPath });
+  if (session.owner.isDestroyed()) return;
+  let url;
+  try { url = new URL(value); } catch { return; }
+  if (url.protocol === "file:") {
+    // Local previews hand links to the studio, which checks the destination's
+    // own path grant and reports missing files. Never grant remote pages this route.
+    if (!session.grantId || !/^file:/i.test(browserSessionContents(session)?.getURL() || "")) return;
+    session.owner.send("gofer:browser-open-file", { href: url.toString() });
     return;
   }
+  if (!["http:", "https:"].includes(url.protocol)) return;
   session.owner.send("gofer:browser-open-tab", { url: url.toString() });
-}
-
-function isMarkdownFilePath(value) {
-  return [".md", ".markdown", ".mdown", ".mkd"].some((extension) =>
-    String(value || "").toLowerCase().endsWith(extension));
 }
 
 function showBrowserContextMenu(session, params) {
@@ -1734,7 +1774,8 @@ async function resolveProjectFile(_event, options = {}) {
   });
   const stat = await fs.promises.stat(selectedPath);
   const selectedDirectory = stat.isDirectory() ? selectedPath : path.dirname(selectedPath);
-  const projectRoot = nearestProjectRoot(selectedDirectory);
+  const discoveredRoot = nearestProjectRoot(selectedDirectory);
+  const projectRoot = getIpcSecurity().grantForPath(discoveredRoot) ? discoveredRoot : selectedDirectory;
   const handle = pathHandle(projectRoot);
   await registerBackendPathGrant(handle);
   return {
@@ -1760,13 +1801,37 @@ function nearestProjectRoot(startDirectory) {
   }
 }
 
+function grantUserPath(_event, options = {}) {
+  return getIpcSecurity().grantUserPath(options.targetPath);
+}
+
 async function grantPath(_event, options = {}) {
   if (!options.targetPath || typeof options.targetPath !== "string") {
     throw new Error("A path is required.");
   }
-  const handle = pathHandle(path.resolve(options.targetPath));
+  await restoreBackendTrustedRoots();
+  let handle;
+  try {
+    handle = getIpcSecurity().renewPath(options.targetPath);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code || error.cause?.code)) {
+      return { missing: true };
+    }
+    throw error;
+  }
   await registerBackendPathGrant(handle);
   return handle;
+}
+
+// This channel is exposed only through preload's webUtils.getPathForFile(File).
+// Synthetic renderer Files have no native path and cannot invoke it.
+async function grantDroppedPath(_event, options = {}) {
+  const selectedPath = path.resolve(options.targetPath);
+  const stat = await fs.promises.stat(selectedPath);
+  const root = stat.isFile() ? nearestProjectRoot(path.dirname(selectedPath)) : selectedPath;
+  const handle = getIpcSecurity().trustPath(root);
+  await registerBackendPathGrant(handle);
+  return { path: selectedPath, grantId: handle.grantId };
 }
 
 async function copyPath(_event, options = {}) {
@@ -1790,10 +1855,9 @@ async function copyPath(_event, options = {}) {
   if (fs.existsSync(destinationPath)) {
     throw new Error(`Destination already exists: ${destinationPath}`);
   }
-  await fs.promises.cp(sourcePath, destinationPath, {
-    errorOnExist: true,
-    force: false,
-    recursive: true,
+  await safeFiles.copyPath(sourcePath, destinationPath, {
+    authorizeSource: (target) => resolveExactPath(target, { grantId: options.sourceGrantId, mustExist: true }),
+    authorizeDestination: (target) => resolveExactPath(target, { grantId: options.destinationGrantId }),
   });
   return pathHandle(destinationPath);
 }
@@ -1836,20 +1900,19 @@ async function renamePath(_event, options = {}) {
   if (fs.existsSync(destinationPath)) {
     throw new Error(`Destination already exists: ${destinationPath}`);
   }
-  await fs.promises.rename(sourcePath, destinationPath);
+  await safeFiles.renamePath(sourcePath, destinationPath, (target) => resolveExactPath(target, { grantId: options.grantId }));
   return pathHandle(destinationPath);
 }
 
 async function createFile(_event, options = {}) {
   const filePath = resolveNewChildPath(options.directory, options.name, options.grantId);
-  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.promises.writeFile(filePath, "", { encoding: "utf-8", flag: "wx" });
+  await safeFiles.writeFile(filePath, "", { exclusive: true, authorize: (target) => resolveExactPath(target, { grantId: options.grantId }) });
   return pathHandle(filePath);
 }
 
 async function createFolder(_event, options = {}) {
   const folderPath = resolveNewChildPath(options.directory, options.name, options.grantId);
-  await fs.promises.mkdir(folderPath, { recursive: false });
+  await safeFiles.createDirectory(folderPath, (target) => resolveExactPath(target, { grantId: options.grantId }));
   return pathHandle(folderPath);
 }
 
@@ -1921,7 +1984,7 @@ async function writeTextFile(_event, options = {}) {
   const targetPath = resolveExactPath(options.targetPath, {
     grantId: options.grantId,
   });
-  await fs.promises.writeFile(targetPath, options.content, "utf-8");
+  await safeFiles.writeFile(targetPath, options.content, { authorize: (target) => resolveExactPath(target, { grantId: options.grantId }) });
   return pathHandle(targetPath);
 }
 
@@ -1947,36 +2010,38 @@ async function setDataDir(_event, options = {}) {
 }
 
 async function listDirectory(_event, options = {}) {
-  const directory = options.create === false
-    ? resolveExactPath(options.currentPath, {
-        grantId: options.grantId,
-        mustExist: true,
-      })
-    : resolvePickerDefaultPath(options.currentPath, options.grantId);
-  if (options.create !== false) {
-    fs.mkdirSync(directory, { recursive: true });
-  }
-  const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+  try {
+    const directory = resolveExactPath(options.currentPath, {
+      grantId: options.grantId,
+      mustExist: true,
+    });
+    const entries = await fs.promises.readdir(directory, { withFileTypes: true });
 
-  return {
-    ...pathHandle(directory),
-    directory,
-    parent: path.dirname(directory) === directory ? null : path.dirname(directory),
-    entries: entries
-      .map((entry) => ({
-        hidden: entry.name.startsWith("."),
-        isDirectory: entry.isDirectory(),
-        isFile: entry.isFile(),
-        name: entry.name,
-        ...pathHandle(path.join(directory, entry.name)),
-      }))
-      .sort((left, right) => {
-        if (left.isDirectory !== right.isDirectory) {
-          return left.isDirectory ? -1 : 1;
-        }
-        return left.name.localeCompare(right.name);
-      }),
-  };
+    return {
+      ...pathHandle(directory),
+      directory,
+      parent: path.dirname(directory) === directory ? null : path.dirname(directory),
+      entries: entries
+        .map((entry) => ({
+          hidden: entry.name.startsWith("."),
+          isDirectory: entry.isDirectory(),
+          isFile: entry.isFile(),
+          name: entry.name,
+          ...entryPathHandle(path.join(directory, entry.name)),
+        }))
+        .sort((left, right) => {
+          if (left.isDirectory !== right.isDirectory) {
+            return left.isDirectory ? -1 : 1;
+          }
+          return left.name.localeCompare(right.name);
+        }),
+    };
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code || error.cause?.code)) {
+      return { directory: options.currentPath, entries: [], missing: true };
+    }
+    throw error;
+  }
 }
 
 function developerInfo() {
@@ -2027,10 +2092,10 @@ async function configureRem(_event, options = {}) {
   fs.renameSync(`${file}.tmp`, file);
   return config;
 }
-function archiveRem(_event, { thread, messages, deleted } = {}) {
+async function archiveRem(_event, { thread, messages, deleted } = {}) {
   const config = remSettings();
   if (!config.archiveFolder) return { skipped: true };
-  const result = archiveConversation(config.archiveFolder, thread, messages, { dataDir: getGoferDataDir(), deleted: deleted === true });
+  const result = await conversationArchives.archive(config.archiveFolder, thread, messages, { dataDir: getGoferDataDir(), deleted: deleted === true });
   for (const warning of result.warnings || []) applicationLog?.write("warn", "archive", warning);
   return result;
 }
@@ -2052,15 +2117,22 @@ async function gitSwitchBranch(_event, options = {}) {
 }
 
 async function gitStatus(_event, options = {}) {
-  const projectRoot = resolveExactPath(options.projectRoot, {
-    grantId: options.grantId,
-    mustExist: true,
-  });
-  const stat = await fs.promises.stat(projectRoot);
-  if (!stat.isDirectory()) {
-    throw new Error(`Git status path is not a folder: ${projectRoot}`);
+  try {
+    const projectRoot = resolveExactPath(options.projectRoot, {
+      grantId: options.grantId,
+      mustExist: true,
+    });
+    const stat = await fs.promises.stat(projectRoot);
+    if (!stat.isDirectory()) {
+      throw new Error(`Git status path is not a folder: ${projectRoot}`);
+    }
+    return await readGitStatus(projectRoot);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code || error.cause?.code)) {
+      return { active: false, entries: [], missing: true };
+    }
+    throw error;
   }
-  return readGitStatus(projectRoot);
 }
 
 async function gitFileBaseline(_event, options = {}) {
@@ -2069,20 +2141,34 @@ async function gitFileBaseline(_event, options = {}) {
 }
 
 async function gitHistory(_event, options = {}) {
-  const projectRoot = await resolveGitProjectDirectory(options);
-  return readGitHistory(projectRoot);
+  try {
+    const projectRoot = await resolveGitProjectDirectory(options);
+    return await readGitHistory(projectRoot);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code || error.cause?.code)) {
+      return { active: false, commits: [], missing: true };
+    }
+    throw error;
+  }
 }
 
 async function gitWorktrees(_event, options = {}) {
-  const projectRoot = await resolveGitProjectDirectory(options);
-  const result = await readGitWorktrees(projectRoot);
-  const worktrees = await Promise.all(result.worktrees.map(async (worktree) => {
-    if (worktree.missing) return worktree;
-    const handle = pathHandle(worktree.path);
-    await registerBackendPathGrant(handle);
-    return { ...worktree, grantId: handle.grantId, path: handle.path };
-  }));
-  return { ...result, worktrees };
+  try {
+    const projectRoot = await resolveGitProjectDirectory(options);
+    const result = await readGitWorktrees(projectRoot);
+    const worktrees = await Promise.all(result.worktrees.map(async (worktree) => {
+      if (worktree.missing) return worktree;
+      const handle = entryPathHandle(worktree.path);
+      if (handle.grantId) await registerBackendPathGrant(handle);
+      return { ...worktree, grantId: handle.grantId, path: handle.path };
+    }));
+    return { ...result, worktrees };
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code || error.cause?.code)) {
+      return { active: false, worktrees: [], missing: true };
+    }
+    throw error;
+  }
 }
 
 async function gitWorktreeAdd(_event, options = {}) {
@@ -2130,7 +2216,6 @@ async function selectPath(_event, options = {}) {
   const parentWindow =
     mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const defaultPath = resolvePickerDefaultPath(options.currentPath, options.grantId);
-  fs.mkdirSync(defaultPath, { recursive: true });
   const properties = options.directoryOnly === true
     ? ["openDirectory", "showHiddenFiles", "createDirectory"]
     : options.fileOnly === true
@@ -2147,7 +2232,13 @@ async function selectPath(_event, options = {}) {
     return null;
   }
 
-  const handle = getIpcSecurity().grantPath(result.filePaths[0]);
+  const selectedPath = result.filePaths[0];
+  const selectedStat = await fs.promises.stat(selectedPath);
+  // Selecting a project file has always opened its project. Derive that root
+  // from the native picker result, never from a renderer-supplied path.
+  const root = selectedStat.isFile() ? nearestProjectRoot(path.dirname(selectedPath)) : selectedPath;
+  const trusted = getIpcSecurity().trustPath(root);
+  const handle = { path: selectedPath, grantId: trusted.grantId };
   await registerBackendPathGrant(handle);
   return handle;
 }
@@ -2158,14 +2249,80 @@ function resolvePickerDefaultPath(currentPath, grantId = "") {
 
 function pathHandle(targetPath) {
   const security = getIpcSecurity();
-  const existingGrantId = security.grantForPath(targetPath);
+  const existingGrantId = security.grantForPath(targetPath) || security.userGrantForPath(targetPath);
   if (existingGrantId) {
     return { grantId: existingGrantId, path: targetPath };
   }
-  return security.grantPath(targetPath);
+  return security.renewPath(targetPath);
+}
+
+function entryPathHandle(targetPath) {
+  try { return pathHandle(targetPath); }
+  catch { return { path: targetPath, grantId: "" }; }
+}
+
+function trustedProjectStore() {
+  return createTrustedProjectStore(path.join(app.getPath("userData"), "trusted-projects.json"));
+}
+
+function migrateLegacyProjects(event, payload) {
+  event.returnValue = false;
+  try {
+    getIpcSecurity().assertTrustedSender(event);
+    if (!legacyProjectMigrationToken || payload?.token !== legacyProjectMigrationToken) return;
+    // Only the isolated preload's initial snapshot may use this launch token.
+    // Reloads and later renderer edits cannot add new trusted roots.
+    legacyProjectMigrationToken = "";
+    if (payload.unavailable) return;
+    if (payload.recentProjects !== null && typeof payload.recentProjects !== "string") return;
+    const roots = trustedProjectStore().migrate(payload.recentProjects);
+    for (const root of roots) {
+      getIpcSecurity().restoreTrustedPath(root);
+    }
+    event.returnValue = true;
+  } catch {
+    writeBackendLog("LEGACY_PROJECT_MIGRATION_FAILED\n");
+  }
+}
+
+function readTrustedRoots() {
+  let roots = [];
+  try { roots = trustedProjectStore().read().roots; }
+  catch { writeBackendLog("TRUSTED_PROJECT_REGISTRY_UNAVAILABLE\n"); }
+  // These paths were accepted and persisted by main after native selection.
+  // Restore them during migration without exposing a new grant to the renderer.
+  try {
+    const settings = remSettings();
+    for (const key of ["archiveFolder", "secondBrainRoot"]) {
+      if (typeof settings[key] === "string" && settings[key]) roots.push(settings[key]);
+    }
+  } catch { /* Invalid settings remain unavailable. */ }
+  return [...new Set(roots)];
+}
+
+function persistTrustedRoot(root) {
+  trustedProjectStore().add([...readTrustedRoots(), root]);
+}
+
+let restoredBackendRootsFor = "";
+async function restoreBackendTrustedRoots() {
+  if (!activeApiBaseUrl || !activeUiApiToken || restoredBackendRootsFor === activeUiApiToken) return;
+  const response = await fetch(`${activeApiBaseUrl}/api/desktop/trusted-roots`, {
+    headers: { Authorization: `Bearer ${activeUiApiToken}`, "X-Gofer-Desktop-Grant-Secret": desktopGrantSecret },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) throw new Error("Could not restore trusted project folders.");
+  const payload = await response.json();
+  for (const root of payload.roots || []) {
+    try { getIpcSecurity().trustPath(root); } catch { /* Removed projects remain unavailable. */ }
+  }
+  restoredBackendRootsFor = activeUiApiToken;
 }
 
 async function registerBackendPathGrant(handle) {
+  if (getIpcSecurity().isUserGrant(handle?.grantId)) {
+    throw new Error("User file navigation does not grant agent access.");
+  }
   const startedAt = Date.now();
   let reason = "backend-unavailable";
   let status = null;
@@ -2218,6 +2375,8 @@ function getIpcSecurity() {
       getMainWebContents: () =>
         mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
       isProduction,
+      trustedRoots: readTrustedRoots(),
+      persistTrustedRoot,
     });
   }
   return ipcSecurity;

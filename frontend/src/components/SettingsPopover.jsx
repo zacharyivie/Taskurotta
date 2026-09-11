@@ -743,6 +743,4 @@ function scopeLabel(scope) {
   return scope === "global" ? "Works anywhere" : `When ${scope} is focused`;
 }
 
-export function defaultSettingsSnapshot() {
-  return JSON.parse(JSON.stringify(DEFAULT_APP_SETTINGS));
-}
+export { defaultSettingsSnapshot } from "../lib/settings.js";

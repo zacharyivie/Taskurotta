@@ -1,5 +1,6 @@
 const { spawn } = require("node:child_process");
 const electronPath = require("electron");
+const { createChromiumStderrFilter } = require("./chromium-stderr.cjs");
 
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE;
@@ -15,10 +16,13 @@ const child = spawn(electronPath, [
   ".",
 ], {
   env,
-  stdio: "inherit",
+  stdio: ["inherit", "inherit", "pipe"],
 });
 
-child.on("exit", (code, signal) => {
+child.stderr.pipe(createChromiumStderrFilter()).pipe(process.stderr, { end: false });
+
+// Wait for stderr to drain before exiting.
+child.on("close", (code, signal) => {
   if (signal) {
     process.kill(process.pid, signal);
     return;

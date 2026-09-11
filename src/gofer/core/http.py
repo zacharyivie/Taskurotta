@@ -3,6 +3,8 @@ from __future__ import annotations
 import http.client
 import socket
 import ssl
+import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -10,6 +12,45 @@ from typing import Protocol
 import anyio
 
 from gofer.core.network_policy import resolve_http_request_target
+
+HTTP_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
+
+
+class _RequestControl:
+    """Close active I/O on cancellation or expiry, including slow header reads."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.connection: http.client.HTTPConnection | None = None
+        self.transport: socket.socket | None = None
+        self.closed = False
+
+    def attach(self, connection: http.client.HTTPConnection) -> None:
+        with self.lock:
+            if self.closed:
+                connection.close()
+                raise TimeoutError("HTTP request deadline exceeded or request cancelled")
+            self.connection = connection
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            connection = self.connection
+            if connection is not None:
+                sock = self.transport or getattr(connection, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                connection.close()
+
+    def set_transport(self, transport: socket.socket) -> None:
+        with self.lock:
+            if self.closed:
+                transport.close()
+                raise TimeoutError("HTTP request deadline exceeded or request cancelled")
+            self.transport = transport
 
 
 @dataclass(frozen=True)
@@ -36,9 +77,22 @@ class HttpClient(Protocol):
 
 class UrllibHttpClient:
     async def send(self, request: HttpRequest) -> HttpResponse:
-        return await anyio.to_thread.run_sync(self._send_sync, request)
+        control = _RequestControl()
+        try:
+            with anyio.fail_after(request.timeout_seconds):
+                return await anyio.to_thread.run_sync(
+                    self._send_sync, request, control, abandon_on_cancel=True
+                )
+        finally:
+            control.close()
 
-    def _send_sync(self, request: HttpRequest) -> HttpResponse:
+    def _send_sync(
+        self, request: HttpRequest, control: _RequestControl | None = None
+    ) -> HttpResponse:
+        if request.timeout_seconds <= 0:
+            raise ValueError("HTTP timeout must be positive")
+        control = control or _RequestControl()
+        deadline = time.monotonic() + request.timeout_seconds
         parsed = urllib.parse.urlsplit(request.url)
         target = resolve_http_request_target(
             request.url,
@@ -59,6 +113,11 @@ class UrllibHttpClient:
                 timeout=request.timeout_seconds,
             )
         conn.set_policy_target(target.connect_host, target.connect_port)
+        conn._gofer_control = control
+        control.attach(conn)
+        timer = threading.Timer(max(0, deadline - time.monotonic()), control.close)
+        timer.daemon = True
+        timer.start()
         try:
             conn.request(
                 request.method.upper(),
@@ -66,19 +125,45 @@ class UrllibHttpClient:
                 body=request.body,
                 headers=headers,
             )
+            control.transport = getattr(conn, "sock", None)
             response = conn.getresponse()
+            response_headers = dict(response.headers.items())
+            declared = next(
+                (
+                    value
+                    for key, value in response_headers.items()
+                    if key.lower() == "content-length"
+                ),
+                None,
+            )
+            if declared is not None and int(declared) > HTTP_RESPONSE_MAX_BYTES:
+                raise ValueError("HTTP response exceeds the 16 MiB response limit")
+            body = bytearray()
+            while True:
+                if control.closed or time.monotonic() >= deadline:
+                    raise TimeoutError("HTTP request deadline exceeded or request cancelled")
+                chunk = response.read1(min(64 * 1024, HTTP_RESPONSE_MAX_BYTES + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > HTTP_RESPONSE_MAX_BYTES:
+                    raise ValueError("HTTP response exceeds the 16 MiB response limit")
+            if control.closed or time.monotonic() >= deadline:
+                raise TimeoutError("HTTP request deadline exceeded or request cancelled")
             return HttpResponse(
                 status=response.status,
-                headers=dict(response.headers.items()),
-                body=response.read(),
+                headers=response_headers,
+                body=bytes(body),
             )
         finally:
+            timer.cancel()
             conn.close()
 
 
 class _PolicyHttpConnection(http.client.HTTPConnection):
     _gofer_connect_host: str
     _gofer_connect_port: int
+    _gofer_control: _RequestControl
 
     def set_policy_target(self, host: str, port: int) -> None:
         self._gofer_connect_host = host
@@ -90,11 +175,13 @@ class _PolicyHttpConnection(http.client.HTTPConnection):
             self.timeout,
             getattr(self, "source_address", None),
         )
+        self._gofer_control.set_transport(self.sock)
 
 
 class _PolicyHttpsConnection(http.client.HTTPSConnection):
     _gofer_connect_host: str
     _gofer_connect_port: int
+    _gofer_control: _RequestControl
 
     def set_policy_target(self, host: str, port: int) -> None:
         self._gofer_connect_host = host
@@ -106,10 +193,15 @@ class _PolicyHttpsConnection(http.client.HTTPSConnection):
             self.timeout,
             getattr(self, "source_address", None),
         )
+        self._gofer_control.set_transport(sock)
         context = getattr(self, "_context", None)
         if context is None:
             context = ssl.create_default_context()
-        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        self.sock = context.wrap_socket(
+            sock, server_hostname=self.host, do_handshake_on_connect=False
+        )
+        self._gofer_control.set_transport(self.sock)
+        self.sock.do_handshake()
 
 
 def append_query_params(url: str, params: dict[str, str]) -> str:

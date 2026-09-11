@@ -13,8 +13,23 @@ function createIpcSecurity({
   getDataDir,
   getMainWebContents,
   isProduction = false,
+  trustedRoots = [],
+  persistTrustedRoot,
 } = {}) {
   const grantedRoots = new Map();
+  const userPaths = new Map();
+  const offlineTrustedRoots = new Set();
+  let knownDataDir;
+  let canonicalDataDir;
+  function approvedDataRoot() {
+    const configured = getDataDir();
+    if (configured !== knownDataDir) {
+      canonicalDataDir = realpathForContainment(configured);
+      knownDataDir = configured;
+    }
+    return canonicalDataDir;
+  }
+  approvedDataRoot();
 
   function assertTrustedSender(event) {
     const url = event?.senderFrame?.url || event?.sender?.getURL?.() || "";
@@ -47,7 +62,7 @@ function createIpcSecurity({
 
   function grantPath(targetPath) {
     if (!targetPath || typeof targetPath !== "string") return "";
-    const root = realpathIfPossible(path.resolve(targetPath));
+    const root = realpathExisting(path.resolve(targetPath));
     const existingGrantId = findGrantIdForRoot(root);
     if (existingGrantId) {
       return { grantId: existingGrantId, path: root };
@@ -57,11 +72,66 @@ function createIpcSecurity({
     return { grantId, path: root };
   }
 
+  // User navigation stays local to Electron and never renews agent permissions.
+  function grantUserPath(targetPath) {
+    if (!targetPath || typeof targetPath !== "string") throw new Error("A path is required.");
+    const canonical = realpathExisting(path.resolve(targetPath));
+    const existing = grantForPath(canonical) || userGrantForPath(canonical);
+    if (existing) return { path: canonical, grantId: existing };
+    const grantId = crypto.randomUUID();
+    // Include the containing directory for editor saves and preview assets.
+    userPaths.set(grantId, fs.statSync(canonical).isFile() ? path.dirname(canonical) : canonical);
+    return { path: canonical, grantId };
+  }
+
+  function userGrantForPath(targetPath) {
+    const canonical = realpathForContainment(path.resolve(targetPath));
+    for (const [grantId, candidate] of userPaths) {
+      if (isPathInside(canonical, candidate)) return grantId;
+    }
+    return "";
+  }
+
+  function trustPath(targetPath) {
+    const handle = grantPath(targetPath);
+    if (handle && typeof persistTrustedRoot === "function") persistTrustedRoot(handle.path);
+    return handle;
+  }
+
+  function renewPath(targetPath) {
+    const candidate = path.resolve(targetPath);
+    for (const root of offlineTrustedRoots) {
+      if (isPathInside(candidate, path.resolve(root))) restoreTrustedPath(root);
+    }
+    const grantId = grantForPath(candidate);
+    resolveAllowedPath(candidate, { grantId, mustExist: true });
+    return grantId ? { path: candidate, grantId } : grantPath(candidate);
+  }
+
+  function restoreTrustedPath(root) {
+    try {
+      const handle = grantPath(root);
+      offlineTrustedRoots.delete(root);
+      return handle;
+    } catch {
+      offlineTrustedRoots.add(root);
+      return null;
+    }
+  }
+
+  for (const root of trustedRoots) restoreTrustedPath(root);
+
   function resolveAllowedPath(targetPath, { grantId = "", mustExist = false } = {}) {
     const dataDir = getDataDir();
     const candidate = resolveCandidatePath(targetPath, dataDir);
-    const roots = [dataDir].filter(Boolean);
+    const roots = [approvedDataRoot()].filter(Boolean);
     if (grantId) {
+      const userPath = userPaths.get(grantId);
+      if (userPath) {
+        const canonical = mustExist ? realpathExisting(candidate) : realpathForContainment(candidate);
+        if (!isPathInside(canonical, userPath)) throw new Error("Path is outside the selected directory.");
+        return candidate;
+      }
       const grantedRoot = grantedRoots.get(grantId);
       if (!grantedRoot) {
         throw new Error("Path grant is invalid or expired.");
@@ -126,7 +196,7 @@ function createIpcSecurity({
   function grantForPath(targetPath) {
     const candidate = realpathForContainment(path.resolve(targetPath));
     for (const [grantId, root] of grantedRoots.entries()) {
-      if (isPathInside(candidate, realpathForContainment(root))) {
+      if (isPathInside(candidate, root)) {
         return grantId;
       }
     }
@@ -144,12 +214,18 @@ function createIpcSecurity({
 
   return {
     assertTrustedSender,
+    restoreTrustedPath,
     grantForPath,
+    grantUserPath,
+    userGrantForPath,
+    isUserGrant: (grantId) => userPaths.has(grantId),
     grantPath,
     resolveAllowedChildPath,
     resolveAllowedPath,
     resolvePickerPath,
     secureHandler,
+    trustPath,
+    renewPath,
   };
 }
 
@@ -198,7 +274,7 @@ function resolveCandidatePath(currentPath, dataDir) {
 
 function isPathInsideAnyRoot(candidate, roots, { mustExist = false } = {}) {
   const checkedPath = mustExist ? realpathExisting(candidate) : realpathForContainment(candidate);
-  return roots.some((root) => isPathInside(checkedPath, realpathForContainment(root)));
+  return roots.some((root) => isPathInside(checkedPath, root));
 }
 
 function isPathInside(child, root) {
@@ -210,23 +286,30 @@ function realpathExisting(targetPath) {
   try {
     return fs.realpathSync.native(targetPath);
   } catch (error) {
-    throw new Error(`Path does not exist: ${targetPath}`, { cause: error });
+    const message = ["ENOENT", "ENOTDIR"].includes(error.code)
+      ? `Path does not exist: ${targetPath}`
+      : `Unable to resolve path: ${targetPath}`;
+    throw new Error(message, { cause: error });
   }
 }
 
 function realpathForContainment(targetPath) {
-  if (fs.existsSync(targetPath)) {
-    return realpathIfPossible(targetPath);
+  // existsSync follows links, so it hides broken links. Only ENOENT from lstat
+  // may represent a missing component; a link must resolve or fail closed.
+  const missingSegments = [];
+  let current = path.resolve(targetPath);
+  while (true) {
+    try {
+      fs.lstatSync(current);
+      return path.resolve(realpathExisting(current), ...missingSegments);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
   }
-
-  let parent = path.dirname(targetPath);
-  const missingSegments = [path.basename(targetPath)];
-  while (parent && parent !== path.dirname(parent) && !fs.existsSync(parent)) {
-    missingSegments.unshift(path.basename(parent));
-    parent = path.dirname(parent);
-  }
-  const realParent = fs.existsSync(parent) ? realpathIfPossible(parent) : path.resolve(parent);
-  return path.resolve(realParent, ...missingSegments);
 }
 
 function realpathIfPossible(targetPath) {
@@ -246,4 +329,6 @@ module.exports = {
   fileUrlForPath,
   isSafeExternalUrl,
   isTrustedSenderUrl,
+  realpathForContainment,
+  isPathInside,
 };

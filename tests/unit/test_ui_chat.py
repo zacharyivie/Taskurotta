@@ -1652,3 +1652,46 @@ async def test_chat_rejects_wrong_provider_permission_before_launch(provider, mo
             permission_mode=mode,
         ):
             pass
+
+
+@pytest.mark.asyncio
+async def test_closing_chat_stream_stops_project_watcher(monkeypatch, tmp_path):
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+    closed = []
+    original_close = chat._ChatProjectTracker.close
+
+    def record_close(tracker):
+        observer = tracker.observer
+        original_close(tracker)
+        closed.append(observer is None or not observer.is_alive())
+
+    monkeypatch.setattr(chat._ChatProjectTracker, "close", record_close)
+
+    async def fake_stream(*args, **kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "returncode": None,
+            "text": json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "reasoning", "text": "Still working"},
+                }
+            )
+            + "\n",
+        }
+        pytest.fail("Closed stream should not resume the provider")
+
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream)
+    stream = chat.stream_workflow_chat(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "inspect"}],
+        workflow={"projectRoot": str(tmp_path)},
+        data_dir=tmp_path / "data",
+    )
+    async for event in stream:
+        if event["type"] == "thought":
+            await stream.aclose()
+            break
+    assert closed == [True]

@@ -1,3 +1,4 @@
+import { startPolling, shareInFlight } from "../lib/refresh.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
@@ -20,12 +21,13 @@ import {
   PencilLine,
   Plus,
   Minus,
+  MoreHorizontal,
   RefreshCw,
   Trash2,
   X,
 } from "lucide-react";
 import GitIntegrationControls from "./GitIntegrationControls.jsx";
-import WorktreeContextMenu, { historyOperations } from "./WorktreeContextMenu.jsx";
+import WorktreeContextMenu, { historyOperations, integrationOperations } from "./WorktreeContextMenu.jsx";
 import ProjectSearch from "./ProjectSearch.jsx";
 import { Dialog } from "./Dialog.jsx";
 import { hasUnsavedCodeChanges } from "./CodeWorkspace.jsx";
@@ -155,7 +157,7 @@ export default function CodeFileExplorer({
     const request = { rootPath };
     gitStatusLoadingRef.current = request;
     try {
-      const payload = await window.goferDesktop?.workspace?.gitStatus?.(rootPath);
+      const payload = await shareInFlight(`git-status:${rootPath}`, () => window.goferDesktop?.workspace?.gitStatus?.(rootPath));
       if (gitStatusLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
       const next = payload?.active
         ? { ...payload, active: true, entries: payload.entries ?? [] }
@@ -182,7 +184,7 @@ export default function CodeFileExplorer({
     const { hash } = historyMenu;
     setHistoryMenu(null);
     if (kind === "worktree-commit") {
-      setWorktreeStartPoint(hash); setWorktreeCreateBranch(true); setWorktreeBranch(""); setWorktreeFolder(""); setWorktreeFormOpen(true); setSourceTab("worktrees"); return;
+      setWorktreeStartPoint(hash); setWorktreeCreateBranch(true); setWorktreeBranch(""); setWorktreeFolder(""); setWorktreeFormOpen(true); setSourceTab("branches"); return;
     }
     if (kind === "branch-commit") {
       setBranchRequest({ hash }); setBranchDraft(""); return;
@@ -250,7 +252,7 @@ export default function CodeFileExplorer({
             setGitError(cause instanceof Error ? cause.message : String(cause));
             // A bulk operation may have partially succeeded. Read the actual index.
             try {
-              const actual = await window.goferDesktop?.workspace?.gitStatus?.(rootPath);
+              const actual = await shareInFlight(`git-status:${rootPath}`, () => window.goferDesktop?.workspace?.gitStatus?.(rootPath));
               if (currentRootRef.current === rootPath) setSourceControl(actual ?? { active: false, entries: [] });
             } catch {
               if (currentRootRef.current === rootPath) setSourceControl({ active: false, entries: [] });
@@ -289,7 +291,7 @@ export default function CodeFileExplorer({
         }
       } else result = action === "switch"
         ? await bridge?.gitSwitchBranch?.(rootPath, value)
-        : (["commit", "push", "pull", "publish", "stash-switch", "stash-apply", "reset-soft", "reset-hard", "detach-commit", "branch-commit"].includes(action) || /^(merge|rebase)-/.test(action))
+        : (["commit", "push", "pull", "publish", "stash-switch", "stash-apply", "reset-soft", "reset-hard", "detach-commit", "branch-commit", "branch-delete"].includes(action) || /^(merge|rebase)-/.test(action))
           ? await bridge?.gitRepoAction?.(rootPath, action, value)
           : await bridge?.gitFileAction?.(rootPath, value, action);
       if (!result) throw new Error("Restart the desktop app to enable Git actions.");
@@ -336,19 +338,19 @@ export default function CodeFileExplorer({
     await Promise.all([loadDirectory(rootPath), loadSourceControlStatus()]);
   }, [loadDirectory, loadSourceControlStatus, rootPath]);
 
-  const loadGitPanels = useCallback(async () => {
+  const loadGitPanels = useCallback(async ({ includeHistory = true } = {}) => {
     if (!rootPath || gitPanelsLoadingRef.current?.rootPath === rootPath) return;
     const request = { rootPath };
     gitPanelsLoadingRef.current = request;
-    setGitHistory((current) => ({ ...current, loading: true }));
-    setWorktrees((current) => ({ ...current, loading: true }));
+    if (includeHistory) setGitHistory((current) => ({ ...current, loading: true }));
+    if (includeHistory) setWorktrees((current) => ({ ...current, loading: true }));
     try {
       const [historyPayload, worktreePayload] = await Promise.all([
-        window.goferDesktop?.workspace?.gitHistory?.(rootPath),
+        includeHistory ? window.goferDesktop?.workspace?.gitHistory?.(rootPath) : null,
         window.goferDesktop?.workspace?.gitWorktrees?.(rootPath),
       ]);
       if (gitPanelsLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
-      setGitHistory({ active: Boolean(historyPayload?.active), commits: historyPayload?.commits ?? [], loading: false });
+      if (includeHistory) setGitHistory({ active: Boolean(historyPayload?.active), commits: historyPayload?.commits ?? [], loading: false });
       setWorktrees({ active: Boolean(worktreePayload?.active), items: worktreePayload?.worktrees ?? [], loading: false });
     } catch (loadError) {
       if (gitPanelsLoadingRef.current !== request || currentRootRef.current !== rootPath) return;
@@ -361,7 +363,9 @@ export default function CodeFileExplorer({
   }, [rootPath]);
 
   useEffect(() => {
-    if (sidebarView === "source-control") void loadGitPanels();
+    if (sidebarView !== "source-control") return undefined;
+    void loadGitPanels();
+    return startPolling(() => loadGitPanels({ includeHistory: false }));
   }, [sidebarView, loadGitPanels]);
 
   useEffect(() => {
@@ -407,13 +411,7 @@ export default function CodeFileExplorer({
 
   useEffect(() => {
     if (!rootPath) return undefined;
-    const refreshStatus = () => void loadSourceControlStatus();
-    const interval = window.setInterval(refreshStatus, 2000);
-    window.addEventListener("focus", refreshStatus);
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("focus", refreshStatus);
-    };
+    return startPolling(loadSourceControlStatus);
   }, [loadSourceControlStatus, rootPath]);
 
   useEffect(() => {
@@ -679,6 +677,44 @@ export default function CodeFileExplorer({
       await refreshTree();
     } catch (grantError) {
       setError(grantError instanceof Error ? grantError.message : "Unable to authorize project folder");
+    }
+  }
+
+  function openBranchMenu(event, branch) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (gitBusy) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setWorktreeMenu({ source: branch, branchMenu: true, x: event.clientX || rect.left, y: event.clientY || rect.bottom, trigger: event.currentTarget });
+  }
+
+  async function deleteBranch(branch) {
+    if (gitBusy || branch === sourceControl.branch || worktrees.items.some(item => item.branch === branch)) return;
+    if (!window.confirm(`Delete local branch ${branch}? Git will refuse if it has unmerged commits.`)) return;
+    await changeSourceControl("branch-delete", branch);
+  }
+
+  async function createBranchWorktree(branch) {
+    if (gitBusy || gitOperationRef.current) return;
+    gitOperationRef.current = true;
+    setGitBusy(true);
+    setGitError("");
+    try {
+      const bridge = window.goferDesktop?.workspace;
+      if (!bridge?.selectPath || !bridge?.addWorktree) throw new Error("Restart the desktop app to enable worktree creation.");
+      const targetPath = await bridge.selectPath({ currentPath: parentWorkspacePath(rootPath), directoryOnly: true });
+      if (!targetPath || currentRootRef.current !== rootPath) return;
+      const payload = await bridge.addWorktree({ projectRoot: rootPath, branch, createBranch: false, targetPath });
+      if (currentRootRef.current !== rootPath) return;
+      if (!payload || payload.error) throw new Error(payload?.error || "Unable to create worktree.");
+      setWorktrees({ active: true, items: payload.worktrees ?? [], loading: false });
+      setGitNotice(`Created worktree for ${branch}.`);
+      onSelectProject?.(payload.createdPath || targetPath, { mainProjectRoot: mainWorktreePath(payload.worktrees, rootPath) });
+    } catch (cause) {
+      if (currentRootRef.current === rootPath) setGitError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      gitOperationRef.current = false;
+      setGitBusy(false);
     }
   }
 
@@ -1038,11 +1074,11 @@ export default function CodeFileExplorer({
 
           </div> : null}
           <div role="tablist" aria-label="Source control views" className="flex shrink-0 gap-3 border-b border-line px-3">
-            {["changes", "history", "worktrees"].map((tab, index, tabs) => <button key={tab} id={`scm-tab-${tab}`} role="tab" aria-selected={sourceTab === tab} aria-controls="scm-content" tabIndex={sourceTab === tab ? 0 : -1} className={`min-w-0 border-b-2 py-2.5 text-[11px] ${sourceTab === tab ? "border-brand font-semibold text-ink" : "border-transparent text-muted hover:text-ink"}`} type="button" onClick={() => setSourceTab(tab)} onKeyDown={(event) => {
+            {["changes", "history", "branches"].map((tab, index, tabs) => <button key={tab} id={`scm-tab-${tab}`} role="tab" aria-selected={sourceTab === tab} aria-controls="scm-content" tabIndex={sourceTab === tab ? 0 : -1} className={`min-w-0 border-b-2 py-2.5 text-[11px] ${sourceTab === tab ? "border-brand font-semibold text-ink" : "border-transparent text-muted hover:text-ink"}`} type="button" onClick={() => setSourceTab(tab)} onKeyDown={(event) => {
               const next = event.key === "ArrowRight" ? (index + 1) % tabs.length : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : -1;
               if (next < 0) return;
               event.preventDefault(); setSourceTab(tabs[next]); document.getElementById(`scm-tab-${tabs[next]}`)?.focus();
-            }}>{tab === "changes" ? "Changes" : tab === "history" ? "History" : "Worktrees"}</button>)}
+            }}>{tab === "changes" ? "Changes" : tab === "history" ? "History" : "Branches"}</button>)}
           </div>
           <div id="scm-content" role="tabpanel" aria-labelledby={`scm-tab-${sourceTab}`} tabIndex={0} className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
             {gitError || blockedBranch ? <div role="alert" className="scm-notice mb-3 rounded p-3 text-xs">
@@ -1079,7 +1115,7 @@ export default function CodeFileExplorer({
                   </details>;
                 })}
               </> : <div className="px-3 py-10 text-center"><Check className="mx-auto mb-3 text-muted" size={20} /><strong className="text-sm font-semibold">Working tree clean</strong><p className="mt-1 text-xs text-muted">No uncommitted changes.</p></div> : null}
-              {sourceTab === "worktrees" ? <>
+              {sourceTab === "branches" ? <>
             <div className="flex h-7 items-center justify-between">
               <span className="text-[10px] font-semibold text-ink">Worktrees</span>
               <button aria-label="Add worktree" className="grid h-6 w-6 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink" type="button" onClick={() => { setWorktreeStartPoint(""); setWorktreeFormOpen((current) => !current); }}><FolderPlus size={12} /></button>
@@ -1137,6 +1173,24 @@ export default function CodeFileExplorer({
                 </div>
               );
             })}
+
+            <section aria-label="Branches" className="mt-4 border-t border-line pt-3">
+              <h3 className="mb-1 text-[10px] font-semibold text-ink">Branches</h3>
+              {!sourceControl.branches?.length ? <p className="py-2 text-[11px] text-muted">No local branches yet.</p> : null}
+              {(sourceControl.branches || []).map(branch => {
+                const current = branch === sourceControl.branch;
+                const checkedOut = current || worktrees.items.some(item => item.branch === branch);
+                return <div key={branch} aria-label={`Branch ${branch}`} tabIndex={0} className="flex min-h-8 items-center gap-1.5 rounded px-1.5 text-[11px] hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
+                  onContextMenu={event => openBranchMenu(event, branch)}
+                  onKeyDown={event => { if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) openBranchMenu(event, branch); }}>
+                  <GitBranch aria-hidden="true" className="shrink-0 text-muted" size={12} />
+                  <span className="min-w-0 flex-1 truncate text-ink" title={branch}>{branch}</span>
+                  {checkedOut ? <span className="shrink-0 text-[10px] text-muted">{current ? "Current" : "Worktree"}</span> : null}
+                  <button type="button" aria-label={`Actions for branch ${branch}`} title="Branch actions" disabled={gitBusy} className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted hover:bg-slate-100 hover:text-ink focus-visible:outline disabled:opacity-40" onClick={event => openBranchMenu(event, branch)}><MoreHorizontal size={13} /></button>
+                  <button type="button" aria-label={`Delete branch ${branch}`} title={checkedOut ? "Cannot delete a checked-out branch" : `Delete branch ${branch}`} disabled={gitBusy || worktrees.loading || checkedOut} className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted hover:text-red-700 focus-visible:outline disabled:opacity-40" onClick={() => void deleteBranch(branch)}><Trash2 size={12} /></button>
+                </div>;
+              })}
+            </section>
 
                 <GitIntegrationControls key={rootPath} rootPath={rootPath} sourceControl={sourceControl} worktrees={worktrees.items} source={integrationSource} request={integrationRequest} onSourceChange={setIntegrationSource} onBusy={(busy) => { gitOperationRef.current = busy; setGitBusy(busy); }} disabled={gitBusy} onSelectProject={onSelectProject} onChanged={async (result) => {
                   if (currentRootRef.current !== rootPath) return;
@@ -1230,12 +1284,19 @@ export default function CodeFileExplorer({
           ) : null}
       </section>
 
-      {worktreeMenu && sidebarView === "source-control" && sourceTab === "worktrees" ? <WorktreeContextMenu
+      {worktreeMenu && sidebarView === "source-control" && sourceTab === "branches" ? <WorktreeContextMenu
         {...worktreeMenu}
-        branches={sourceControl.branches || []}
+        operations={worktreeMenu.branchMenu ? [...integrationOperations, ["worktree-branch", "Create worktree from branch", worktrees.loading || worktreeMenu.source === sourceControl.branch || worktrees.items.some(item => item.branch === worktreeMenu.source)], ["branch-delete", "Delete branch", worktrees.loading || worktreeMenu.source === sourceControl.branch || worktrees.items.some(item => item.branch === worktreeMenu.source)]] : integrationOperations}
         disabled={gitBusy}
         onClose={() => setWorktreeMenu(null)}
         onSelect={(kind, target) => {
+          if (kind === "branch-delete" || kind === "worktree-branch") {
+            const branch = worktreeMenu.source;
+            setWorktreeMenu(null);
+            if (kind === "branch-delete") void deleteBranch(branch);
+            else void createBranchWorktree(branch);
+            return;
+          }
           setIntegrationSource(worktreeMenu.source);
           setIntegrationRequest({ kind, target });
           setWorktreeMenu(null);

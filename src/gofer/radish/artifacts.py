@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -330,7 +331,28 @@ def _referenced_workflows(
     return resolved
 
 
+# Installed assets are read-only during normal use. Include file identities so
+# development edits and atomic replacements invalidate these bounded caches.
+AssetIdentity = tuple[tuple[Path, int, int, int, int], ...]
+
+
+def _asset_identity(paths: list[Path]) -> AssetIdentity:
+    identities = []
+    for path in paths:
+        stat = path.stat()
+        identities.append((path, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
+    return tuple(identities)
+
+
 def _compiler(asset_root: Path) -> RadishCompiler:
+    paths = sorted((asset_root / "schemas").glob("*.json")) + sorted(
+        (asset_root / "contracts").glob("*.json")
+    )
+    return _cached_compiler(asset_root, _asset_identity(paths))
+
+
+@lru_cache(maxsize=8)
+def _cached_compiler(asset_root: Path, identity: AssetIdentity) -> RadishCompiler:
     return RadishCompiler.from_paths(
         schema_root=asset_root / "schemas",
         contract_paths=sorted((asset_root / "contracts").glob("*.json")),
@@ -338,10 +360,28 @@ def _compiler(asset_root: Path) -> RadishCompiler:
 
 
 def _provider_contracts(asset_root: Path) -> dict[str, ProviderContract]:
+    paths = [
+        asset_root / "schemas" / "provider-contract.schema.json",
+        *sorted((asset_root / "providers").glob("*.json")),
+    ]
+    return _cached_provider_contracts(asset_root, _asset_identity(paths))
+
+
+@lru_cache(maxsize=8)
+def _cached_provider_contracts(
+    asset_root: Path,
+    identity: AssetIdentity,
+) -> dict[str, ProviderContract]:
     return load_provider_contracts(
         asset_root / "schemas" / "provider-contract.schema.json",
         sorted((asset_root / "providers").glob("*.json")),
     )
+
+
+@lru_cache(maxsize=8)
+def _diagnostic_validator(identity: AssetIdentity) -> Draft202012Validator:
+    schema = json.loads(identity[0][0].read_text(encoding="utf-8"))
+    return Draft202012Validator(schema)
 
 
 def radish_asset_root() -> Path:
@@ -475,8 +515,9 @@ def _read_cached_artifact(
             or not isinstance(document.get("ir"), dict)
         ):
             return None
-        schema = json.loads((asset_root / "schemas" / "ir.schema.json").read_text(encoding="utf-8"))
-        contract_registry = _compiler(asset_root).contracts
+        compiler = _compiler(asset_root)
+        schema = compiler.ir_validator.schema
+        contract_registry = compiler.contracts
         ir = load_ir(
             cast(dict[str, Any], document["ir"]),
             schema,
@@ -490,10 +531,9 @@ def _read_cached_artifact(
                 for key, workflow in referenced_workflows.items()
             },
         )
-        diagnostic_schema = json.loads(
-            (asset_root / "schemas" / "diagnostic.schema.json").read_text(encoding="utf-8")
+        diagnostic_validator = _diagnostic_validator(
+            _asset_identity([asset_root / "schemas" / "diagnostic.schema.json"])
         )
-        diagnostic_validator = Draft202012Validator(diagnostic_schema)
         diagnostics = tuple(
             cast(dict[str, Any], item) for item in document["diagnostics"] if isinstance(item, dict)
         )

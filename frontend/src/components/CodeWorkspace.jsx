@@ -1,3 +1,7 @@
+import { resolveMarkdownLinkPath } from "../lib/fileLinks.js";
+export { resolveMarkdownLinkPath, markdownFileLinkTarget, filePathFromMarkdownUrl, resolveMarkdownFileLinkTarget, resolveMarkdownFileTarget } from "../lib/fileLinks.js";
+import { reconcileEditorLifetimes, closeEditorLifetimes, acceptsEditorState, retainOpenEditorStates } from "../lib/editorStateLifetime.js";
+import { startPolling, shareInFlight } from "../lib/refresh.js";
 import { installRemActions } from "../lib/editorRem.js";
 import { installConflictControls } from "../lib/mergeConflicts.js";
 import {
@@ -123,6 +127,11 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   const draggedPathRef = useRef("");
   const documentPathOrderRef = useRef(openPaths);
   const [fileStates, setFileStates] = useState({});
+  const editorLifetimesRef = useRef(new Map());
+  reconcileEditorLifetimes(editorLifetimesRef.current, openPaths);
+  useEffect(() => {
+    setFileStates((current) => retainOpenEditorStates(current, openPaths));
+  }, [openPaths]);
   const [browserViewStates, setBrowserViewStates] = useState({});
   const [documentModes, setDocumentModes] = useState({});
   const [diffOnOpenPaths, setDiffOnOpenPaths] = useState(() => new Set());
@@ -242,6 +251,10 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   }, [browserTabs, currentPath, fileStates, onActiveDocumentStateChange]);
 
   const finishClosingWorkspacePaths = useCallback((targets, discardRadish = false) => {
+    closeEditorLifetimes(editorLifetimesRef.current, targets);
+    setFileStates((current) => Object.fromEntries(
+      Object.entries(current).filter(([path]) => !targets.includes(path)),
+    ));
     for (const path of targets) textEditorRefs.current.get(path)?.discard?.();
     setBrowserViewStates((current) => Object.fromEntries(
       Object.entries(current).filter(([path]) => !targets.includes(path)),
@@ -249,6 +262,10 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     setDocumentModes((current) => Object.fromEntries(
       Object.entries(current).filter(([path]) => !targets.includes(path)),
     ));
+    setGitGroups((current) => Object.fromEntries(
+      Object.entries(current).filter(([path]) => !targets.includes(path)),
+    ));
+    setDiffOnOpenPaths((current) => new Set([...current].filter((path) => !targets.includes(path))));
     if (onClosePaths) onClosePaths(targets);
     else for (const path of targets) onClosePath?.(path);
     if (discardRadish) onRadishDiscard?.();
@@ -518,6 +535,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
 
   function renderDocuments(paths) {
     return paths.map((path) => {
+      const editorLifetime = editorLifetimesRef.current.get(path);
       const inSplitGroup = splitPaths.includes(path);
       const groupPaths = inSplitGroup ? splitPaths : primaryGroupPaths;
       const activeForGroup = inSplitGroup ? splitPath : primaryPath;
@@ -610,6 +628,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
             }}
             theme={theme}
             onModeChange={(mode) => {
+              if (!acceptsEditorState(editorLifetimesRef.current, path, editorLifetime)) return;
               setDocumentModes((current) => ({ ...current, [path]: mode }));
               if (mode === "preview") {
                 setDiffOnOpenPaths((current) => withoutSetValue(current, path));
@@ -625,7 +644,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
               if (targetPath) onOpenPath?.(targetPath, { preview: true });
             }}
             onStateChange={(nextState) => {
-              setFileStates((current) => ({ ...current, [path]: nextState }));
+              if (!acceptsEditorState(editorLifetimesRef.current, path, editorLifetime)) return;
+              setFileStates((current) => acceptsEditorState(editorLifetimesRef.current, path, editorLifetime)
+                ? { ...current, [path]: nextState } : current);
               if (nextState.dirty) onPinPath?.(path);
               if (path === sourcePath) {
                 const currentDocument = radishDocument;
@@ -1043,7 +1064,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       return null;
     }
     try {
-      const baseline = await readBaseline(path, gitGroup);
+      const baseline = await shareInFlight(`git-baseline:${path}:${gitGroup}`, () => readBaseline(path, gitGroup));
       setGitBaseline(baseline?.tracked ? baseline : null);
       if (!baseline?.changed) setDiffMode(false);
       return baseline;
@@ -1059,15 +1080,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   }, [refreshGitBaseline]);
 
   useEffect(() => {
-    const refresh = () => void refreshGitBaseline();
-    const interval = window.setInterval(refresh, 2000);
-    window.addEventListener("focus", refresh);
-    document.addEventListener("visibilitychange", refresh);
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("focus", refresh);
-      document.removeEventListener("visibilitychange", refresh);
-    };
+    return startPolling(refreshGitBaseline);
   }, [refreshGitBaseline]);
 
   useEffect(() => {
@@ -1544,6 +1557,7 @@ export function MarkdownPreview({ content, path, onEdit, onOpenRelativeLink }) {
     >
       <MarkdownContent
         className="mx-auto w-full max-w-[76ch]"
+        sourcePath={path}
         value={content}
         onOpenRelativeLink={onOpenRelativeLink}
       />
@@ -1848,83 +1862,6 @@ export function browserViewTabMetadata(browserTab, viewState) {
 
 export function codeTabLabel(path, browserTab) {
   return browserTab ? browserTabLabel(browserTab) : fileName(path);
-}
-
-export function resolveMarkdownLinkPath(sourcePath, href) {
-  if (/^file:/i.test(String(href ?? ""))) {
-    return filePathFromMarkdownUrl(href, sourcePath);
-  }
-  const rawTarget = String(href ?? "").split(/[?#]/, 1)[0];
-  const windowsAbsolute = /^[a-z]:[\\/]/i.test(rawTarget);
-  if (!rawTarget || (!windowsAbsolute && /^[a-z][a-z\d+.-]*:/i.test(rawTarget))) return "";
-  let target;
-  try {
-    target = decodeURIComponent(rawTarget).replaceAll("\\", "/");
-  } catch {
-    target = rawTarget.replaceAll("\\", "/");
-  }
-  const source = String(sourcePath ?? "").replaceAll("\\", "/");
-  const separator = String(sourcePath).includes("\\") && !String(sourcePath).includes("/")
-    ? "\\"
-    : "/";
-  const absolute = target.startsWith("/") || /^[a-z]:\//i.test(target);
-  const parts = absolute
-    ? []
-    : source.split("/").slice(0, -1).filter(Boolean);
-  const prefix = target.startsWith("//") || (!absolute && source.startsWith("//"))
-    ? "//"
-    : target.startsWith("/") || (!absolute && source.startsWith("/")) ? "/" : "";
-
-  for (const segment of target.split("/")) {
-    if (!segment || segment === ".") continue;
-    if (segment === "..") {
-      if (parts.length && !/^[a-z]:$/i.test(parts.at(-1))) parts.pop();
-      continue;
-    }
-    parts.push(segment);
-  }
-  return `${prefix}${parts.join("/")}`.replaceAll("/", separator);
-}
-
-export function markdownFileLinkTarget(sourcePath, href) {
-  const resolvedPath = resolveMarkdownLinkPath(sourcePath, href);
-  if (!resolvedPath) return null;
-  const location = resolvedPath.match(/:([1-9]\d*)(?::([1-9]\d*))?$/);
-  if (!location) return { column: 1, lineNumber: null, path: resolvedPath };
-  return {
-    column: location[2] ? Number(location[2]) : 1,
-    lineNumber: Number(location[1]),
-    path: resolvedPath.slice(0, -location[0].length),
-  };
-}
-
-export function filePathFromMarkdownUrl(href, sourcePath = "") {
-  try {
-    const url = new URL(String(href ?? ""));
-    if (url.protocol !== "file:") return "";
-    const hostname = url.hostname && url.hostname !== "localhost" ? url.hostname : "";
-    let targetPath = decodeURIComponent(url.pathname);
-    if (hostname) targetPath = `//${hostname}${targetPath}`;
-    if (/^\/[a-z]:\//i.test(targetPath)) targetPath = targetPath.slice(1);
-    const windowsPath = /^[a-z]:\//i.test(targetPath)
-      || (String(sourcePath).includes("\\") && !String(sourcePath).includes("/"));
-    return windowsPath ? targetPath.replaceAll("/", "\\") : targetPath;
-  } catch {
-    return "";
-  }
-}
-
-export async function resolveMarkdownFileLinkTarget(sourcePath, href, getPathInfo) {
-  const target = markdownFileLinkTarget(sourcePath, href);
-  if (!target) return null;
-  if (!getPathInfo) return target;
-  const info = await getPathInfo(target.path);
-  if (!info?.isFile) throw new Error(`The link does not point to a file: ${target.path}`);
-  return { ...target, path: info.path || target.path };
-}
-
-export async function resolveMarkdownFileTarget(sourcePath, href, getPathInfo) {
-  return (await resolveMarkdownFileLinkTarget(sourcePath, href, getPathInfo))?.path ?? "";
 }
 
 export function revealEditorLocation(editor, target) {

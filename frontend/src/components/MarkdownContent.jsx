@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isLocalFileLink, resolveMarkdownLinkPath } from "../lib/fileLinks.js";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import rehypeSlug from "rehype-slug";
 import remarkGfm from "remark-gfm";
 
-export default function MarkdownContent({
+function MarkdownContent({
   className = "",
   compact = false,
   inverse = false,
   onOpenRelativeLink,
+  sourcePath = "",
   value,
 }) {
   const rootRef = useRef(null);
@@ -27,22 +29,23 @@ export default function MarkdownContent({
       return;
     }
     event.preventDefault();
-    if ((!hasUrlScheme(href) || isFileUrl(href) || isWindowsFilePath(href)) && onOpenRelativeLinkRef.current) {
+    if (isLocalFileLink(href) && onOpenRelativeLinkRef.current) {
       onOpenRelativeLinkRef.current(href);
       return;
     }
-    if (isExternalUrl(href)) window.open(href, "_blank", "noopener,noreferrer");
+    if (isExternalUrl(href)) window.open(websiteLinkHref(href), "_blank", "noopener,noreferrer");
   }, []);
 
   const components = useMemo(() => ({
-    a({ children, href = "" }) {
+    a({ children, href = "", title }) {
       const external = isExternalUrl(href);
       return (
         <a
           className={`font-medium underline decoration-current underline-offset-2 transition ${
             inverse ? "text-white" : "text-brand"
           }`}
-          href={href}
+          href={external ? websiteLinkHref(href) : href}
+          title={resolveMarkdownLinkPath(sourcePath, href) || title || href}
           rel={external ? "noreferrer" : undefined}
           target={external ? "_blank" : undefined}
           onClick={(event) => handleLinkClick(event, href)}
@@ -132,7 +135,7 @@ export default function MarkdownContent({
     ul({ children, className: listClassName = "" }) {
       return <ul className={`${listClassName} ml-6 list-disc space-y-1`}>{children}</ul>;
     },
-  }), [handleLinkClick, inverse]);
+  }), [handleLinkClick, inverse, sourcePath]);
 
   return (
     <div
@@ -212,23 +215,17 @@ function textFromReactNode(node) {
   return node?.props ? textFromReactNode(node.props.children) : "";
 }
 
-function hasUrlScheme(value) {
-  return /^[a-z][a-z\d+.-]*:/i.test(value);
-}
-
-function isWindowsFilePath(value) {
-  return /^[a-z]:[\\/]/i.test(value) || String(value).startsWith("\\\\");
-}
-
-function isFileUrl(value) {
-  return /^file:/i.test(value);
-}
-
 export function markdownUrlTransform(url, key) {
-  if (key === "href" && (isFileUrl(url) || isWindowsFilePath(url))) return url;
+  if (key === "href" && isLocalFileLink(url)) return url;
   return defaultUrlTransform(url);
 }
 
 export function isExternalUrl(value) {
   return /^(?:https?:|mailto:)/i.test(value) || String(value ?? "").startsWith("//");
 }
+
+function websiteLinkHref(href) {
+  return href.startsWith("//") ? `https:${href}` : href;
+}
+
+export default memo(MarkdownContent);

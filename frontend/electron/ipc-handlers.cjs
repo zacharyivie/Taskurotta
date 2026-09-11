@@ -1,4 +1,5 @@
 const desktopIpcHandlers = [
+  ["gofer:api-session", "apiSession"],
   ["gofer:developer-info", "developerInfo"],
   ["gofer:developer-action", "developerAction"],
   ["gofer:renderer-log", "rendererLog"],
@@ -9,6 +10,8 @@ const desktopIpcHandlers = [
   ["gofer:open-logs", "openLogsFolder"],
   ["gofer:get-data-dir", "getGoferDataDir"],
   ["gofer:grant-path", "grantPath"],
+  ["gofer:grant-user-path", "grantUserPath"],
+  ["gofer:grant-dropped-path", "grantDroppedPath"],
   ["gofer:list-directory", "listDirectory"],
   ["gofer:search-project", "searchProject"],
   ["gofer:replace-project", "replaceProject"],

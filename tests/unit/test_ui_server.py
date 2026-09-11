@@ -71,9 +71,17 @@ def _fake_server(
     server.data_dir = tmp_path
     server.resource_limits = resource_limits or DEFAULT_RESOURCE_LIMITS
     server.api_token = "test-ui-token"
-    server.allowed_origins = {"http://127.0.0.1:5173", "null"}
+    server.allowed_origins = {"http://127.0.0.1:5173"}
     server.path_grant_secret = "test-secret"
     server.path_grants = DesktopPathGrantStore()
+    server.trusted_project_roots = tuple(
+        sorted(
+            {
+                str(workflow.project_root.resolve())
+                for workflow in server_module.list_registered_workflows(registry_dir=tmp_path)
+            }
+        )
+    )
     server.gofer_cli_path = None
     server.server_address = ("127.0.0.1", 8765)
     server.sync_calls = 0
@@ -112,7 +120,8 @@ def _request(
     handler.path = path
     handler.headers = Message()
     request_headers = dict(headers or {})
-    if authenticated and method in {"POST", "PUT", "DELETE"}:
+    request_headers.setdefault("Host", "127.0.0.1:8765")
+    if authenticated:
         request_headers.setdefault("Authorization", "Bearer test-ui-token")
     for key, value in request_headers.items():
         handler.headers[key] = value
@@ -362,13 +371,13 @@ def test_ui_server_health_check_works_on_dynamic_port(tmp_path) -> None:
     response = _request(tmp_path, "GET", "/api/health")
 
     assert response.status == 200
-    assert response.json() == {"ok": True, "dataDir": str(tmp_path)}
+    assert response.json() == {"ok": True}
     assert response.header("Content-Type") == "application/json"
     assert response.header("Content-Length") == str(len(response.body))
     assert response.header("Access-Control-Allow-Origin") is None
 
 
-def test_ui_server_session_payload_exposes_token_for_frontend_bootstrap(tmp_path) -> None:
+def test_ui_server_session_payload_requires_existing_bootstrap_token(tmp_path) -> None:
     response = _request(
         tmp_path,
         "GET",
@@ -710,10 +719,12 @@ include_content = true
     server.api_token = "test-ui-token"
     handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
     handler.server = server
+    server.server_address = ("127.0.0.1", 8765)
     handler.path = "/api/workflows/watched-plan/plan"
     handler.headers = Message()
     handler.headers["Content-Length"] = str(len(body))
     handler.headers["Authorization"] = "Bearer test-ui-token"
+    handler.headers["Host"] = "127.0.0.1:8765"
     handler.rfile = BytesIO(body)
     handler.wfile = BytesIO()
     status: dict[str, int] = {}
@@ -960,6 +971,11 @@ def test_ui_server_doctor_endpoint_returns_health_payload(monkeypatch, tmp_path)
     server.data_dir = tmp_path
     handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
     handler.server = server
+    server.server_address = ("127.0.0.1", 8765)
+    server.api_token = "test-ui-token"
+    handler.headers = Message()
+    handler.headers["Host"] = "127.0.0.1:8765"
+    handler.headers["Authorization"] = "Bearer test-ui-token"
     handler.path = "/api/doctor"
     handler.wfile = BytesIO()
     status: dict[str, int] = {}
@@ -1002,6 +1018,11 @@ def test_ui_server_log_endpoint_forwards_range_query(monkeypatch, tmp_path) -> N
     server.data_dir = tmp_path
     handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
     handler.server = server
+    server.server_address = ("127.0.0.1", 8765)
+    server.api_token = "test-ui-token"
+    handler.headers = Message()
+    handler.headers["Host"] = "127.0.0.1:8765"
+    handler.headers["Authorization"] = "Bearer test-ui-token"
     handler.path = "/api/workflows/wf/logs/run.log?offset=3&limit=4&tailBytes=8&details=0"
     handler.wfile = BytesIO()
     status: dict[str, int] = {}
@@ -1491,7 +1512,7 @@ def test_ui_server_chat_routes_and_stream_headers(monkeypatch, tmp_path) -> None
     assert chat.json() == {"reply": "ok", "provider": "codex"}
     assert stream.status == 200
     assert stream.header("Content-Type") == "application/x-ndjson; charset=utf-8"
-    assert stream.header("Cache-Control") == "no-cache"
+    assert stream.header("Cache-Control") == "no-store"
     assert stream.text().splitlines() == [
         '{"type": "message", "body": "one"}',
         '{"type": "done"}',
@@ -2102,3 +2123,291 @@ def test_second_brain_expired_grant_recovers_after_registration(
         handler._validate_second_brain(body)
     handler._register_desktop_path_grant(registration)
     handler._validate_second_brain(body)
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/session", "/api/workflows", "/api/doctor", "/workflows/demo/usage"]
+)
+@pytest.mark.parametrize(
+    "origin", [None, "null", "https://attacker.example", "http://127.0.0.1:5173"]
+)
+def test_sensitive_reads_never_disclose_data_without_credentials(tmp_path, path, origin):
+    response = _request(
+        tmp_path, "GET", path, headers={"Origin": origin} if origin else {}, authenticated=False
+    )
+    assert response.status in {401, 403}
+    assert "test-ui-token" not in response.text()
+    assert str(tmp_path) not in response.text()
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "attacker.invalid:8765",
+        "127.0.0.1:8766",
+        "127.0.0.1:8765@attacker.invalid",
+        "127.0.0.1:bad",
+        "127.0.0.1:8765/path",
+    ],
+)
+def test_api_rejects_arbitrary_host_even_with_credentials(tmp_path, host):
+    response = _request(tmp_path, "GET", "/api/session", headers={"Host": host})
+    assert response.status == 403
+    assert "test-ui-token" not in response.text()
+
+
+def test_opaque_origin_desktop_requires_token_and_narrow_preflight(tmp_path):
+    authenticated = _request(tmp_path, "GET", "/api/session", headers={"Origin": "null"})
+    assert authenticated.status == 200
+    assert authenticated.header("Access-Control-Allow-Origin") == "null"
+    preflight = _request(
+        tmp_path,
+        "OPTIONS",
+        "/api/session",
+        authenticated=False,
+        headers={
+            "Origin": "null",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert preflight.status == 204
+    assert preflight.body == b""
+    assert preflight.header("Access-Control-Allow-Origin") == "null"
+    rejected = _request(
+        tmp_path, "OPTIONS", "/api/session", authenticated=False, headers={"Origin": "null"}
+    )
+    assert rejected.status == 403
+    assert "null" not in server_module._default_allowed_origins()
+
+
+@pytest.mark.parametrize(
+    "method,path,required",
+    [
+        ("GET", "/api/health", False),
+        ("GET", "/api/session", True),
+        ("GET", "/workflows/w/usage", True),
+        ("PUT", "/api/workflows/w", True),
+        ("DELETE", "/api/workflows/w", True),
+        ("OPTIONS", "/api/workflows", False),
+        ("POST", "/api/workflows/w/webhooks/default/trigger", False),
+        ("POST", "/api/workflows/w/webhooks/default/replay", False),
+        ("GET", "/api/workflows/w/webhooks/default/trigger", True),
+        ("POST", "/api/other/webhooks/default/trigger", True),
+    ],
+)
+def test_request_policy_covers_methods_and_webhook_exceptions(method, path, required):
+    assert server_module._requires_ui_api_auth(method, path) is required
+
+
+def test_workflow_poll_does_not_reconcile_schedules(tmp_path):
+    response = _request(tmp_path, "GET", "/api/workflows")
+    assert response.status == 200
+    assert response.server.sync_calls == 0
+
+
+def test_schedule_reconciliation_only_runs_when_configuration_changes(tmp_path, monkeypatch):
+    server = _fake_server(tmp_path)
+    server._schedule_lock = threading.Lock()
+    server._schedule_signature = None
+    server.scheduler = cast(Any, object())
+    server.watcher = cast(Any, object())
+    calls = []
+    monkeypatch.setattr(
+        server_module, "sync_workflow_schedules", lambda *_: calls.append("schedule")
+    )
+    monkeypatch.setattr(server_module, "sync_workflow_watchers", lambda *_: calls.append("watch"))
+    GoferUiServer.sync_schedules(server)
+    GoferUiServer.sync_schedules(server)
+    assert calls == ["schedule", "watch"]
+    (tmp_path / "external.toml").write_text("# external change")
+    GoferUiServer.sync_schedules(server)
+    assert calls == ["schedule", "watch", "schedule", "watch"]
+
+
+_PATH_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures/path-containment.json").read_text()
+)["cases"]
+
+
+@pytest.mark.parametrize("case", _PATH_CASES, ids=lambda case: case["name"])
+def test_shared_path_containment_contract(tmp_path, case):
+    root = tmp_path / case["root"]
+    root.mkdir()
+    for directory in case.get("directories", []):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    for filename in case.get("files", []):
+        file = tmp_path / filename
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("fixture")
+    for link in case.get("links", []):
+        path = tmp_path / link["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(tmp_path / link["target"])
+    store = DesktopPathGrantStore()
+    grant = store.register(root)
+    try:
+        allowed = store.covers(tmp_path / case["candidate"], grant)
+    except (OSError, RuntimeError):
+        allowed = False
+    assert allowed is case["allowed"]
+
+
+def test_commit_message_body_is_rejected_before_reading_large_payload(tmp_path):
+    response = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/commit-message",
+        headers={"Content-Length": str(server_module.COMMIT_MESSAGE_MAX_BODY_BYTES + 1)},
+    )
+    assert response.status == 400
+    assert "exceeds limit" in response.text()
+
+
+def test_desktop_trusted_roots_requires_desktop_secret(tmp_path):
+    denied = _request(tmp_path, "GET", "/api/desktop/trusted-roots")
+    assert denied.status == 403
+    project = tmp_path / "project"
+    project.mkdir()
+    create_registered_workflow(project, "Trusted", registry_dir=tmp_path)
+    allowed = _request(
+        tmp_path,
+        "GET",
+        "/api/desktop/trusted-roots",
+        headers={"X-Gofer-Desktop-Grant-Secret": "test-secret"},
+    )
+    assert allowed.status == 200
+    assert allowed.json() == {"roots": [str(project)]}
+
+
+@pytest.mark.skipif(not _sockets_available(), reason="Loopback sockets unavailable")
+def test_http_handler_budget_and_incomplete_request_recovery(tmp_path, monkeypatch):
+    import http.client
+    import time
+
+    monkeypatch.setattr(server_module, "UI_MAX_HANDLERS", 1)
+    monkeypatch.setattr(server_module, "UI_REQUEST_READ_DEADLINE_SECONDS", 0.15)
+    server = create_server(host="127.0.0.1", port=0, data_dir=tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = server.server_address
+    first = socket.create_connection(address)
+    first.settimeout(2)
+    try:
+        first.sendall(b"GET /api/health HTTP/1.1\r\n")
+        time.sleep(0.03)
+        second = socket.create_connection(address)
+        second.settimeout(2)
+        try:
+            assert second.recv(1) == b""
+        finally:
+            second.close()
+        assert first.recv(1) == b""
+        time.sleep(0.03)
+        connection = http.client.HTTPConnection(str(address[0]), int(address[1]), timeout=2)
+        try:
+            connection.request("GET", "/api/health")
+            response = connection.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read()) == {"ok": True}
+        finally:
+            connection.close()
+        partial = socket.create_connection(address)
+        partial.settimeout(2)
+        try:
+            partial.sendall(
+                (
+                    "POST /api/workflows HTTP/1.1\r\n"
+                    f"Host: {address[0]}:{address[1]}\r\n"
+                    f"Authorization: Bearer {server.api_token}\r\n"
+                    "Content-Length: 100\r\n\r\n{"
+                ).encode()
+            )
+            assert partial.recv(4096) == b""
+        finally:
+            partial.close()
+    finally:
+        first.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "case",
+    json.loads((Path(__file__).parents[1] / "fixtures/path-containment.json").read_text())[
+        "lexicalCases"
+    ],
+)
+def test_shared_cross_platform_lexical_containment(case):
+    import ntpath
+    import posixpath
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    path_type = PureWindowsPath if case["platform"] == "win32" else PurePosixPath
+    normalizer = ntpath if case["platform"] == "win32" else posixpath
+    root = path_type(normalizer.normpath(case["root"]))
+    candidate = path_type(normalizer.normpath(case["candidate"]))
+    assert server_module._is_path_inside(cast(Any, candidate), cast(Any, root)) is case["allowed"]
+
+
+def test_expensive_request_budget_does_not_block_health_and_recovers(tmp_path, monkeypatch):
+    server = _fake_server(tmp_path)
+    server._expensive_slots = threading.BoundedSemaphore(1)
+    monkeypatch.setitem(globals(), "_fake_server", lambda *_args, **_kwargs: server)
+    assert server._expensive_slots.acquire(blocking=False)
+    denied = _request(tmp_path, "POST", "/api/chat", body={})
+    assert denied.status == 503
+    assert _request(tmp_path, "GET", "/api/health").status == 200
+    server._expensive_slots.release()
+    monkeypatch.setattr(
+        GoferUiRequestHandler, "_dispatch_POST", lambda self: self._send_json({"ok": True})
+    )
+    assert _request(tmp_path, "POST", "/api/chat", body={}).status == 200
+    assert server._expensive_slots.acquire(blocking=False)
+    server._expensive_slots.release()
+
+
+def test_ambiguous_body_framing_is_rejected_centrally(tmp_path):
+    response = _request(
+        tmp_path, "POST", "/api/workflows", body={}, headers={"Transfer-Encoding": "chunked"}
+    )
+    assert response.status == 400
+    assert "framing" in response.text()
+
+
+def test_log_revision_changes_only_with_response_content(tmp_path, monkeypatch):
+    payload = {"logText": "first"}
+    monkeypatch.setattr(
+        server_module, "latest_workflow_log_payload", lambda *_args, **_kwargs: payload
+    )
+    first = _request(tmp_path, "GET", "/api/workflows/w/logs/latest")
+    same = _request(tmp_path, "GET", "/api/workflows/w/logs/latest")
+    assert first.header("ETag")
+    assert same.header("ETag") == first.header("ETag")
+    payload["logText"] = "second"
+    changed = _request(tmp_path, "GET", "/api/workflows/w/logs/latest")
+    assert changed.header("ETag") != first.header("ETag")
+
+
+def test_async_request_deadline_cancels_work_and_preserves_stream_framing(tmp_path, monkeypatch):
+    import asyncio
+
+    cancelled = threading.Event()
+    server = _fake_server(tmp_path)
+    server.request_job_timeout = 0.01
+    monkeypatch.setitem(globals(), "_fake_server", lambda *_args, **_kwargs: server)
+
+    async def stalled_stream(**_kwargs):
+        try:
+            await asyncio.sleep(10)
+            yield {"type": "done"}
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(server_module, "stream_workflow_chat", stalled_stream)
+    response = _request(tmp_path, "POST", "/api/chat/stream", body={})
+    assert cancelled.is_set()
+    assert response.status == 200
+    assert response.header("Content-Type") == "application/x-ndjson; charset=utf-8"
+    assert response.json() == {"type": "error", "error": "Request exceeded its execution deadline"}

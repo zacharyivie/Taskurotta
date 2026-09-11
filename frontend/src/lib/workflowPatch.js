@@ -1,3 +1,4 @@
+import { cloneJson } from "./jsonValue.js";
 const PATCH_BLOCK_PATTERN = /```(?:gofer-workflow-patch|workflow-patch|json)?\s*([\s\S]*?)```/gi;
 
 const patchOperationLabels = {
@@ -386,5 +387,5 @@ function patchOperationDetail(operation) {
 }
 
 function clone(value) {
-  return JSON.parse(JSON.stringify(value));
+  return cloneJson(value);
 }

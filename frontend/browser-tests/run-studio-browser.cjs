@@ -8,23 +8,24 @@ const childEnv = {
 };
 delete childEnv.ELECTRON_RUN_AS_NODE;
 
-const child = spawn(
-  electronPath,
-  [path.join(__dirname, "studio.browser.cjs")],
-  {
-    env: childEnv,
-    stdio: "inherit",
-  },
-);
+function runBrowserTest(script) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(electronPath, [script], { env: childEnv, stdio: "inherit" });
+    child.on("exit", (code, signal) => {
+      if (code === 0 && !signal) resolve();
+      else reject(new Error(`Browser regression ${path.basename(script)} exited with ${signal || code}.`));
+    });
+    child.on("error", reject);
+  });
+}
 
-child.on("exit", (code, signal) => {
-  if (signal) {
-    console.error(`Browser studio regression tests exited with signal ${signal}.`);
-  }
-  process.exit(code || (signal ? 1 : 0));
-});
+async function main() {
+  await runBrowserTest(path.join(__dirname, "studio.browser.cjs"));
+  await runBrowserTest(path.join(__dirname, "../electron/tests/studio-policy.browser.cjs"));
+  await runBrowserTest(path.join(__dirname, "../electron/tests/conversation-storage.browser.cjs"));
+}
 
-child.on("error", (error) => {
+main().catch((error) => {
   console.error(error);
-  process.exit(1);
+  process.exitCode = 1;
 });

@@ -1,3 +1,4 @@
+import { cloneJson } from "./jsonValue.js";
 export const REPORT_THEMES = [
   {
     "id": "auto",
@@ -154,13 +155,13 @@ export function loadAppSettings(storage = globalThis.window?.localStorage) {
   try {
     stored = storage?.getItem(SETTINGS_STORAGE_KEY);
   } catch {
-    return migrateLegacySettings(cloneDefaults(), storage);
+    return migrateLegacySettings(defaultSettingsSnapshot(), storage);
   }
-  if (!stored) return migrateLegacySettings(cloneDefaults(), storage);
+  if (!stored) return migrateLegacySettings(defaultSettingsSnapshot(), storage);
   try {
     return normalizeAppSettings(JSON.parse(stored));
   } catch {
-    return migrateLegacySettings(cloneDefaults(), storage);
+    return migrateLegacySettings(defaultSettingsSnapshot(), storage);
   }
 }
 
@@ -175,7 +176,7 @@ export function saveAppSettings(settings, storage = globalThis.window?.localStor
 }
 
 export function normalizeAppSettings(value = {}) {
-  const settings = mergeSettings(cloneDefaults(), value);
+  const settings = mergeSettings(defaultSettingsSnapshot(), value);
   const storedVersion = Number(value?.version) || 1;
   settings.version = 2;
   settings.assistant.avatarEnabled = settings.assistant.avatarEnabled !== false;
@@ -339,8 +340,8 @@ export function reducedMotionEnabled(settings, systemPreference = false) {
   return systemPreference;
 }
 
-function cloneDefaults() {
-  return JSON.parse(JSON.stringify(DEFAULT_APP_SETTINGS));
+export function defaultSettingsSnapshot() {
+  return cloneJson(DEFAULT_APP_SETTINGS);
 }
 
 function mergeSettings(base, value) {

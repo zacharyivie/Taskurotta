@@ -7,16 +7,33 @@ import json
 import os
 import re
 import shutil
+import stat as stat_module
 import sys
+import tempfile
 import threading
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal, cast
+
+from watchdog.events import (
+    DirCreatedEvent,
+    DirDeletedEvent,
+    DirModifiedEvent,
+    DirMovedEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+    FileSystemEvent,
+    FileSystemEventHandler,
+)
+from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
 from gofer.core.prompt_envelope import (
     AgentResources,
@@ -40,6 +57,7 @@ from gofer.radish.artifacts import (
 )
 from gofer.ui.chat_media import ChatMediaError, resolve_chat_attachment
 from gofer.ui.second_brain import second_brain_rules, with_second_brain
+from gofer.utils.atomic_output import atomic_binary_output, mkdir_without_links, open_binary_input
 from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
 from gofer.utils.process import env_with_executable_on_path, run_subprocess, stream_subprocess
@@ -49,6 +67,15 @@ CHAT_COMPACT_CHAR_LIMIT = 32_000
 CHAT_COMPACT_RECENT_MESSAGES = 8
 CHAT_CHANGE_MAX_FILE_BYTES = 16 * 1024 * 1024
 CHAT_CHANGE_MAX_DIFF_CHARS = 80_000
+CHAT_CHANGE_MAX_SCAN_BYTES = 512 * 1024 * 1024
+CHAT_CHANGE_MAX_SCAN_FILES = 100_000
+CHAT_CHANGE_MAX_SCAN_DIRECTORIES = 100_000
+CHAT_CHANGE_MAX_SCAN_SECONDS = 15.0
+CHAT_CHANGE_PREVIEW_INTERVAL = 0.5
+CHAT_CHANGE_RECOVERY_INTERVAL = 30.0
+CHAT_CHANGE_MAX_WATCH_DIRECTORIES = 8192
+CHAT_CHANGE_MAX_WATCH_ENTRIES = 100_000
+CHAT_CHANGE_MAX_WATCH_SECONDS = 0.25
 CHAT_CHANGE_IGNORED_DIRECTORIES = {
     ".git",
     ".mypy_cache",
@@ -86,6 +113,33 @@ class _ChatFileState:
     mode: int
     size: int
     data: bytes | None
+    blob: Path | None = field(default=None, compare=False)
+    identity: tuple[int, ...] | None = field(default=None, compare=False)
+    # Each state keeps only its own backing storage alive. Repeated incremental
+    # captures must not retain a chain of obsolete snapshots and content blobs.
+    owner: tempfile.TemporaryDirectory[str] | None = field(default=None, compare=False, repr=False)
+
+
+class _ChatSnapshot(dict[str, _ChatFileState]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.spool = tempfile.TemporaryDirectory(prefix="taskurotta-chat-")
+        self.complete = True
+
+
+def _chat_file_bytes(state: _ChatFileState | None) -> bytes | None:
+    if state is None:
+        return b""
+    if state.data is not None:
+        return state.data
+    if state.blob is not None:
+        with open_binary_input(state.blob) as source:
+            return source.read(CHAT_CHANGE_MAX_FILE_BYTES + 1)
+    return None
+
+
+def _chat_file_available(state: _ChatFileState | None) -> bool:
+    return state is None or state.data is not None or state.blob is not None
 
 
 def _chat_project_root(workflow: dict[str, Any] | None) -> Path | None:
@@ -105,60 +159,397 @@ def _chat_project_root(workflow: dict[str, Any] | None) -> Path | None:
     return resolved if resolved.is_dir() else None
 
 
-def _capture_chat_project(root: Path | None) -> dict[str, _ChatFileState]:
+def _chat_project_files(root: Path, paths: set[str] | None) -> Iterator[Path | None]:
+    starts = [root] if paths is None else [root / relative for relative in sorted(paths)]
+    for start in starts:
+        relative = start.relative_to(root)
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        # A directory may have been replaced by a symlink since its event. Do
+        # not enumerate outside the project, even if the final file is regular.
+        if any(
+            (root.joinpath(*relative.parts[:index])).is_symlink()
+            for index in range(1, len(relative.parts) + 1)
+        ):
+            continue
+        try:
+            info = start.lstat()
+        except FileNotFoundError:
+            if start == root:
+                raise
+            continue
+        if not stat_module.S_ISDIR(info.st_mode):
+            yield start
+            continue
+
+        def scan_error(error: OSError) -> None:
+            raise error
+
+        for directory, directory_names, file_names in os.walk(
+            start, followlinks=False, onerror=scan_error
+        ):
+            # Charge directory traversal even when there are no files. Without
+            # this marker an empty tree can evade the capture's time budget.
+            yield None
+            directory_names[:] = sorted(
+                name
+                for name in directory_names
+                if name not in CHAT_CHANGE_IGNORED_DIRECTORIES
+                and not (Path(directory) / name).is_symlink()
+            )
+            for name in sorted(file_names):
+                yield Path(directory) / name
+
+
+def _capture_chat_project(
+    root: Path | None,
+    previous: dict[str, _ChatFileState] | None = None,
+    *,
+    paths: set[str] | None = None,
+) -> dict[str, _ChatFileState]:
     if root is None:
         return {}
-    snapshot: dict[str, _ChatFileState] = {}
-    for directory, directory_names, file_names in os.walk(root, followlinks=False):
-        directory_names[:] = sorted(
-            name
-            for name in directory_names
-            if name not in CHAT_CHANGE_IGNORED_DIRECTORIES
-            and not (Path(directory) / name).is_symlink()
-        )
-        for name in sorted(file_names):
-            path = Path(directory) / name
+    snapshot = _ChatSnapshot()
+    started = monotonic()
+    scanned_bytes = 0
+    scanned_directories = 0
+    previous = previous or {}
+    try:
+        for path in _chat_project_files(root, paths):
+            if path is None:
+                scanned_directories += 1
+                if (
+                    scanned_directories > CHAT_CHANGE_MAX_SCAN_DIRECTORIES
+                    or monotonic() - started > CHAT_CHANGE_MAX_SCAN_SECONDS
+                ):
+                    snapshot.complete = False
+                    return snapshot
+                continue
+            if (
+                len(snapshot) >= CHAT_CHANGE_MAX_SCAN_FILES
+                or monotonic() - started > CHAT_CHANGE_MAX_SCAN_SECONDS
+            ):
+                snapshot.complete = False
+                return snapshot
             try:
-                if path.is_symlink() or not path.is_file():
+                info = path.lstat()
+                if not stat_module.S_ISREG(info.st_mode):
                     continue
-                stat = path.stat()
-                digest = sha256()
-                chunks: list[bytes] | None = (
-                    [] if stat.st_size <= CHAT_CHANGE_MAX_FILE_BYTES else None
-                )
-                with path.open("rb") as handle:
-                    while chunk := handle.read(1024 * 1024):
-                        digest.update(chunk)
-                        if chunks is not None:
-                            chunks.append(chunk)
                 relative = path.relative_to(root).as_posix()
+                identity = (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mtime_ns,
+                    info.st_ctime_ns,
+                    info.st_size,
+                    info.st_mode,
+                )
+                old = previous.get(relative)
+                if old is not None and old.identity == identity:
+                    snapshot[relative] = old
+                    continue
+                if info.st_size > CHAT_CHANGE_MAX_FILE_BYTES:
+                    snapshot[relative] = _ChatFileState(
+                        digest=f"unavailable:{identity}",
+                        mode=info.st_mode & 0o777,
+                        size=info.st_size,
+                        data=None,
+                        identity=identity,
+                    )
+                    continue
+                scanned_bytes += info.st_size
+                if scanned_bytes > CHAT_CHANGE_MAX_SCAN_BYTES:
+                    snapshot.complete = False
+                    return snapshot
+                digest = sha256()
+                temporary = Path(snapshot.spool.name) / uuid.uuid4().hex
+                with open_binary_input(path) as source, temporary.open("xb") as target:
+                    os.chmod(temporary, 0o600)
+                    opened = os.fstat(source.fileno())
+                    if (opened.st_dev, opened.st_ino) != identity[:2]:
+                        snapshot.complete = False
+                        return snapshot
+                    size = 0
+                    while chunk := source.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > CHAT_CHANGE_MAX_FILE_BYTES:
+                            snapshot.complete = False
+                            return snapshot
+                        digest.update(chunk)
+                        target.write(chunk)
+                    final = os.fstat(source.fileno())
+                    if (final.st_size, final.st_mtime_ns, final.st_ctime_ns) != (
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                    ):
+                        snapshot.complete = False
+                        return snapshot
+                blob = temporary.with_name(digest.hexdigest())
+                temporary.replace(blob)
                 snapshot[relative] = _ChatFileState(
                     digest=digest.hexdigest(),
-                    mode=stat.st_mode & 0o777,
-                    size=stat.st_size,
-                    data=b"".join(chunks) if chunks is not None else None,
+                    mode=info.st_mode & 0o777,
+                    size=size,
+                    data=None,
+                    blob=blob,
+                    identity=identity,
+                    owner=snapshot.spool,
                 )
             except (OSError, ValueError):
-                continue
+                snapshot.complete = False
+    except (OSError, ValueError):
+        snapshot.complete = False
     return snapshot
 
 
-def _serialized_chat_file_state(state: _ChatFileState | None) -> dict[str, Any] | None:
+class _ChatProjectEvents(FileSystemEventHandler):
+    def __init__(self, tracker: _ChatProjectTracker) -> None:
+        self.tracker = tracker
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if event.event_type not in {"created", "modified", "deleted", "moved"}:
+            return
+        # Directory modification events accompany ordinary file changes. The
+        # corresponding file event supplies the precise path to refresh.
+        if event.is_directory and event.event_type == "modified":
+            return
+        for raw in (event.src_path, event.dest_path):
+            if raw:
+                self.tracker.invalidate(Path(os.fsdecode(raw)), directory=event.is_directory)
+
+
+class _ChatProjectTracker:
+    """Track live previews for one turn; final undo data always gets a full scan."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self.lock = threading.Lock()
+        self.pending: set[str] = set()
+        self.pending_directories: set[str] = set()
+        self.recover = True
+        self.last_recovery = monotonic()
+        self.observer: BaseObserver | None = None
+        self.before: dict[str, _ChatFileState] = {}
+        self.current: dict[str, _ChatFileState] = {}
+        self.changed: set[str] = set()
+
+    def _watch_scope_is_bounded(self) -> bool:
+        if self.root is None:
+            return False
+        started = monotonic()
+        entries = 0
+        directories = [self.root]
+        count = 0
+        try:
+            while directories:
+                count += 1
+                if (
+                    count > CHAT_CHANGE_MAX_WATCH_DIRECTORIES
+                    or monotonic() - started > CHAT_CHANGE_MAX_WATCH_SECONDS
+                ):
+                    return False
+                with os.scandir(directories.pop()) as children:
+                    for entry in children:
+                        entries += 1
+                        if (
+                            entries > CHAT_CHANGE_MAX_WATCH_ENTRIES
+                            or monotonic() - started > CHAT_CHANGE_MAX_WATCH_SECONDS
+                        ):
+                            return False
+                        # Native recursive registration includes ignored trees,
+                        # so count them too before allocating OS watch handles.
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(Path(entry.path))
+                if monotonic() - started > CHAT_CHANGE_MAX_WATCH_SECONDS:
+                    return False
+            return True
+        except OSError:
+            return False
+
+    def start(self) -> dict[str, _ChatFileState]:
+        if self.root is not None and self._watch_scope_is_bounded():
+            observer = Observer()
+            try:
+                observer.schedule(
+                    _ChatProjectEvents(self),
+                    str(self.root),
+                    recursive=True,
+                    event_filter=[
+                        FileCreatedEvent,
+                        FileDeletedEvent,
+                        FileModifiedEvent,
+                        FileMovedEvent,
+                        DirCreatedEvent,
+                        DirDeletedEvent,
+                        DirModifiedEvent,
+                        DirMovedEvent,
+                    ],
+                )
+                observer.start()
+                self.observer = observer
+            except (OSError, RuntimeError):
+                observer.stop()
+                if observer.is_alive():
+                    observer.join(timeout=2)
+                log.warning("Rem filesystem watcher unavailable; using recovery scans")
+        # Starting the watcher first preserves events arriving during baseline
+        # capture. The first preview reconciles delayed native event delivery.
+        try:
+            self.before = _capture_chat_project(self.root)
+            self.current = dict(self.before)
+            return self.before
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.observer is not None:
+            self.observer.stop()
+            self.observer.join(timeout=2)
+            self.observer = None
+
+    def invalidate(self, path: Path, *, directory: bool = False) -> None:
+        if self.root is None:
+            return
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError:
+            return
+        if ".." in relative.parts or any(
+            part in CHAT_CHANGE_IGNORED_DIRECTORIES for part in relative.parts[:-1]
+        ):
+            return
+        if relative.name in CHAT_CHANGE_IGNORED_DIRECTORIES:
+            return
+        with self.lock:
+            if relative == Path(".") or len(self.pending) >= CHAT_CHANGE_MAX_SCAN_FILES:
+                self.pending.clear()
+                self.pending_directories.clear()
+                self.recover = True
+            elif not self.recover:
+                self.pending.add(relative.as_posix())
+                if directory:
+                    self.pending_directories.add(relative.as_posix())
+
+    def capture(self) -> dict[str, _ChatFileState] | None:
+        if self.root is None or not getattr(self.before, "complete", True):
+            return None
+        healthy = self.observer is not None and self.observer.is_alive()
+        if healthy and self.observer is not None:
+            healthy = all(emitter.is_alive() for emitter in self.observer.emitters)
+        with self.lock:
+            recovery = (
+                self.recover
+                or not healthy
+                or monotonic() - self.last_recovery >= CHAT_CHANGE_RECOVERY_INTERVAL
+            )
+            pending, self.pending = self.pending, set()
+            directories, self.pending_directories = self.pending_directories, set()
+            self.recover = False
+        if recovery:
+            if (
+                self.observer is not None
+                and monotonic() - self.last_recovery >= CHAT_CHANGE_RECOVERY_INTERVAL
+                and not self._watch_scope_is_bounded()
+            ):
+                # A dependency install can grow ignored trees during a long
+                # turn. Release native watches if their scope outgrows its cap.
+                self.close()
+            captured = _capture_chat_project(self.root, self.current)
+        elif pending:
+            # A directory move can produce both the subtree event and synthetic
+            # child events. Capture each subtree only once.
+            paths = {
+                path
+                for path in pending
+                if not any(parent.as_posix() in pending for parent in Path(path).parents)
+            }
+            captured = _capture_chat_project(self.root, self.current, paths=paths)
+        else:
+            return self.current
+        if not getattr(captured, "complete", True):
+            with self.lock:
+                self.recover = True
+            return None
+        if recovery:
+            self.current = dict(captured)
+            self.changed = {
+                path
+                for path in self.before.keys() | self.current.keys()
+                if self.before.get(path) != self.current.get(path)
+            }
+            self.last_recovery = monotonic()
+        else:
+            affected = pending | captured.keys()
+            if directories:
+                affected |= {
+                    path
+                    for path in self.current
+                    if any(parent.as_posix() in directories for parent in Path(path).parents)
+                }
+            for path in affected:
+                if path in captured:
+                    self.current[path] = captured[path]
+                else:
+                    self.current.pop(path, None)
+                if self.before.get(path) != self.current.get(path):
+                    self.changed.add(path)
+                else:
+                    self.changed.discard(path)
+        if len(self.current) > CHAT_CHANGE_MAX_SCAN_FILES:
+            with self.lock:
+                self.recover = True
+            return None
+        return self.current
+
+
+def _serialized_chat_file_state(
+    state: _ChatFileState | None,
+    data_dir: Path | None = None,
+) -> dict[str, Any] | None:
     if state is None:
         return None
-    return {
-        "digest": state.digest,
-        "mode": state.mode,
-        "size": state.size,
-        "data": base64.b64encode(state.data).decode("ascii") if state.data is not None else None,
-    }
+    result: dict[str, Any] = {"digest": state.digest, "mode": state.mode, "size": state.size}
+    if data_dir is not None and state.blob is not None:
+        root = data_dir / "chat-change-blobs"
+        mkdir_without_links(root)
+        target = root / state.digest
+        if target.exists():
+            with open_binary_input(target) as stored:
+                if sha256(stored.read(CHAT_CHANGE_MAX_FILE_BYTES + 1)).hexdigest() != state.digest:
+                    raise OSError("The existing undo snapshot is invalid")
+        else:
+            with atomic_binary_output(target) as output, open_binary_input(state.blob) as source:
+                shutil.copyfileobj(source, output, 1024 * 1024)
+        result["blob"] = state.digest
+    else:
+        data = _chat_file_bytes(state)
+        result["data"] = base64.b64encode(data).decode("ascii") if data is not None else None
+    return result
 
 
-def _chat_file_state_from_payload(value: Any) -> _ChatFileState | None:
+def _chat_file_state_from_payload(
+    value: Any, data_dir: Path | None = None
+) -> _ChatFileState | None:
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ChatChangeError("The saved change set is invalid")
+    blob = value.get("blob")
+    blob_path = None
+    if blob is not None:
+        if data_dir is None or not isinstance(blob, str) or not re.fullmatch(r"[0-9a-f]{64}", blob):
+            raise ChatChangeError("The saved change set is invalid")
+        blob_path = data_dir / "chat-change-blobs" / blob
+        if blob_path.is_symlink() or not blob_path.is_file():
+            raise ChatChangeError("The undo snapshot is unavailable")
+        with open_binary_input(blob_path) as source:
+            if (
+                blob_path.stat().st_size > CHAT_CHANGE_MAX_FILE_BYTES
+                or sha256(source.read(CHAT_CHANGE_MAX_FILE_BYTES + 1)).hexdigest() != blob
+            ):
+                raise ChatChangeError("The undo snapshot is invalid")
     encoded = value.get("data")
     try:
         data = base64.b64decode(encoded, validate=True) if isinstance(encoded, str) else None
@@ -167,6 +558,7 @@ def _chat_file_state_from_payload(value: Any) -> _ChatFileState | None:
             mode=int(value["mode"]),
             size=int(value["size"]),
             data=data,
+            blob=blob_path,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ChatChangeError("The saved change set is invalid") from exc
@@ -177,8 +569,8 @@ def _chat_file_diff(
     before: _ChatFileState | None,
     after: _ChatFileState | None,
 ) -> tuple[str, int, int, bool]:
-    before_data = before.data if before is not None else b""
-    after_data = after.data if after is not None else b""
+    before_data = _chat_file_bytes(before)
+    after_data = _chat_file_bytes(after)
     if before_data is None or after_data is None:
         return "File is too large to preview.", 0, 0, True
     try:
@@ -214,13 +606,8 @@ def _write_chat_change_store(store: Path, payload: dict[str, Any]) -> None:
         store.parent.chmod(0o700)
     except OSError:
         pass
-    temporary = store.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    try:
-        temporary.chmod(0o600)
-    except OSError:
-        pass
-    temporary.replace(store)
+    with atomic_binary_output(store) as output:
+        output.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
 
 def _finalize_chat_changes(
@@ -230,14 +617,21 @@ def _finalize_chat_changes(
 ) -> dict[str, Any] | None:
     if root is None:
         return None
-    after = _capture_chat_project(root)
-    changes, stored_files = _chat_changes_from_snapshots(root, before, after)
+    after = _capture_chat_project(root, before)
+    try:
+        changes, stored_files = _chat_changes_from_snapshots(root, before, after, data_dir=data_dir)
+    except OSError:
+        log.exception("Could not save Rem snapshot content")
+        changes, stored_files = _chat_changes_from_snapshots(root, before, after, store_files=False)
+        if changes is not None:
+            changes["undoable"] = False
+            changes["undoUnavailableReason"] = "The undo snapshot could not be saved"
     if changes is None:
         return None
     change_set_id = uuid.uuid4().hex
     changes["id"] = change_set_id
     payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "id": change_set_id,
         "projectRoot": str(root),
         "undone": False,
@@ -257,13 +651,22 @@ def _finalize_chat_changes(
 def _preview_chat_changes(
     root: Path | None,
     before: dict[str, _ChatFileState],
+    tracker: _ChatProjectTracker | None = None,
 ) -> dict[str, Any] | None:
     if root is None:
         return None
+    after = _capture_chat_project(root, before) if tracker is None else tracker.capture()
+    if after is None:
+        return None
+    if tracker is not None:
+        # Diff only paths whose captured state differs from the turn baseline.
+        before = {path: before[path] for path in tracker.changed if path in before}
+        after = {path: after[path] for path in tracker.changed if path in after}
     changes, _stored_files = _chat_changes_from_snapshots(
         root,
         before,
-        _capture_chat_project(root),
+        after,
+        store_files=False,
     )
     if changes is not None:
         changes["live"] = True
@@ -276,7 +679,16 @@ def _chat_changes_from_snapshots(
     root: Path,
     before: dict[str, _ChatFileState],
     after: dict[str, _ChatFileState],
+    *,
+    store_files: bool = True,
+    data_dir: Path | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if not getattr(before, "complete", True) or not getattr(after, "complete", True):
+        log.warning(
+            "Rem change tracking skipped: project scan exceeded its budget "
+            "or changed during capture"
+        )
+        return None, []
     changed_paths = sorted(
         path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
     )
@@ -289,9 +701,7 @@ def _chat_changes_from_snapshots(
         previous = before.get(path)
         current = after.get(path)
         diff, additions, deletions, binary = _chat_file_diff(path, previous, current)
-        file_reversible = (previous is None or previous.data is not None) and (
-            current is None or current.data is not None
-        )
+        file_reversible = _chat_file_available(previous) and _chat_file_available(current)
         undoable = undoable and file_reversible
         files.append(
             {
@@ -305,13 +715,14 @@ def _chat_changes_from_snapshots(
                 "diff": diff,
             }
         )
-        stored_files.append(
-            {
-                "path": path,
-                "before": _serialized_chat_file_state(previous),
-                "after": _serialized_chat_file_state(current),
-            }
-        )
+        if store_files:
+            stored_files.append(
+                {
+                    "path": path,
+                    "before": _serialized_chat_file_state(previous, data_dir),
+                    "after": _serialized_chat_file_state(current, data_dir),
+                }
+            )
     changes = {
         "id": None,
         "projectRoot": str(root),
@@ -380,8 +791,8 @@ def _apply_chat_changes(
             path.relative_to(root)
         except ValueError as exc:
             raise ChatChangeError("The saved change set contains an invalid path") from exc
-        before = _chat_file_state_from_payload(item.get("before"))
-        after = _chat_file_state_from_payload(item.get("after"))
+        before = _chat_file_state_from_payload(item.get("before"), store.parent.parent)
+        after = _chat_file_state_from_payload(item.get("after"), store.parent.parent)
         current = _current_chat_file_state(path, action)
         current_identity = None if current is None else (current.digest, current.mode, current.size)
         expected = before if redo else after
@@ -406,13 +817,15 @@ def _apply_chat_changes(
                     break
                 parent = parent.parent
             continue
-        if target.data is None:
+        target_data = _chat_file_bytes(target)
+        if target_data is None:
             raise ChatChangeError(
                 f"Cannot restore '{path.name}' because its snapshot is incomplete"
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(target.data)
-        path.chmod(target.mode)
+        with atomic_binary_output(path) as output:
+            output.write(target_data)
+            if os.name != "nt":
+                os.fchmod(output.fileno(), target.mode)
     payload["undone"] = not redo
     _write_chat_change_store(store, payload)
     return {"id": change_set_id, "undone": not redo, "fileCount": len(resolved)}
@@ -647,7 +1060,17 @@ async def stream_workflow_chat(
     )
 
     project_root = _chat_project_root(workflow)
-    project_before = _capture_chat_project(project_root)
+    project_tracker = _ChatProjectTracker(project_root)
+    project_before = project_tracker.start()
+    last_preview = 0.0
+
+    def preview_changes() -> dict[str, Any] | None:
+        nonlocal last_preview
+        now = monotonic()
+        if now - last_preview < CHAT_CHANGE_PREVIEW_INTERVAL:
+            return None
+        last_preview = now
+        return _preview_chat_changes(project_root, project_before, project_tracker)
 
     def turn_metadata() -> dict[str, Any]:
         completed_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -705,7 +1128,7 @@ async def stream_workflow_chat(
                                 "trace": trace,
                             }
                             if trace.get("title") == "Edit" and trace.get("phase") == "result":
-                                changes = _preview_chat_changes(project_root, project_before)
+                                changes = preview_changes()
                                 if changes is not None:
                                     yield {
                                         "type": "changes",
@@ -737,7 +1160,7 @@ async def stream_workflow_chat(
                             "trace": trace,
                         }
                         if trace.get("title") == "Edit" and trace.get("phase") == "result":
-                            changes = _preview_chat_changes(project_root, project_before)
+                            changes = preview_changes()
                             if changes is not None:
                                 yield {
                                     "type": "changes",
@@ -775,6 +1198,8 @@ async def stream_workflow_chat(
             return
     except OSError as exc:
         raise ChatProviderError(f"Could not start '{binary}' CLI: {exc}") from exc
+    finally:
+        project_tracker.close()
 
 
 def _complete_json_lines(buffer: str, chunk: str) -> tuple[list[str], str]:

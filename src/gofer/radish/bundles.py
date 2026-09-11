@@ -20,6 +20,7 @@ from gofer.radish.workspaces import (
     find_registered_workflow,
     install_registered_workflow,
 )
+from gofer.utils.atomic_output import atomic_binary_output
 
 BUNDLE_EXTENSION = ".taskurotta"
 BUNDLE_MANIFEST = "taskurotta.bundle.json"
@@ -51,7 +52,7 @@ def export_radish_bundle(
     registry_dir: Path,
 ) -> RadishBundlePreview:
     workflow = find_registered_workflow(workflow_id, registry_dir=registry_dir)
-    output_path = output_path.expanduser().resolve()
+    output_path = output_path.expanduser().absolute()
     if output_path.suffix.lower() != BUNDLE_EXTENSION:
         output_path = output_path.with_name(f"{output_path.name}{BUNDLE_EXTENSION}")
     if output_path == workflow.workflow_root or workflow.workflow_root in output_path.parents:
@@ -81,16 +82,13 @@ def export_radish_bundle(
         "workflowName": workflow.name,
         "files": list(preview.files),
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.with_name(f".{output_path.name}.tmp")
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(BUNDLE_MANIFEST, json.dumps(manifest, indent=2) + "\n")
-            for source, relative in files:
-                archive.write(source, relative)
-        temporary.replace(output_path)
+        with atomic_binary_output(output_path) as output:
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(BUNDLE_MANIFEST, json.dumps(manifest, indent=2) + "\n")
+                for source, relative in files:
+                    archive.write(source, relative)
     except (OSError, zipfile.BadZipFile) as exc:
-        temporary.unlink(missing_ok=True)
         raise RadishBundleError(f"Could not export workflow bundle: {exc}") from exc
     return preview
 

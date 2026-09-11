@@ -4,9 +4,16 @@ on:
   workflow_call:
     inputs:
       checkout_ref:
-        description: Git ref to build and test
+        description: Release ref used for tag-version validation
         required: true
         type: string
+      signed_release:
+        description: Require platform signing before publication
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -15,14 +22,35 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ github.sha }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --extra dev --extra xlsx --group dev
+
+      - name: Lint Python
+        run: uv run --locked ruff check src tests
+
+      - name: Type-check Python
+        run: uv run --locked mypy src tests
+
+      - name: Test Python
+        run: uv run --locked pytest
+
+      - name: Audit all locked Python platform dependencies
+        run: uv run --locked python scripts/audit-dependencies.py
 
       - name: Verify tag matches package versions
         if: startsWith(inputs.checkout_ref, 'refs/tags/v')
@@ -52,7 +80,7 @@ jobs:
           sudo apt-get install -y xvfb
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22.12.0"
           cache: npm
@@ -61,6 +89,20 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Audit frontend and shipped Electron dependencies
+        working-directory: frontend
+        run: |
+          mkdir -p ../audit-evidence
+          npm audit --include=peer --audit-level=low --json > ../audit-evidence/npm-audit.json
+
+      - name: Save dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gofer-flow-audit-evidence
+          path: audit-evidence/*
+          if-no-files-found: error
 
       - name: Lint frontend source
         working-directory: frontend
@@ -103,6 +145,7 @@ jobs:
               frontend/release/*.exe.blockmap
               frontend/release/latest.yml
               frontend/release/checksums-windows.txt
+              frontend/release/signatures-windows.json
           - name: macos
             os: macos-latest
             electron_builder_args: --mac dmg zip
@@ -115,35 +158,40 @@ jobs:
               frontend/release/latest-mac.yml
               frontend/release/gof-macos-*
               frontend/release/checksums-macos.txt
+              frontend/release/notarization-macos-*.json
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ github.sha }}
 
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev rpm
+          sudo apt-get install -y dpkg-dev rpm xvfb
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
+          version: "0.11.21"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - name: Install Python dependencies
-        run: uv sync --extra dev --extra xlsx --group dev
+        run: uv sync --locked --extra dev --extra xlsx --group dev
+
+      - name: Test platform filesystem security
+        run: uv run --locked pytest tests/unit/test_atomic_output.py tests/unit/test_native_filesystem_security.py tests/unit/test_resource_security.py tests/unit/test_radish_workspaces.py
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22.12.0"
           cache: npm
@@ -153,14 +201,75 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build Electron packages
+      - name: Require Windows signing credentials
+        env:
+          CSC_LINK: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE) || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE_PASSWORD || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD) || '' }}
+        if: inputs.signed_release && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not $env:CSC_LINK -or -not $env:CSC_KEY_PASSWORD) {
+            throw "Release requires WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD."
+          }
+
+      - name: Prepare macOS signing keychain
+        env:
+          CSC_LINK: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE) || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE_PASSWORD || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD) || '' }}
+          APPLE_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+          GOFER_CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        if: inputs.signed_release && runner.os == 'macOS'
+        shell: bash
+        run: scripts/prepare-macos-signing.sh
+
+      - name: Build backend
         working-directory: frontend
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GOFER_CODESIGN_IDENTITY: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.MACOS_SIGNING_IDENTITY || '' }}
+        run: npm run backend:build
+
+      - name: Sign Windows backend before packaging
+        env:
+          CSC_LINK: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE) || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE_PASSWORD || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD) || '' }}
+        if: inputs.signed_release && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/sign-windows-backend.ps1
+
+      - name: Build Electron packages
+        working-directory: frontend
+        shell: bash
+        env:
+          CSC_LINK: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE) || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.signed_release && (runner.os == 'Windows' && secrets.WINDOWS_CERTIFICATE_PASSWORD || runner.os == 'macOS' && secrets.MACOS_CERTIFICATE_PASSWORD) || '' }}
+          APPLE_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+          SIGNED_RELEASE: ${{ inputs.signed_release }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.signed_release && 'true' || 'false' }}
         run: |
-          npm run backend:build
           npm run build
-          npx electron-builder ${{ matrix.electron_builder_args }} --publish=never
+          signing_args=()
+          if [ "$SIGNED_RELEASE" = "true" ] && [ "$RUNNER_OS" != "Linux" ]; then
+            signing_args+=(--config.forceCodeSigning=true)
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              signing_args+=(--config.mac.notarize=true --config.dmg.sign=true)
+            fi
+          fi
+          npx --no-install electron-builder ${{ matrix.electron_builder_args }} "${signing_args[@]}" --publish=never
+
+      - name: Test native terminal and Electron security on packaged runtime version
+        working-directory: frontend
+        run: npm run test:platform
+
+      - name: Delete temporary macOS signing keychain
+        if: always() && inputs.signed_release && runner.os == 'macOS'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/taskurotta-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/taskurotta-signing.p12"
 
       - name: Copy Linux CLI artifact
         if: runner.os == 'Linux'
@@ -192,6 +301,20 @@ jobs:
           cp dist/gof "frontend/release/gof-macos-${artifact_arch}"
           chmod +x "frontend/release/gof-macos-${artifact_arch}"
 
+      - name: Verify Windows release signatures
+        if: inputs.signed_release && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify-windows-release.ps1
+
+      - name: Verify macOS signatures and notarization
+        env:
+          APPLE_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.signed_release && runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+        if: inputs.signed_release && runner.os == 'macOS'
+        shell: bash
+        run: scripts/verify-macos-release.sh
+
       - name: Generate Linux checksums
         if: runner.os == 'Linux'
         working-directory: frontend/release
@@ -216,7 +339,7 @@ jobs:
         shell: pwsh
         run: |
           Get-ChildItem -File |
-            Where-Object { $_.Name -like "*.exe" -or $_.Name -like "*.exe.blockmap" -or $_.Name -eq "latest.yml" } |
+            Where-Object { $_.Name -like "*.exe" -or $_.Name -like "*.exe.blockmap" -or $_.Name -eq "latest.yml" -or $_.Name -eq "signatures-windows.json" } |
             Sort-Object Name |
             ForEach-Object {
               $hash = Get-FileHash -Algorithm SHA256 $_.FullName
@@ -230,7 +353,7 @@ jobs:
         shell: bash
         run: |
           files=()
-          for pattern in *.dmg *.dmg.blockmap *.zip *.zip.blockmap latest-mac.yml gof-macos-*; do
+          for pattern in *.dmg *.dmg.blockmap *.zip *.zip.blockmap latest-mac.yml gof-macos-* notarization-macos-*.json; do
             for file in $pattern; do
               [ -e "$file" ] && files+=("$file")
             done
@@ -243,7 +366,7 @@ jobs:
           cat checksums-macos.txt
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact-name }}
           path: ${{ matrix.artifact-glob }}
